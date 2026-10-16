@@ -1,4 +1,5 @@
 #include "gpu/presenter.h"
+#include "gpu/rsx.h"
 #include "vk_context.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
@@ -184,6 +185,7 @@ void begin_frame() {
         LOG_INFO("gpu", "fence wait %.2f ms per frame", total / 60.0);
         total = 0;
     }
+    gpu::rsx::frame_complete();
     g_frame_serial++;
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};

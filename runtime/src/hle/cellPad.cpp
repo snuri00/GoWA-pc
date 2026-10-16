@@ -6,12 +6,17 @@
 #include <string>
 #include <vector>
 
+namespace host {
+void poll_pad(uint16_t* b);
+}
+
 namespace hle {
 
 namespace {
 
 struct Press {
     double at;
+    double hold;
     uint32_t offset;
     uint16_t mask;
     uint32_t pressure;
@@ -55,7 +60,10 @@ void load_script() {
         size_t at = item.find('@');
         Press p{};
         if (at != std::string::npos && button_of(item.substr(0, at), p.offset, p.mask, p.pressure)) {
-            p.at = std::atof(item.substr(at + 1).c_str());
+            std::string when = item.substr(at + 1);
+            size_t colon = when.find(':');
+            p.at = std::atof(when.substr(0, colon).c_str());
+            p.hold = colon == std::string::npos ? 0.25 : std::atof(when.substr(colon + 1).c_str());
             g_script.push_back(p);
             LOG_INFO("cellPad", "autopad: %s at %.1fs", item.substr(0, at).c_str(), p.at);
         }
@@ -72,11 +80,12 @@ void fill(uint32_t out) {
     b[20] = b[21] = b[22] = 0x200;
     b[23] = 0x200;
     for (const Press& p : g_script) {
-        if (now >= p.at && now < p.at + 0.25) {
+        if (now >= p.at && now < p.at + p.hold) {
             b[p.offset] |= p.mask;
             if (p.pressure) b[p.pressure] = 0xFF;
         }
     }
+    host::poll_pad(b);
     vm::write32(out, 24);
     for (int i = 0; i < 24; i++) vm::write16(out + 4 + i * 2, b[i]);
 }
