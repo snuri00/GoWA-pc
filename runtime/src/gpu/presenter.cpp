@@ -167,9 +167,12 @@ bool ensure_frame(uint32_t w, uint32_t h) {
     return true;
 }
 
+uint64_t g_frame_serial = 0;
+
 void begin_frame() {
     if (g.recording) return;
     vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
+    g_frame_serial++;
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -336,6 +339,8 @@ void set_display_buffer(uint32_t id, uint32_t offset, uint32_t pitch, uint32_t w
 }
 
 const VkCtx& vk() { return g.ctx; }
+
+uint64_t frame_serial() { return g_frame_serial; }
 
 VkCommandBuffer frame_cmd() {
     begin_frame();
