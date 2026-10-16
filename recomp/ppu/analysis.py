@@ -5,7 +5,7 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
-from inventory import Elf, opd, prx_param, imports
+from inventory import Elf, opd, prx_param, imports, exports
 from isa import mnemonic
 
 
@@ -23,17 +23,38 @@ class Image:
                 self.imports.append({"module": m["module"], "nid": f["nid"], "name": f["name"], "stub": int(f["stub_target"], 16)})
         self.stubs = {imp["stub"]: i for i, imp in enumerate(self.imports)}
         stub_lo = min(self.stubs) if self.stubs else None
-        execs = sorted((s[3], s[3] + s[5]) for s in self.elf.shdrs if s[2] & 4 and s[5])
-        code = [r for r in execs if stub_lo is None or not (r[0] <= stub_lo < r[1])]
-        self.text_lo = code[0][0]
-        self.text_hi = max(b for _, b in code)
-        self.text_size = self.text_hi - self.text_lo
-        self.text = self.elf.read(self.text_lo, self.text_size)
-        o = opd(self.elf)
-        base = int(o["addr"], 16)
-        raw = self.elf.read(base, o["count"] * 8)
-        self.opd = [struct.unpack_from(">II", raw, i * 8) for i in range(o["count"])]
-        self.toc = self.opd[0][1]
+        self.exports = []
+        if self.elf.shdrs:
+            execs = sorted((s[3], s[3] + s[5]) for s in self.elf.shdrs if s[2] & 4 and s[5])
+            code = [r for r in execs if stub_lo is None or not (r[0] <= stub_lo < r[1])]
+            self.text_lo = code[0][0]
+            self.text_hi = max(b for _, b in code)
+            self.text_size = self.text_hi - self.text_lo
+            self.text = self.elf.read(self.text_lo, self.text_size)
+            o = opd(self.elf)
+            base = int(o["addr"], 16)
+            raw = self.elf.read(base, o["count"] * 8)
+            self.opd = [struct.unpack_from(">II", raw, i * 8) for i in range(o["count"])]
+            self.toc = self.opd[0][1]
+        else:
+            seg = next(p for p in self.elf.phdrs if p[0] == 1 and p[1] & 1)
+            self.text_lo = seg[3]
+            self.text_hi = stub_lo if stub_lo is not None and seg[3] <= stub_lo < seg[3] + seg[5] else seg[3] + seg[5]
+            self.text_size = self.text_hi - self.text_lo
+            self.text = self.elf.read(self.text_lo, self.text_size)
+            self.toc = int(prx["toc"], 16)
+            self.opd = []
+            for p in self.elf.phdrs:
+                if p[0] != 1 or p[1] & 1 or not p[5]:
+                    continue
+                blob = self.elf.d[p[2]:p[2] + p[5]]
+                for k in range(0, len(blob) - 7, 4):
+                    code, toc = struct.unpack_from(">II", blob, k)
+                    if toc == self.toc and self.in_text(code):
+                        self.opd.append((code, toc))
+            for m in exports(self.elf, prx, nids or {}):
+                for e in m["entries"]:
+                    self.exports.append({"module": m["module"], "nid": e["nid"], "name": e["name"], "opd": int(e["addr"], 16)})
 
     def word(self, addr):
         return struct.unpack_from(">I", self.text, addr - self.text_lo)[0]

@@ -682,10 +682,11 @@ def gen_insn(m, w):
 
 
 class Emitter:
-    def __init__(self, img, funcs, entries):
+    def __init__(self, img, funcs, entries, import_base=0):
         self.img = img
         self.funcs = funcs
         self.entries = entries
+        self.import_base = import_base
         self.unimpl = {}
 
     def fname(self, addr):
@@ -693,14 +694,14 @@ class Emitter:
 
     def call(self, target, ret):
         if target in self.img.stubs:
-            return f"ctx.lr = 0x{ret:x}; ppu::call_import(ctx, base, {self.img.stubs[target]});"
+            return f"ctx.lr = 0x{ret:x}; ppu::call_import(ctx, base, {self.import_base + self.img.stubs[target]});"
         if target in self.entries:
             return f"ctx.lr = 0x{ret:x}; {self.fname(target)}(ctx, base);"
         return f"ctx.lr = 0x{ret:x}; ppu::call_indirect(ctx, base, 0x{target:x});"
 
     def jump_out(self, target, f):
         if target in self.img.stubs:
-            return f"ppu::call_import(ctx, base, {self.img.stubs[target]}); return;"
+            return f"ppu::call_import(ctx, base, {self.import_base + self.img.stubs[target]}); return;"
         if target in self.entries:
             return f"{self.fname(target)}(ctx, base); return;"
         return f"ppu::call_indirect(ctx, base, 0x{target:x}); return;"
@@ -796,10 +797,7 @@ class Emitter:
 HEADER = '#include "ppu/ops.h"\n#include "funcs.h"\n\n'
 
 
-def main(elf_path, nid_db, out_dir, chunk_bytes="0x19000"):
-    import json
-    nids = json.load(open(nid_db))
-    img = Image(elf_path, nids)
+def lift(img):
     funcs, entries = discover(img)
     extra = set()
     while True:
@@ -809,44 +807,79 @@ def main(elf_path, nid_db, out_dir, chunk_bytes="0x19000"):
             break
         extra |= found
         funcs, entries = discover(img, extra)
-    em = Emitter(img, funcs, entries)
+    return funcs, entries
+
+
+NL = "\n"
+
+
+def main(manifest_path, nid_db, out_dir, chunk_bytes="0x19000"):
+    import json
+    nids = json.load(open(nid_db))
+    root = os.path.dirname(os.path.abspath(manifest_path))
+    manifest = json.load(open(manifest_path))
     os.makedirs(out_dir, exist_ok=True)
-    order = sorted(funcs)
-    with open(os.path.join(out_dir, "funcs.h"), "w") as h:
-        h.write("#pragma once\n#include \"ppu/context.h\"\n\n")
-        for e in order:
-            h.write(f"void {em.fname(e)}(ppu::Context& ctx, uint8_t* base);\n")
+    for old in os.listdir(out_dir):
+        if old.endswith(".cpp") or old.endswith(".h"):
+            os.remove(os.path.join(out_dir, old))
     chunk = int(chunk_bytes, 16)
-    files = []
-    cur, cur_start, buf = None, None, []
-    for e in order:
-        bucket = (e - img.text_lo) // chunk
-        if bucket != cur:
-            if buf:
-                files.append((cur, buf))
-            cur, buf = bucket, []
-        buf.append(em.function(funcs[e]))
-    if buf:
-        files.append((cur, buf))
-    for bucket, bodies in files:
-        with open(os.path.join(out_dir, f"chunk_{bucket:03d}.cpp"), "w") as fo:
-            fo.write(HEADER)
-            fo.write("\n\n".join(bodies))
-            fo.write("\n")
-    with open(os.path.join(out_dir, "table.cpp"), "w") as t:
-        t.write('#include "ppu/context.h"\n#include "funcs.h"\n#include "runtime/image.h"\n\nnamespace image {\n\n')
-        t.write(f"const uint32_t text_lo = 0x{img.text_lo:x};\nconst uint32_t text_hi = 0x{img.text_hi:x};\nconst uint32_t toc = 0x{img.toc:x};\n")
-        t.write(f"const uint32_t entry_opd = 0x{img.elf.entry:x};\n\n")
-        t.write(f"const FuncEntry functions[] = {{\n")
-        for e in order:
-            t.write(f"    {{0x{e:x}, {em.fname(e)}}},\n")
-        t.write(f"}};\nconst uint32_t function_count = {len(order)};\n\n")
-        t.write("const ImportEntry imports[] = {\n")
+    all_funcs = []
+    images = []
+    imports = []
+    exports = []
+    unimpl = {}
+    for idx, spec in enumerate(manifest):
+        img = Image(os.path.join(root, spec["elf"]), nids)
+        funcs, entries = lift(img)
+        em = Emitter(img, funcs, entries, len(imports))
         for imp in img.imports:
-            t.write(f'    {{"{imp["module"]}", 0x{imp["nid"]}u, "{imp["name"] or ""}"}},\n')
-        t.write(f"}};\nconst uint32_t import_count = {len(img.imports)};\n\n}}\n")
-    print(f"functions {len(order)} files {len(files)} imports {len(img.imports)}")
-    print("unimplemented:", sorted(em.unimpl.items(), key=lambda kv: -kv[1]))
+            imports.append(dict(imp, image=idx))
+        for exp in img.exports:
+            exports.append(dict(exp, image=idx))
+        order = sorted(funcs)
+        files = []
+        cur, buf = None, []
+        for e in order:
+            bucket = (e - img.text_lo) // chunk
+            if bucket != cur:
+                if buf:
+                    files.append((cur, buf))
+                cur, buf = bucket, []
+            buf.append(em.function(funcs[e]))
+        if buf:
+            files.append((cur, buf))
+        for bucket, bodies in files:
+            with open(os.path.join(out_dir, f"{spec['name']}_{bucket:03d}.cpp"), "w") as fo:
+                fo.write(HEADER)
+                fo.write((NL + NL).join(bodies))
+                fo.write(NL)
+        all_funcs.extend((e, em.fname(e)) for e in order)
+        images.append({"name": spec["name"], "file": spec["file"], "prx": bool(img.exports),
+                       "text_lo": img.text_lo, "text_hi": img.text_hi, "toc": img.toc, "entry": img.elf.entry})
+        for k, v in em.unimpl.items():
+            unimpl[k] = unimpl.get(k, 0) + v
+        print(f"{spec['name']:14} functions {len(order):>6} files {len(files):>3} imports {len(img.imports):>4} exports {len(img.exports):>4}")
+    all_funcs.sort()
+    lines = ["#pragma once", '#include "ppu/context.h"', ""]
+    lines += [f"void {name}(ppu::Context& ctx, uint8_t* base);" for _, name in all_funcs]
+    open(os.path.join(out_dir, "funcs.h"), "w").write(NL.join(lines) + NL)
+    t = ['#include "ppu/context.h"', '#include "funcs.h"', '#include "runtime/image.h"', "", "namespace image {", ""]
+    t.append("const ImageEntry images[] = {")
+    for im in images:
+        t.append(f'    {{"{im["name"]}", "{im["file"]}", {str(im["prx"]).lower()}, 0x{im["text_lo"]:x}, 0x{im["text_hi"]:x}, 0x{im["toc"]:x}, 0x{im["entry"]:x}}},')
+    t += ["};", f"const uint32_t image_count = {len(images)};", ""]
+    t.append("const FuncEntry functions[] = {")
+    t += [f"    {{0x{addr:x}, {name}}}," for addr, name in all_funcs]
+    t += ["};", f"const uint32_t function_count = {len(all_funcs)};", ""]
+    t.append("const ImportEntry imports[] = {")
+    t += [f'    {{"{imp["module"]}", 0x{imp["nid"]}u, "{imp["name"] or ""}", {imp["image"]}}},' for imp in imports]
+    t += ["};", f"const uint32_t import_count = {len(imports)};", ""]
+    t.append("const ExportEntry exports[] = {")
+    t += [f'    {{"{exp["module"]}", 0x{exp["nid"]}u, "{exp["name"] or ""}", {exp["image"]}, 0x{exp["opd"]:x}}},' for exp in exports]
+    t += ["};", f"const uint32_t export_count = {len(exports)};", "", "}"]
+    open(os.path.join(out_dir, "table.cpp"), "w").write(NL.join(t) + NL)
+    print(f"total functions {len(all_funcs)} imports {len(imports)} exports {len(exports)}")
+    print("unimplemented:", sorted(unimpl.items(), key=lambda kv: -kv[1]))
 
 
 if __name__ == "__main__":

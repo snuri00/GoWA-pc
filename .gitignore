@@ -28,3 +28,6 @@ __pycache__/
 /ref/
 /build/
 /oracle/
+/docs/
+*.md
+/run/
