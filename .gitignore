@@ -26,3 +26,5 @@
 *.PSARC
 __pycache__/
 /ref/
+/build/
+/oracle/
