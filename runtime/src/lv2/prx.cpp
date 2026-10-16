@@ -74,6 +74,13 @@ LV2_SYSCALL(465, _sys_prx_load_module_list) {
     return CELL_OK;
 }
 
+LV2_SYSCALL(496, _sys_prx_get_module_id_by_name) {
+    uint32_t name = u32arg(ctx, 0);
+    if (!name) return CELL_EINVAL;
+    LOG_DEBUG("prx", "get_module_id_by_name('%s') -> unknown", reinterpret_cast<const char*>(vm::ptr(name)));
+    return static_cast<int32_t>(0x8001112Eu);
+}
+
 LV2_SYSCALL(481, _sys_prx_start_module) {
     uint32_t id = u32arg(ctx, 0);
     uint32_t opt = u32arg(ctx, 2);

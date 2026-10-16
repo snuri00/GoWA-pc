@@ -352,6 +352,14 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
     if (dma_watch && ea < (dma_watch >> 32) && ea + size > static_cast<uint32_t>(dma_watch)) {
         LOG_INFO("spudma", "thread 0x%x pc 0x%05x %s cmd 0x%02x ea 0x%08x lsa 0x%05x size 0x%x", id, ctx.pc, put ? "PUT" : "GET", cmd, ea, lsa, size);
     }
+    if (ea < 0xF0000000u && (ea < 0x10000 || !vm::is_mapped(ea) || !vm::is_mapped(ea + size - 1))) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1) < 20) {
+            LOG_ERROR("spu", "thread 0x%x '%s' DMA %s cmd 0x%02x unmapped ea 0x%08x size 0x%x lsa 0x%05x pc 0x%05x", id, name.c_str(), put ? "PUT" : "GET", cmd, ea, size, lsa, ctx.pc);
+        }
+        if (!put) std::memset(ls + lsa, 0, size);
+        return;
+    }
     bool handled;
     uint8_t* p = translate(ea, size, put, handled, lsa);
     if (handled || !p) return;
@@ -407,6 +415,23 @@ bool SpuThread::run_list(uint32_t tag, uint32_t cmd, uint32_t lsa, uint32_t list
 
 void SpuThread::process_mfc(uint32_t cmd) {
     uint32_t lsa = mfc_lsa, ea = mfc_eal, size = mfc_size, tag = mfc_tag;
+    if ((cmd == 0xD0 || cmd == 0xB4 || cmd == 0xB0 || cmd == 0xB8) && (ea < 0x10000 || !vm::is_mapped(ea & ~127u))) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1) < 6) {
+            LOG_ERROR("spu", "thread 0x%x '%s' atomic cmd 0x%x on unmapped ea 0x%08x at pc 0x%05x lsa 0x%05x r0 0x%05x r1 0x%05x", id, name.c_str(), cmd, ea, ctx.pc, lsa,
+                      ctx.gpr[0].u32[3], ctx.gpr[1].u32[3]);
+            char fn[64];
+            std::snprintf(fn, sizeof fn, "spu_fault_%08x.ls", id);
+            if (FILE* f = std::fopen(fn, "wb")) {
+                std::fwrite(ls, 1, LS_SIZE, f);
+                std::fclose(f);
+            }
+        }
+        std::lock_guard lk(m);
+        atomic_stat = cmd == 0xD0 ? 4 : 1;
+        atomic_stat_count = true;
+        return;
+    }
     switch (cmd) {
     case 0x20: case 0x21: case 0x22: case 0x30: case 0x31: case 0x32:
     case 0x40: case 0x41: case 0x42: case 0x89:

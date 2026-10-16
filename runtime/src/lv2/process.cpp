@@ -108,6 +108,15 @@ LV2_SYSCALL(865, sys_ss_random_number_generator) {
     return CELL_OK;
 }
 
+LV2_SYSCALL(871, sys_ss_access_control_engine) {
+    uint64_t pkg = u64arg(ctx, 0);
+    if (pkg == 2) {
+        vm::write64(u32arg(ctx, 1), 0x1010000001000003ull);
+        return CELL_OK;
+    }
+    return CELL_ENOSYS;
+}
+
 LV2_SYSCALL(872, sys_ss_get_open_psid) {
     if (uint32_t p = u32arg(ctx, 0)) {
         vm::write64(p, 0x0123456789ABCDEFull);
