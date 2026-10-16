@@ -14,7 +14,7 @@ add_library(gowa_ppu_ops STATIC runtime/src/ppu_ops.cpp)
 target_include_directories(gowa_ppu_ops PUBLIC runtime/include "${CMAKE_SOURCE_DIR}/out/include")
 target_compile_options(gowa_ppu_ops PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
 
-file(GLOB GOWA_RUNTIME_SOURCES CONFIGURE_DEPENDS runtime/src/*.cpp runtime/src/lv2/*.cpp runtime/src/hle/*.cpp)
+file(GLOB GOWA_RUNTIME_SOURCES CONFIGURE_DEPENDS runtime/src/*.cpp runtime/src/lv2/*.cpp runtime/src/hle/*.cpp runtime/src/spu/*.cpp runtime/src/rsx/*.cpp)
 list(REMOVE_ITEM GOWA_RUNTIME_SOURCES "${CMAKE_SOURCE_DIR}/runtime/src/ppu_ops.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/main.cpp")
 add_library(gowa_runtime OBJECT ${GOWA_RUNTIME_SOURCES})
 target_link_libraries(gowa_runtime PUBLIC gowa_ppu_ops)
