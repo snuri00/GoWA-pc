@@ -5,7 +5,7 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
-from inventory import Elf, opd
+from inventory import Elf, opd, prx_param, imports
 from isa import mnemonic
 
 
@@ -14,14 +14,20 @@ def sext(v, bits):
 
 
 class Image:
-    def __init__(self, path):
+    def __init__(self, path, nids=None):
         self.elf = Elf(path)
-        best = None
-        for s in self.elf.shdrs:
-            if s[2] & 4 and s[5] and (best is None or s[5] > best[1]):
-                best = (s[3], s[5])
-        self.text_lo, self.text_size = best
-        self.text_hi = self.text_lo + self.text_size
+        prx = prx_param(self.elf)
+        self.imports = []
+        for m in imports(self.elf, prx, nids or {}):
+            for f in m["functions"]:
+                self.imports.append({"module": m["module"], "nid": f["nid"], "name": f["name"], "stub": int(f["stub_target"], 16)})
+        self.stubs = {imp["stub"]: i for i, imp in enumerate(self.imports)}
+        stub_lo = min(self.stubs) if self.stubs else None
+        execs = sorted((s[3], s[3] + s[5]) for s in self.elf.shdrs if s[2] & 4 and s[5])
+        code = [r for r in execs if stub_lo is None or not (r[0] <= stub_lo < r[1])]
+        self.text_lo = code[0][0]
+        self.text_hi = max(b for _, b in code)
+        self.text_size = self.text_hi - self.text_lo
         self.text = self.elf.read(self.text_lo, self.text_size)
         o = opd(self.elf)
         base = int(o["addr"], 16)
@@ -92,6 +98,7 @@ class Function:
         self.syscalls = []
         self.errors = []
         self.data = set()
+        self.import_calls = set()
 
 
 def explore(img, entry, entries):
@@ -117,6 +124,12 @@ def explore(img, entry, entries):
             op = w >> 26
             if op == 18:
                 t = branch_target(pc, w)
+                if t in img.stubs:
+                    f.import_calls.add(t)
+                    if w & 1:
+                        pc += 4
+                        continue
+                    break
                 if w & 1:
                     f.calls.add(t)
                     pc += 4
