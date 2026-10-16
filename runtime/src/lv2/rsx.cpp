@@ -1,15 +1,23 @@
 #include "runtime/hostsleep.h"
 #include "event.h"
+#include "gpu/presenter.h"
+#include "gpu/rsx.h"
 #include "ppu/ops.h"
 #include "runtime/reservation.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <string>
 #include <thread>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+
+namespace crash {
+std::string sample_stack(void* native, int depth);
+void profile_thread(void* native, const char* name);
+}
 
 namespace lv2 {
 
@@ -109,6 +117,7 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
         uint32_t v = static_cast<uint32_t>(a4);
         uint32_t buffer = (v & 0x80000000u) ? (v & 0xF) : 0;
         if ((v & 0x80000000u) && buffer > 7) buffer = vm::read32(head_addr(head) + 0x14);
+        if (!gpu::rsx::present(buffer)) gpu::flip(buffer);
         g_rsx.pending_flip = buffer;
         while (g_rsx.pending_flip >= 0 && g_rsx.running) Sleep(0);
         return CELL_OK;
@@ -135,7 +144,11 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
         }
         send_event(1u << 7);
         return CELL_OK;
-    case 0x100: case 0x101: case 0x104: case 0x105: case 0x106: case 0x108: case 0x10B: case 0x10C: case 0x10D:
+    case 0x104:
+        gpu::set_display_buffer(static_cast<uint32_t>(a3) & 0xFF, static_cast<uint32_t>(a5), static_cast<uint32_t>(a5 >> 32), static_cast<uint32_t>(a4 >> 32),
+                                static_cast<uint32_t>(a4));
+        return CELL_OK;
+    case 0x100: case 0x101: case 0x105: case 0x106: case 0x108: case 0x10B: case 0x10C: case 0x10D:
     case 0x300: case 0x301: case 0x302: case 0x600: case 0x601: case 0x602: case 0x603:
         return CELL_OK;
     default:
@@ -170,12 +183,16 @@ void semaphore_wait(uint32_t addr, uint32_t value) {
     }
 }
 
+std::atomic<uint64_t> g_method_counts[0x4000];
+
 void execute(uint32_t reg, uint32_t arg) {
+    g_method_counts[(reg >> 2) & 0x3FFF].fetch_add(1, std::memory_order_relaxed);
     g_rsx.last_method.store(reg, std::memory_order_relaxed);
     g_rsx.last_arg.store(arg, std::memory_order_relaxed);
     if (reg >= 0xE000) LOG_DEBUG("rsx", "driver method 0x%04x arg 0x%08x", reg, arg);
     static const bool trace = std::getenv("GOWA_RSX_TRACE") != nullptr;
     if (trace) LOG_INFO("rsxm", "0x%04x 0x%08x", reg, arg);
+    if (reg < 0xE000) gpu::rsx::method(reg, arg);
     switch (reg) {
     case 0x50: vm::write32(g_rsx.dma_control + 0x48, arg); break;
     case 0x60: g_rsx.sema_ctx_406e = arg; break;
@@ -226,8 +243,12 @@ void execute(uint32_t reg, uint32_t arg) {
     }
 }
 
+HANDLE g_fifo_handle = nullptr;
+
 void fifo_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX FIFO");
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_fifo_handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    if (std::getenv("GOWA_PROFILE_FIFO")) crash::profile_thread(g_fifo_handle, "rsx fifo");
     LOG_INFO("rsx", "null RSX FIFO thread started");
     uint32_t ctrl = g_rsx.dma_control;
     uint32_t idle = 0;
@@ -249,12 +270,14 @@ void fifo_thread() {
         uint32_t cmd = vm::read32(ea);
         static const bool trace = std::getenv("GOWA_RSX_TRACE") != nullptr;
         if (trace) LOG_INFO("rsxc", "get 0x%08x cmd 0x%08x", get, cmd);
-        if ((cmd & 0xE0000003) == 0x20000000) {
-            vm::write32(ctrl + 0x44, cmd & 0x1FFFFFFC);
-            continue;
-        }
-        if ((cmd & 0xE0000003) == 0x00000001) {
-            vm::write32(ctrl + 0x44, cmd & 0xFFFFFFFC);
+        if ((cmd & 0xE0000003) == 0x20000000 || (cmd & 0xE0000003) == 0x00000001) {
+            uint32_t target = (cmd & 3) == 1 ? cmd & 0xFFFFFFFC : cmd & 0x1FFFFFFC;
+            if (target == get) {
+                if (++idle < 256) std::this_thread::yield();
+                else Sleep(1);
+                continue;
+            }
+            vm::write32(ctrl + 0x44, target);
             continue;
         }
         if ((cmd & 3) == 2) {
@@ -295,8 +318,27 @@ void vblank_thread() {
 
 }
 
+uint32_t rsx_address(uint32_t offset, uint32_t loc) { return get_address(offset, loc); }
+
 void rsx_status() {
     if (!g_rsx.dma_control) return;
+    if (g_fifo_handle) LOG_INFO("status", "rsx fifo stack: %s", crash::sample_stack(g_fifo_handle, 16).c_str());
+    if (std::getenv("GOWA_RSX_STATS")) {
+        std::string line;
+        char b[32];
+        int n = 0;
+        for (uint32_t i = 0; i < 0x4000; i++) {
+            uint64_t c = g_method_counts[i].load();
+            if (!c) continue;
+            std::snprintf(b, sizeof b, " %04x:%llu", i * 4, static_cast<unsigned long long>(c));
+            line += b;
+            if (++n % 16 == 0) {
+                LOG_INFO("rsxstat", "%s", line.c_str());
+                line.clear();
+            }
+        }
+        if (!line.empty()) LOG_INFO("rsxstat", "%s", line.c_str());
+    }
     uint32_t put = vm::read32(g_rsx.dma_control + 0x40), get = vm::read32(g_rsx.dma_control + 0x44);
     LOG_INFO("status", "rsx handlers 0x%08x head1 flags 0x%08x vblanks %llu", vm::read32(g_rsx.driver_info + 0x12C0), vm::read32(head_addr(1) + 8),
              static_cast<unsigned long long>(vm::read64(head_addr(1) + 0x30)));

@@ -2,6 +2,7 @@
 #include "runtime/loader.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
+#include "gpu/presenter.h"
 #include "runtime/thread.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -53,6 +54,7 @@ void rearm_watch();
 int main(int argc, char** argv) {
     crash::install();
     timeBeginPeriod(1);
+    gpu::init();
     if (const char* root = std::getenv("GOWA_ROOT")) loader::g_root = root;
     if (const char* lvl = std::getenv("GOWA_LOG")) {
         if (!std::strcmp(lvl, "trace")) logging::set_level(logging::Level::Trace);
