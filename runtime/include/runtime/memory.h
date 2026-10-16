@@ -21,6 +21,8 @@ extern uint8_t* g_base;
 bool init();
 bool map(uint32_t addr, uint32_t size);
 uint32_t alloc(Region region, uint32_t size, uint32_t align);
+uint32_t reserve_slot(uint32_t size, uint32_t align);
+void release_slot(uint32_t addr);
 bool dealloc(uint32_t addr);
 uint32_t region_free(Region region);
 uint32_t region_size(Region region);

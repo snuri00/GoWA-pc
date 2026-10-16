@@ -86,6 +86,11 @@ LV2_SYSCALL(481, _sys_prx_start_module) {
     case 1:
         if (p->state != PrxState::Initialized) return CELL_PRX_ERROR_ERROR;
         p->state = PrxState::Starting;
+        if (p->image < 0 && p->name == "libsysutil.sprx") {
+            uint32_t area = vm::reserve_slot(0x10000000, 0x10000000);
+            if (area) vm::map(area, 0x10000);
+            LOG_INFO("prx", "libsysutil shared memory at 0x%08x", area);
+        }
         vm::write64(opt + 16, p->start_opd ? p->start_opd : ~0ull);
         if (vm::read64(opt) != 0x20) vm::write64(opt + 32, ~0ull);
         return CELL_OK;

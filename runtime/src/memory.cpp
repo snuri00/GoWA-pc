@@ -19,17 +19,36 @@ struct RegionInfo {
     uint32_t page;
 };
 
-constexpr RegionInfo kRegions[] = {
-    {0x00010000, 0x1FFF0000, 0x10000},
-    {0x20000000, 0x10000000, 0x10000},
-    {0x30000000, 0x10000000, 0x100000},
-    {0x40000000, 0x10000000, 0x100000},
+RegionInfo kRegions[] = {
+    {0x00010000, 0x0FFF0000, 0x10000},
+    {0, 0x10000000, 0x10000},
+    {0, 0x10000000, 0x100000},
+    {0, 0x10000000, 0x100000},
     {0xC0000000, 0x10000000, 0x100000},
     {0xD0000000, 0x10000000, 0x10000},
     {0xE0000000, 0x20000000, 0x10000},
 };
 
 std::mutex g_lock;
+std::map<uint32_t, uint32_t> g_slots = {{0x00000000, 0x10000000}};
+
+uint32_t reserve_slot_locked(uint32_t size, uint32_t align) {
+    if (!align) align = 0x10000000;
+    for (uint64_t a = 0x10000000; a + size <= 0xC0000000; a += align) {
+        bool clash = false;
+        for (auto& [b, n] : g_slots) {
+            if (a < uint64_t(b) + n && b < a + size) {
+                clash = true;
+                break;
+            }
+        }
+        if (!clash) {
+            g_slots[uint32_t(a)] = size;
+            return uint32_t(a);
+        }
+    }
+    return 0;
+}
 std::map<uint32_t, uint32_t> g_blocks;
 uint32_t g_used[static_cast<size_t>(Region::Count)] = {};
 
@@ -68,9 +87,24 @@ bool map(uint32_t addr, uint32_t size) {
     return true;
 }
 
+uint32_t reserve_slot(uint32_t size, uint32_t align) {
+    std::lock_guard lk(g_lock);
+    return reserve_slot_locked(size, align);
+}
+
+void release_slot(uint32_t addr) {
+    std::lock_guard lk(g_lock);
+    g_slots.erase(addr);
+}
+
 uint32_t alloc(Region region, uint32_t size, uint32_t align) {
     std::lock_guard lk(g_lock);
-    const RegionInfo& r = kRegions[static_cast<size_t>(region)];
+    RegionInfo& r = kRegions[static_cast<size_t>(region)];
+    if (!r.start) {
+        r.start = reserve_slot_locked(r.size, 0x10000000);
+        if (!r.start) return 0;
+        LOG_INFO("vm", "region %u placed at 0x%08x", static_cast<unsigned>(region), r.start);
+    }
     if (align < r.page) align = r.page;
     size = (size + r.page - 1) & ~(r.page - 1);
     const uint64_t end = uint64_t(r.start) + r.size;
@@ -99,7 +133,7 @@ bool dealloc(uint32_t addr) {
     auto it = g_blocks.find(addr);
     if (it == g_blocks.end()) return false;
     for (size_t i = 0; i < static_cast<size_t>(Region::Count); i++) {
-        if (addr >= kRegions[i].start && addr < kRegions[i].start + kRegions[i].size) {
+        if (kRegions[i].start && addr >= kRegions[i].start && addr < kRegions[i].start + kRegions[i].size) {
             g_used[i] -= it->second;
         }
     }

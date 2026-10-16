@@ -4,6 +4,7 @@
 #include "runtime/reservation.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <thread>
 
@@ -144,15 +145,28 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
 }
 
 void semaphore_wait(uint32_t addr, uint32_t value) {
+    static const uint64_t tdr_us = std::getenv("GOWA_TDR_US") ? std::strtoull(std::getenv("GOWA_TDR_US"), nullptr, 10) : 1000000;
     g_rsx.waiting_addr = addr;
     g_rsx.waiting_value = value;
+    auto start = std::chrono::steady_clock::now();
     for (int spins = 0; g_rsx.running; spins++) {
         if (vm::read32(addr) == value) {
             g_rsx.waiting_addr = 0;
             return;
         }
-        if (spins < 64) std::this_thread::yield();
-        else Sleep(0);
+        if (spins < 64) {
+            std::this_thread::yield();
+            continue;
+        }
+        Sleep(0);
+        if (tdr_us && (spins & 255) == 0) {
+            auto waited = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+            if (static_cast<uint64_t>(waited) > tdr_us) {
+                LOG_ERROR("rsx", "semaphore acquire timed out: 0x%08x == 0x%x (value 0x%x)", addr, value, vm::read32(addr));
+                g_rsx.waiting_addr = 0;
+                return;
+            }
+        }
     }
 }
 

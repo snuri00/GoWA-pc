@@ -23,13 +23,6 @@ std::mutex g_lock;
 std::map<uint32_t, Area> g_areas;
 std::map<uint32_t, uint32_t> g_maps;
 
-bool area_free(uint32_t addr, uint32_t size) {
-    for (auto& [a, ar] : g_areas) {
-        if (addr < a + ar.size && a < addr + size) return false;
-    }
-    return true;
-}
-
 const Area* area_of(uint32_t addr) {
     for (auto& [a, ar] : g_areas) {
         if (addr >= a && addr < a + ar.size) return &ar;
@@ -47,20 +40,19 @@ LV2_SYSCALL(330, sys_mmapper_allocate_address) {
     if (!size || size % 0x10000000) return CELL_EALIGN;
     if (!align) align = 0x10000000;
     std::lock_guard lk(g_lock);
-    for (uint64_t a = 0x50000000; a + size <= 0xC0000000; a += align) {
-        if (area_free(static_cast<uint32_t>(a), static_cast<uint32_t>(size))) {
-            g_areas[static_cast<uint32_t>(a)] = {static_cast<uint32_t>(a), static_cast<uint32_t>(size), (flags & 0xF00) == 0x200 ? 0x10000u : 0x100000u};
-            vm::write32(out, static_cast<uint32_t>(a));
-            LOG_INFO("mmapper", "allocate_address 0x%llx -> 0x%08x", static_cast<unsigned long long>(size), static_cast<uint32_t>(a));
-            return CELL_OK;
-        }
-    }
-    return CELL_ENOMEM;
+    uint32_t a = vm::reserve_slot(static_cast<uint32_t>(size), static_cast<uint32_t>(align));
+    if (!a) return CELL_ENOMEM;
+    g_areas[a] = {a, static_cast<uint32_t>(size), (flags & 0xF00) == 0x200 ? 0x10000u : 0x100000u};
+    vm::write32(out, a);
+    LOG_INFO("mmapper", "allocate_address 0x%llx -> 0x%08x", static_cast<unsigned long long>(size), a);
+    return CELL_OK;
 }
 
 LV2_SYSCALL(331, sys_mmapper_free_address) {
     std::lock_guard lk(g_lock);
-    return g_areas.erase(u32arg(ctx, 0)) ? CELL_OK : CELL_EINVAL;
+    if (!g_areas.erase(u32arg(ctx, 0))) return CELL_EINVAL;
+    vm::release_slot(u32arg(ctx, 0));
+    return CELL_OK;
 }
 
 LV2_SYSCALL(332, sys_mmapper_allocate_shared_memory) {
