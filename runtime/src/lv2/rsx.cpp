@@ -1,5 +1,6 @@
 #include "runtime/hostsleep.h"
 #include "event.h"
+#include "gpu/presenter.h"
 #include "ppu/ops.h"
 #include "runtime/reservation.h"
 
@@ -93,6 +94,7 @@ void flip_done(uint32_t buffer) {
     vm::write64(h, ppu::timebase());
     vm::write32(h + 0x10, buffer);
     std::memset(vm::ptr(g_rsx.reports + 0x10), 0, 16);
+    gpu::flip(buffer);
     g_rsx.flips++;
     if ((g_rsx.flips % 60) == 1) LOG_INFO("rsx", "flip %llu (buffer %u)", static_cast<unsigned long long>(g_rsx.flips), buffer);
     send_event(1u << 4);
@@ -135,7 +137,11 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
         }
         send_event(1u << 7);
         return CELL_OK;
-    case 0x100: case 0x101: case 0x104: case 0x105: case 0x106: case 0x108: case 0x10B: case 0x10C: case 0x10D:
+    case 0x104:
+        gpu::set_display_buffer(static_cast<uint32_t>(a3) & 0xFF, static_cast<uint32_t>(a5), static_cast<uint32_t>(a5 >> 32), static_cast<uint32_t>(a4 >> 32),
+                                static_cast<uint32_t>(a4));
+        return CELL_OK;
+    case 0x100: case 0x101: case 0x105: case 0x106: case 0x108: case 0x10B: case 0x10C: case 0x10D:
     case 0x300: case 0x301: case 0x302: case 0x600: case 0x601: case 0x602: case 0x603:
         return CELL_OK;
     default:
