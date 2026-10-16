@@ -289,6 +289,13 @@ def gen_int(m, f):
     if m == "mftb":
         return f"{G(rt)} = {'ppu::timebase()' if f.spr == 268 else 'ppu::timebase() >> 32'};"
     if m == "mfcr":
+        if (f.w >> 20) & 1:
+            fxm = (f.w >> 12) & 0xFF
+            mk = 0
+            for i in range(8):
+                if fxm & (0x80 >> i):
+                    mk |= 0xF << (28 - 4 * i)
+            return f"{G(rt)} = ppu::cr_get(ctx) & 0x{mk:x}u;"
         return f"{G(rt)} = ppu::cr_get(ctx);"
     if m == "mtcrf":
         return f"ppu::cr_put(ctx, 0x{(f.w >> 12) & 0xFF:x}, uint32_t({G(rt)}));"
@@ -372,21 +379,28 @@ def gen_fp(m, f):
         return f"{{ uint32_t ea = {ea_xu(f)}; ppu::stf{'32' if m == 'stfsux' else '64'}(base, ea, {F(d)}); {G(a)} = {G(a)} + {G(b)}; }}"
     if m == "stfiwx":
         return f"ppu::st32(base, {ea_x(f)}, uint32_t(ppu::f2u({F(d)})));"
+    A, B, C = F(a), F(b), F(c)
     s = {
-        "fadd": f"{F(a)} + {F(b)}", "fsub": f"{F(a)} - {F(b)}", "fmul": f"{F(a)} * {F(c)}", "fdiv": f"{F(a)} / {F(b)}",
-        "fadds": f"ppu::frsp({F(a)} + {F(b)})", "fsubs": f"ppu::frsp({F(a)} - {F(b)})",
-        "fmuls": f"ppu::frsp({F(a)} * {F(c)})", "fdivs": f"ppu::frsp({F(a)} / {F(b)})",
-        "fsqrt": f"std::sqrt({F(b)})", "fsqrts": f"ppu::frsp(std::sqrt({F(b)}))",
-        "fmadd": f"std::fma({F(a)}, {F(c)}, {F(b)})", "fmsub": f"std::fma({F(a)}, {F(c)}, -{F(b)})",
-        "fnmadd": f"-std::fma({F(a)}, {F(c)}, {F(b)})", "fnmsub": f"-std::fma({F(a)}, {F(c)}, -{F(b)})",
-        "fmadds": f"ppu::frsp(std::fma({F(a)}, {F(c)}, {F(b)}))", "fmsubs": f"ppu::frsp(std::fma({F(a)}, {F(c)}, -{F(b)}))",
-        "fnmadds": f"ppu::frsp(-std::fma({F(a)}, {F(c)}, {F(b)}))", "fnmsubs": f"ppu::frsp(-std::fma({F(a)}, {F(c)}, -{F(b)}))",
-        "fsel": f"ppu::fsel({F(a)}, {F(c)}, {F(b)})", "fres": f"ppu::frsp(ppu::fres({F(b)}))",
-        "frsqrte": f"ppu::frsqrte({F(b)})", "frsp": f"ppu::frsp({F(b)})",
-        "fmr": F(b), "fneg": f"-{F(b)}", "fabs": f"std::fabs({F(b)})", "fnabs": f"-std::fabs({F(b)})",
-        "fctiw": f"ppu::fctiw({F(b)}, false)", "fctiwz": f"ppu::fctiw({F(b)}, true)",
-        "fctid": f"ppu::fctid({F(b)}, false)", "fctidz": f"ppu::fctid({F(b)}, true)",
-        "fcfid": f"ppu::fcfid({F(b)})",
+        "fadd": f"ppu::fnan({A} + {B}, {A}, {B})", "fsub": f"ppu::fnan({A} - {B}, {A}, {B})",
+        "fmul": f"ppu::fnan({A} * {C}, {A}, {C})", "fdiv": f"ppu::fnan({A} / {B}, {A}, {B})",
+        "fadds": f"ppu::frsp(ppu::fnan({A} + {B}, {A}, {B}))", "fsubs": f"ppu::frsp(ppu::fnan({A} - {B}, {A}, {B}))",
+        "fmuls": f"ppu::frsp(ppu::fnan({A} * {C}, {A}, {C}))", "fdivs": f"ppu::frsp(ppu::fnan({A} / {B}, {A}, {B}))",
+        "fsqrt": f"ppu::fnan(std::sqrt({B}), {B})", "fsqrts": f"ppu::frsp(ppu::fnan(std::sqrt({B}), {B}))",
+        "fmadd": f"ppu::fnan(std::fma({A}, {C}, {B}), {A}, {B}, {C})",
+        "fmsub": f"ppu::fnan(std::fma({A}, {C}, -{B}), {A}, {B}, {C})",
+        "fnmadd": f"ppu::fneg_r(std::fma({A}, {C}, {B}), {A}, {B}, {C})",
+        "fnmsub": f"ppu::fneg_r(std::fma({A}, {C}, -{B}), {A}, {B}, {C})",
+        "fmadds": f"ppu::frsp(ppu::fnan(std::fma({A}, {C}, {B}), {A}, {B}, {C}))",
+        "fmsubs": f"ppu::frsp(ppu::fnan(std::fma({A}, {C}, -{B}), {A}, {B}, {C}))",
+        "fnmadds": f"ppu::frsp(ppu::fneg_r(std::fma({A}, {C}, {B}), {A}, {B}, {C}))",
+        "fnmsubs": f"ppu::frsp(ppu::fneg_r(std::fma({A}, {C}, -{B}), {A}, {B}, {C}))",
+        "fsel": f"ppu::fsel({A}, {C}, {B})", "fres": f"ppu::frsp(ppu::fres({B}))",
+        "frsqrte": f"ppu::frsqrte({B})", "frsp": f"ppu::frsp({B})",
+        "fmr": B, "fneg": f"ppu::u2f(ppu::f2u({B}) ^ 0x8000000000000000ull)",
+        "fabs": f"ppu::u2f(ppu::f2u({B}) & 0x7FFFFFFFFFFFFFFFull)", "fnabs": f"ppu::u2f(ppu::f2u({B}) | 0x8000000000000000ull)",
+        "fctiw": f"ppu::fctiw({B}, false)", "fctiwz": f"ppu::fctiw({B}, true)",
+        "fctid": f"ppu::fctid({B}, false)", "fctidz": f"ppu::fctid({B}, true)",
+        "fcfid": f"ppu::fcfid({B})",
     }.get(m)
     if s:
         out = f"{F(d)} = {s};"
@@ -421,8 +435,8 @@ def gen_fp(m, f):
 VX_FLOAT = {
     "vaddfp": "_mm_add_ps(ppu::vin(ctx, {a}.vf), ppu::vin(ctx, {b}.vf))",
     "vsubfp": "_mm_sub_ps(ppu::vin(ctx, {a}.vf), ppu::vin(ctx, {b}.vf))",
-    "vmaxfp": "_mm_max_ps({a}.vf, {b}.vf)",
-    "vminfp": "_mm_min_ps({a}.vf, {b}.vf)",
+    "vmaxfp": "ppu::vmax(ppu::vin(ctx, {a}.vf), ppu::vin(ctx, {b}.vf))",
+    "vminfp": "ppu::vmin(ppu::vin(ctx, {a}.vf), ppu::vin(ctx, {b}.vf))",
     "vrfin": "_mm_round_ps({b}.vf, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)",
     "vrfiz": "_mm_round_ps({b}.vf, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC)",
     "vrfip": "_mm_round_ps({b}.vf, _MM_FROUND_TO_POS_INF | _MM_FROUND_NO_EXC)",
@@ -496,14 +510,17 @@ def gen_vmx(m, f):
             s += f" ctx.cr[6] = {{0, 0, uint8_t(_mm_testz_si128({d}.vi, {d}.vi)), 0}};"
         return s
     if m in VX_FLOAT:
-        return f"{d}.vf = ppu::vfix(ctx, {VX_FLOAT[m].format(a=a, b=b)});"
+        srcs = f"{a}.vf, {b}.vf, {b}.vf" if m in ("vaddfp", "vsubfp", "vmaxfp", "vminfp") else f"{b}.vf, {b}.vf, {b}.vf"
+        return f"{d}.vf = ppu::vfix(ctx, {VX_FLOAT[m].format(a=a, b=b)}, {srcs});"
     if m == "vmaddfp":
-        return f"{d}.vf = ppu::vfix(ctx, _mm_fmadd_ps(ppu::vin(ctx, {a}.vf), ppu::vin(ctx, {c}.vf), ppu::vin(ctx, {b}.vf)));"
+        return f"{d}.vf = ppu::vfix0(ctx, _mm_fmadd_ps(ppu::vin(ctx, {a}.vf), ppu::vin(ctx, {c}.vf), ppu::vin(ctx, {b}.vf)));"
     if m == "vnmsubfp":
-        return f"{d}.vf = ppu::vfix(ctx, _mm_fnmadd_ps(ppu::vin(ctx, {a}.vf), ppu::vin(ctx, {c}.vf), ppu::vin(ctx, {b}.vf)));"
-    if m in ("vrefp", "vrsqrtefp", "vexptefp", "vlogefp"):
-        fn = {"vrefp": "ppu::vrefp", "vrsqrtefp": "ppu::vrsqrtefp", "vexptefp": "std::exp2", "vlogefp": "std::log2"}[m]
-        return f"{{ ppu::v128 t = {b}; for (int i = 0; i < 4; i++) t.f32[i] = {fn}(t.f32[i]); {d}.vf = ppu::vfix(ctx, t.vf); }}"
+        return f"{d}.vf = ppu::vfix0(ctx, _mm_xor_ps(_mm_fmsub_ps(ppu::vin(ctx, {a}.vf), ppu::vin(ctx, {c}.vf), ppu::vin(ctx, {b}.vf)), _mm_castsi128_ps(_mm_set1_epi32(int32_t(0x80000000u)))));"
+    if m in ("vexptefp", "vlogefp"):
+        return f"{{ ppu::v128 t = {b}; for (int i = 0; i < 4; i++) t.u32[i] = ppu::{m}(t.u32[i], ctx.vscr_nj); {d} = t; }}"
+    if m in ("vrefp", "vrsqrtefp"):
+        fn = {"vrefp": "ppu::vrefp", "vrsqrtefp": "ppu::vrsqrtefp"}[m]
+        return f"{{ ppu::v128 t; t.vf = ppu::vin(ctx, {b}.vf); for (int i = 0; i < 4; i++) t.f32[i] = {fn}(t.f32[i]); {d}.vf = ppu::vfix(ctx, t.vf, {b}.vf, {b}.vf, {b}.vf); }}"
     if m == "vandc":
         return f"{d}.vi = _mm_andnot_si128({b}.vi, {a}.vi);"
     if m == "vnor":
