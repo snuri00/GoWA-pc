@@ -386,6 +386,16 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         } else {
             std::memcpy(p, ls + lsa, size);
         }
+    } else if (ea < 0xF0000000u) {
+        uint32_t done = 0;
+        alignas(16) uint8_t line[128];
+        while (done < size) {
+            uint32_t a = ea + done;
+            uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+            rsv::snapshot(a & ~127u, line);
+            std::memcpy(ls + lsa + done, line + (a & 127), chunk);
+            done += chunk;
+        }
     } else {
         std::memcpy(ls + lsa, p, size);
     }
@@ -612,6 +622,97 @@ void SpuThread::start() {
     std::thread([this] { run(); }).detach();
 }
 
+namespace {
+
+struct ChannelEvent {
+    int kind;
+    uint32_t ch;
+    uint32_t value;
+    uint32_t pc;
+    uint32_t srr0;
+    bool ie;
+    bool halted;
+    bool result;
+    std::shared_ptr<std::vector<uint8_t>> ls_after;
+};
+
+struct RecordHost : Host {
+    SpuThread& t;
+    std::vector<ChannelEvent> events;
+    explicit RecordHost(SpuThread& thread) : t(thread) {}
+    void note(int kind, uint32_t ch, uint32_t value, bool result) {
+        events.push_back({kind, ch, value, t.ctx.pc, t.ctx.srr0, t.ctx.interrupts_enabled, t.ctx.halted, result, nullptr});
+        if (kind == 1 && (ch == 21 || ch == 26)) events.back().ls_after = std::make_shared<std::vector<uint8_t>>(t.ls, t.ls + LS_SIZE);
+    }
+    uint32_t read_channel(uint32_t ch) override {
+        uint32_t v = t.read_channel(ch);
+        note(0, ch, v, true);
+        return v;
+    }
+    void write_channel(uint32_t ch, uint32_t value) override {
+        t.write_channel(ch, value);
+        note(1, ch, value, true);
+    }
+    uint32_t channel_count(uint32_t ch) override {
+        uint32_t v = t.channel_count(ch);
+        note(2, ch, v, true);
+        return v;
+    }
+    bool stop_and_signal(uint32_t code) override {
+        bool r = t.stop_and_signal(code);
+        note(3, code, 0, r);
+        return r;
+    }
+    void halt(uint32_t pc, uint32_t word) override {
+        t.halt(pc, word);
+        note(4, pc, word, true);
+    }
+};
+
+struct ReplayHost : Host {
+    Context& c;
+    const std::vector<ChannelEvent>& events;
+    size_t pos = 0;
+    std::string error;
+    ReplayHost(Context& ctx, const std::vector<ChannelEvent>& ev) : c(ctx), events(ev) {}
+    const ChannelEvent* next(int kind, uint32_t ch, uint32_t value, bool check_value) {
+        if (pos >= events.size()) {
+            if (error.empty()) error = "extra channel op kind " + std::to_string(kind) + " ch " + std::to_string(ch);
+            return nullptr;
+        }
+        const ChannelEvent& e = events[pos++];
+        if (e.kind != kind || e.ch != ch || (check_value && e.value != value)) {
+            if (error.empty()) {
+                char b[160];
+                std::snprintf(b, sizeof b, "channel op %zu: aot kind %d ch %u val 0x%x, int kind %d ch %u val 0x%x", pos - 1, kind, ch, value, e.kind, e.ch, e.value);
+                error = b;
+            }
+        }
+        c.pc = e.pc;
+        c.srr0 = e.srr0;
+        c.interrupts_enabled = e.ie;
+        c.halted = e.halted;
+        if (e.ls_after) std::memcpy(c.ls, e.ls_after->data(), LS_SIZE);
+        return &e;
+    }
+    uint32_t read_channel(uint32_t ch) override {
+        const ChannelEvent* e = next(0, ch, 0, false);
+        return e ? e->value : 0;
+    }
+    void write_channel(uint32_t ch, uint32_t value) override { next(1, ch, value, true); }
+    uint32_t channel_count(uint32_t ch) override {
+        const ChannelEvent* e = next(2, ch, 0, false);
+        return e ? e->value : 0;
+    }
+    bool stop_and_signal(uint32_t code) override {
+        const ChannelEvent* e = next(3, code, 0, false);
+        return e ? e->result : false;
+    }
+    void halt(uint32_t pc, uint32_t word) override { next(4, pc, word, true); }
+};
+
+}
+
 void SpuThread::run() {
     wchar_t w[64];
     swprintf(w, 64, L"SPU %u %hs", slot, name.c_str());
@@ -646,6 +747,7 @@ void SpuThread::run() {
     }();
     const bool aot_on = aot::active();
     const bool verify = std::getenv("GOWA_SPU_AOT_VERIFY") != nullptr;
+    bool halted_in_verify = false;
     const bool pure_only = std::getenv("GOWA_SPU_AOT_PURE_ONLY") != nullptr;
     std::vector<uint8_t> verify_ls(verify ? LS_SIZE : 0);
     std::unordered_map<const CompiledBlock*, int> verify_count;
@@ -656,10 +758,19 @@ void SpuThread::run() {
         Context copy = ctx;
         std::memcpy(verify_ls.data(), ls, LS_SIZE);
         copy.ls = verify_ls.data();
-        b->fn(copy, *this);
         uint32_t start = ctx.pc;
-        for (uint32_t k = 0; k < b->words; k++) step(ctx, *this);
-        bool bad = copy.pc != ctx.pc || std::memcmp(copy.gpr, ctx.gpr, sizeof ctx.gpr) != 0 || std::memcmp(verify_ls.data(), ls, LS_SIZE) != 0;
+        RecordHost recorder(*this);
+        bool int_ok = true;
+        for (uint32_t k = 0; k < b->words; k++) {
+            int_ok = step(ctx, recorder);
+            if (!int_ok) break;
+            if (k + 1 < b->words && ctx.pc != ((start + 4 * (k + 1)) & PC_MASK)) break;
+        }
+        ReplayHost replay(copy, recorder.events);
+        bool aot_ok = b->fn(copy, replay);
+        if (replay.error.empty() && replay.pos != recorder.events.size()) replay.error = "aot consumed " + std::to_string(replay.pos) + " of " + std::to_string(recorder.events.size()) + " channel ops";
+        bool bad = !replay.error.empty() || aot_ok != int_ok || copy.pc != ctx.pc || copy.srr0 != ctx.srr0 || copy.interrupts_enabled != ctx.interrupts_enabled ||
+                   std::memcmp(copy.gpr, ctx.gpr, sizeof ctx.gpr) != 0 || std::memcmp(verify_ls.data(), ls, LS_SIZE) != 0;
         if (bad) {
             std::string diff;
             for (int r = 0; r < 128; r++) {
@@ -669,9 +780,10 @@ void SpuThread::run() {
                               ctx.gpr[r].u32[1], ctx.gpr[r].u32[0]);
                 diff += t;
             }
-            LOG_ERROR("spuaot", "MISMATCH block lsa 0x%05x words %u: pc aot 0x%05x int 0x%05x ls %s%s", start, b->words, copy.pc, ctx.pc,
-                      std::memcmp(verify_ls.data(), ls, LS_SIZE) ? "differs" : "same", diff.c_str());
+            LOG_ERROR("spuaot", "MISMATCH block lsa 0x%05x words %u pure %d: ok %d/%d pc aot 0x%05x int 0x%05x ie %d/%d ls %s %s%s", start, b->words, b->pure ? 1 : 0, aot_ok, int_ok, copy.pc, ctx.pc,
+                      copy.interrupts_enabled, ctx.interrupts_enabled, std::memcmp(verify_ls.data(), ls, LS_SIZE) ? "differs" : "same", replay.error.c_str(), diff.c_str());
         }
+        if (!int_ok) halted_in_verify = true;
         return true;
     };
     std::vector<const CompiledBlock*> block_cache(aot_on ? LS_SIZE / 4 : 0, nullptr);
@@ -690,9 +802,10 @@ void SpuThread::run() {
                     b = aot::find(ls, ctx.pc);
                     slot = b;
                 }
-                if (b && verify && b->pure && verify_block(b)) {
+                if (b && verify && verify_block(b)) {
                     n += b->words;
                     block_start = true;
+                    if (halted_in_verify) break;
                     continue;
                 }
                 if (b && pure_only && !b->pure) b = nullptr;
