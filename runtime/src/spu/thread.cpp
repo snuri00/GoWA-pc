@@ -6,7 +6,11 @@
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
 
+#include <algorithm>
+#include <map>
+#include <string>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <malloc.h>
 
@@ -56,6 +60,19 @@ uint32_t SpuThread::dec_now() {
 void SpuThread::set_events(uint32_t bits) {
     events |= bits;
     if (event_mask & bits) event_count = true;
+}
+
+void SpuThread::check_interrupt() {
+    if (!ctx.interrupts_enabled) return;
+    std::lock_guard lk(m);
+    collect_events();
+    if (!event_count) return;
+    ctx.interrupts_enabled = false;
+    ctx.srr0 = ctx.pc;
+    uint32_t w;
+    std::memcpy(&w, ls, 4);
+    w = __builtin_bswap32(w);
+    ctx.pc = (w & 0xFD80007Fu) == 0x30000000u ? ((w >> 5) & 0x3FFFCu) : 0;
 }
 
 void SpuThread::collect_events() {
@@ -190,6 +207,8 @@ void SpuThread::write_channel(uint32_t ch, uint32_t value) {
         collect_events();
         event_mask = value;
         if (events & event_mask) event_count = true;
+        lk.unlock();
+        check_interrupt();
         return;
     case 2:
         collect_events();
@@ -199,6 +218,8 @@ void SpuThread::write_channel(uint32_t ch, uint32_t value) {
         }
         events &= ~value;
         event_count = (events & event_mask) != 0;
+        lk.unlock();
+        check_interrupt();
         return;
     case 7:
         collect_events();
@@ -537,9 +558,15 @@ void SpuThread::run() {
     _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
     LOG_INFO("spu", "thread 0x%x '%s' start pc 0x%05x args 0x%llx 0x%llx", id, name.c_str(), ctx.pc,
              static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));
+    register_thread(this);
     uint32_t n = 0;
     while (step(ctx, *this)) {
-        if ((++n & 1023) == 0 && stop_flag.load(std::memory_order_relaxed)) break;
+        if (ctx.interrupts_enabled && (n & 63) == 0) check_interrupt();
+        if ((++n & 1023) == 0) {
+            insns.fetch_add(1024, std::memory_order_relaxed);
+            pc_samples[pc_sample_pos.fetch_add(1, std::memory_order_relaxed) & 255] = ctx.pc;
+            if (stop_flag.load(std::memory_order_relaxed)) break;
+        }
     }
     LOG_INFO("spu", "thread 0x%x '%s' stopped at 0x%05x", id, name.c_str(), ctx.pc);
     {
@@ -548,6 +575,38 @@ void SpuThread::run() {
         in_mbox.clear();
     }
     if (group) group->thread_stopped(*this);
+}
+
+namespace {
+std::mutex g_reg_lock;
+std::vector<SpuThread*> g_reg;
+}
+
+void register_thread(SpuThread* t) {
+    std::lock_guard lk(g_reg_lock);
+    if (std::find(g_reg.begin(), g_reg.end(), t) == g_reg.end()) g_reg.push_back(t);
+}
+
+void status_dump() {
+    std::lock_guard lk(g_reg_lock);
+    for (SpuThread* t : g_reg) {
+        LOG_INFO("status", "spu 0x%x '%s' pc 0x%05x insns %llu mask 0x%x events 0x%x raddr 0x%08x running %d", t->id, t->name.c_str(), t->ctx.pc,
+                 static_cast<unsigned long long>(t->insns.load()), t->event_mask, t->events, t->raddr, t->running ? 1 : 0);
+        std::map<uint32_t, int> hist;
+        for (uint32_t pc : t->pc_samples) hist[pc & ~0x3Fu]++;
+        std::vector<std::pair<int, uint32_t>> top;
+        for (auto& [pc, n] : hist) top.push_back({n, pc});
+        std::sort(top.rbegin(), top.rend());
+        std::string line;
+        for (size_t i = 0; i < top.size() && i < 6; i++) line += " " + std::to_string(top[i].first) + "@" + std::to_string(top[i].second);
+        LOG_INFO("status", "   hot pcs (count@addr dec):%s", line.c_str());
+        char fn[64];
+        std::snprintf(fn, sizeof fn, "spu_%08x.ls", t->id);
+        if (FILE* f = std::fopen(fn, "wb")) {
+            std::fwrite(t->ls, 1, LS_SIZE, f);
+            std::fclose(f);
+        }
+    }
 }
 
 SpuThread* Group::by_slot(uint32_t slot) {

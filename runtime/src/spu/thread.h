@@ -32,6 +32,9 @@ struct SpuThread : Host {
     std::mutex m;
     std::condition_variable cv;
     std::atomic<bool> stop_flag{false};
+    std::atomic<uint64_t> insns{0};
+    uint32_t pc_samples[256] = {};
+    std::atomic<uint32_t> pc_sample_pos{0};
     bool running = false;
     uint32_t exit_status = 0;
     bool exited_by_thread_exit = false;
@@ -89,6 +92,7 @@ struct SpuThread : Host {
 
 private:
     void set_events(uint32_t bits);
+    void check_interrupt();
     void collect_events();
     uint32_t dec_now();
     void process_mfc(uint32_t cmd);
@@ -99,6 +103,9 @@ private:
     bool block(std::unique_lock<std::mutex>& lk, Pred pred);
     uint32_t pop_out_mbox();
 };
+
+void register_thread(SpuThread* t);
+void status_dump();
 
 struct Group {
     uint32_t id = 0;
