@@ -4,6 +4,7 @@
 #include "runtime/log.h"
 
 #include <chrono>
+#include <immintrin.h>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -54,6 +55,8 @@ bool watched_line(uint32_t line) {
         }
         return v;
     }();
+    static const bool jm = std::getenv("GOWA_RSV_LOG") && std::string(std::getenv("GOWA_RSV_LOG")) == "jm";
+    if (jm) return vm::read32(line) == 0x007a7b00u || line == 0x3001ad00u;
     for (uint32_t l : lines) if (l == line) return true;
     return false;
 }
@@ -76,7 +79,16 @@ bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uin
     if (e.ver.load(std::memory_order_acquire) != rtime) return false;
     if (std::memcmp(vm::ptr(line + offset), expected, size) != 0) return false;
     log_change(line, offset, data, size, size == 128 ? "putllc" : "stcx");
-    std::memcpy(vm::ptr(line + offset), data, size);
+    uint8_t* dst = vm::ptr(line + offset);
+    for (uint32_t i = 0; i < size; i += 8) {
+        uint64_t want, was;
+        std::memcpy(&want, data + i, 8);
+        std::memcpy(&was, expected + i, 8);
+        if (want == was) continue;
+        for (uint32_t b = 0; b < 8; b++) {
+            if (data[i + b] != expected[i + b]) dst[i + b] = data[i + b];
+        }
+    }
     e.ver.fetch_add(128, std::memory_order_release);
     e.ver.notify_all();
     return true;
@@ -111,6 +123,15 @@ void wait_change(uint32_t line, uint64_t rtime, uint32_t micros) {
     while (e.ver.load(std::memory_order_acquire) == rtime && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
     }
+}
+
+bool wait_lost(uint32_t line, uint64_t rtime, const uint8_t* rdata, uint32_t micros) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
+    do {
+        if (lost(line, rtime, rdata)) return true;
+        _mm_pause();
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
 }
 
 }

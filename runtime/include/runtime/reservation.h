@@ -12,5 +12,6 @@ void store_unconditional(uint32_t line, const uint8_t* data);
 void store_locked(uint32_t addr, const void* data, uint32_t size);
 bool lost(uint32_t line, uint64_t rtime, const uint8_t* rdata);
 void wait_change(uint32_t line, uint64_t rtime, uint32_t micros);
+bool wait_lost(uint32_t line, uint64_t rtime, const uint8_t* rdata, uint32_t micros);
 
 }

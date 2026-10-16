@@ -149,8 +149,10 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
             if ((event_mask & EV_LR) && raddr) {
                 uint32_t line = raddr;
                 uint64_t rt = rtime;
+                uint8_t snap[128];
+                std::memcpy(snap, rdata, 128);
                 lk.unlock();
-                rsv::wait_change(line, rt, 100);
+                rsv::wait_lost(line, rt, snap, 100);
                 lk.lock();
             } else {
                 cv.wait_for(lk, std::chrono::microseconds(100));
@@ -589,7 +591,32 @@ void SpuThread::run() {
              static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));
     register_thread(this);
     uint32_t n = 0;
+    static const std::vector<uint32_t> bps = [] {
+        std::vector<uint32_t> v;
+        if (const char* e = std::getenv("GOWA_SPU_BP")) {
+            std::string s = e;
+            size_t pos = 0;
+            while (pos < s.size()) {
+                size_t end = s.find(',', pos);
+                if (end == std::string::npos) end = s.size();
+                v.push_back(static_cast<uint32_t>(std::strtoul(s.substr(pos, end - pos).c_str(), nullptr, 16)));
+                pos = end + 1;
+            }
+        }
+        return v;
+    }();
     while (step(ctx, *this)) {
+        if (!bps.empty()) {
+            for (uint32_t bp : bps) {
+                if (ctx.pc == bp) {
+                    uint32_t wid;
+                    std::memcpy(&wid, ls + 0x1dc, 4);
+                    LOG_INFO("spubp", "thread 0x%x pc 0x%05x wid %u r3 %08x r4 %08x r5 %08x lr(r0) %05x", id, ctx.pc, __builtin_bswap32(wid), ctx.gpr[3].u32[3], ctx.gpr[4].u32[3],
+                             ctx.gpr[5].u32[3], ctx.gpr[0].u32[3]);
+                    break;
+                }
+            }
+        }
         if (ctx.irq_check) {
             ctx.irq_check = false;
             check_interrupt();

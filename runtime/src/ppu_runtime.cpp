@@ -169,6 +169,7 @@ void call_import(Context& ctx, uint8_t* base, uint32_t index) {
         LOG_TRACE("import", "%s::%s -> LLE 0x%08x", imp.module, imp.name, code);
         call_indirect(ctx, base, code);
         ctx.gpr[2] = ld64(base, sp + 0x28);
+        if (slot.log_args) LOG_INFO("import", "%s::%s returned 0x%llx", imp.module, imp.name, static_cast<unsigned long long>(ctx.gpr[3]));
         return;
     }
     if (st == kHle) {
