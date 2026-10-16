@@ -307,6 +307,8 @@ void vblank_thread() {
 
 }
 
+uint32_t rsx_address(uint32_t offset, uint32_t loc) { return get_address(offset, loc); }
+
 void rsx_status() {
     if (!g_rsx.dma_control) return;
     if (std::getenv("GOWA_RSX_STATS")) {

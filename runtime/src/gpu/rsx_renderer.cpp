@@ -4,6 +4,8 @@
 #include "vk_context.h"
 #include "shader_compiler.h"
 #include "vp_decompiler.h"
+#include "fp_decompiler.h"
+#include "runtime/memory.h"
 
 #include <cstdio>
 #include <cstring>
@@ -13,6 +15,10 @@
 #include <memory>
 #include <tuple>
 #include <vector>
+
+namespace lv2 {
+uint32_t rsx_address(uint32_t offset, uint32_t loc);
+}
 
 namespace gpu::rsx {
 
@@ -93,6 +99,72 @@ uint64_t hash_program(uint32_t start) {
         }
     }
     return h;
+}
+
+struct FpEntry {
+    bool ok = false;
+};
+std::unordered_map<uint64_t, FpEntry> g_fp_cache;
+uint32_t g_fp_failures = 0;
+
+uint32_t texture_dims() {
+    uint32_t d = 0;
+    for (uint32_t u = 0; u < 16; u++) {
+        uint32_t f = R(0x1A04 + u * 0x20);
+        uint32_t dim = (f >> 4) & 0xF;
+        uint32_t v = dim == 1 ? 0 : dim == 3 ? 3 : (f & 4) ? 2 : 1;
+        d |= v << (u * 2);
+    }
+    return d;
+}
+
+uint32_t mrt_count() {
+    switch (R(0x0220)) {
+    case 0x13: return 2;
+    case 0x17: return 3;
+    case 0x1F: return 4;
+    default: return 1;
+    }
+}
+
+void check_fragment_program() {
+    uint32_t prog = R(0x08E4);
+    uint32_t loc = (prog & 3) - 1;
+    uint32_t ea = lv2::rsx_address(prog & ~3u, loc);
+    if (!ea) return;
+    FpWordReader read = [ea](uint32_t i) {
+        uint32_t v = vm::read32(ea + i * 4);
+        return (v << 16) | (v >> 16);
+    };
+    FragmentProgramInfo a = analyse_fragment_program(read);
+    if (!a.valid) return;
+    FragmentProgramKey key;
+    key.control = R(0x1D60) & 0xCE;
+    uint32_t dims = texture_dims();
+    for (uint32_t u = 0; u < 16; u++) {
+        if (a.texture_mask & (1u << u)) key.texture_dims |= dims & (3u << (u * 2));
+    }
+    key.mrt_count = mrt_count();
+    uint64_t h = a.hash ^ (uint64_t(key.control) << 1) ^ (uint64_t(key.texture_dims) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(key.mrt_count) << 40);
+    if (g_fp_cache.count(h)) return;
+    FpEntry& e = g_fp_cache[h];
+    FragmentProgramInfo fp = decompile_fragment_program(read, key);
+    std::vector<uint32_t> spirv;
+    std::string log;
+    e.ok = fp.valid && compile_glsl(ShaderStage::Fragment, fp.glsl, spirv, log);
+    if (!e.ok && g_fp_failures++ < 20) {
+        char fn[64];
+        std::snprintf(fn, sizeof fn, "fp_fail_%016llx.frag", static_cast<unsigned long long>(h));
+        if (FILE* f = std::fopen(fn, "w")) {
+            std::fputs(fp.glsl.c_str(), f);
+            std::fputs("\n/*\n", f);
+            std::fputs(log.c_str(), f);
+            std::fputs("\n*/\n", f);
+            std::fclose(f);
+        }
+    }
+    LOG_INFO("rsx", "fragment program %016llx at 0x%08x (%u slots, %zu literals): %s (%zu seen, %u failures)", static_cast<unsigned long long>(h), ea, fp.length_slots,
+             fp.literal_slots.size(), e.ok ? "ok" : "FAILED", g_fp_cache.size(), g_fp_failures);
 }
 
 void check_vertex_program() {
@@ -261,7 +333,10 @@ void method(uint32_t reg, uint32_t arg) {
     switch (reg) {
     case CLEAR_SURFACE: clear(arg); break;
     case BEGIN_END:
-        if (arg) check_vertex_program();
+        if (arg) {
+            check_vertex_program();
+            check_fragment_program();
+        }
         break;
     default: break;
     }
