@@ -27,6 +27,13 @@ def spu_elf_span(d, off):
     return end
 
 
+def seg_end(elf, addr):
+    for t, _, _, va, _, fs, _, _ in elf.phdrs:
+        if t == 1 and va <= addr < va + fs:
+            return va + fs
+    return None
+
+
 def scan(elf, region):
     lo, hi = region
     d = elf.d
@@ -54,7 +61,8 @@ def scan(elf, region):
             if lo <= v < hi and v % 16 == 0:
                 refs[v].append(va + k)
     for v in refs:
-        starts.setdefault(v, ("blob", None))
+        if seg_end(elf, v):
+            starts.setdefault(v, ("blob", None))
     order = []
     covered = 0
     for addr in sorted(starts):
@@ -68,7 +76,7 @@ def scan(elf, region):
     for n, addr in enumerate(order):
         kind, span = starts[addr]
         nxt = order[n + 1] if n + 1 < len(order) else hi
-        size = span if span else nxt - addr
+        size = min(span if span else nxt - addr, seg_end(elf, addr) - addr)
         data = elf.read(addr, size)
         images.append({
             "addr": addr,
@@ -83,9 +91,11 @@ def scan(elf, region):
     return images
 
 
-def main(elf_path, lo, hi, out_dir):
+def main(elf_path, lo, hi, out_dir, mode="all"):
     elf = Elf(elf_path)
     images = scan(elf, (int(lo, 16), int(hi, 16)))
+    if mode == "noblob":
+        images = [im for im in images if im["kind"] != "blob"]
     os.makedirs(out_dir, exist_ok=True)
     meta = []
     for im in images:
@@ -100,4 +110,4 @@ def main(elf_path, lo, hi, out_dir):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:5])
+    main(*sys.argv[1:6])
