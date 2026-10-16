@@ -16,6 +16,7 @@
 
 namespace crash {
 std::string sample_stack(void* native, int depth);
+void profile_thread(void* native, const char* name);
 }
 
 namespace lv2 {
@@ -247,6 +248,7 @@ HANDLE g_fifo_handle = nullptr;
 void fifo_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX FIFO");
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_fifo_handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    if (std::getenv("GOWA_PROFILE_FIFO")) crash::profile_thread(g_fifo_handle, "rsx fifo");
     LOG_INFO("rsx", "null RSX FIFO thread started");
     uint32_t ctrl = g_rsx.dma_control;
     uint32_t idle = 0;
@@ -268,12 +270,14 @@ void fifo_thread() {
         uint32_t cmd = vm::read32(ea);
         static const bool trace = std::getenv("GOWA_RSX_TRACE") != nullptr;
         if (trace) LOG_INFO("rsxc", "get 0x%08x cmd 0x%08x", get, cmd);
-        if ((cmd & 0xE0000003) == 0x20000000) {
-            vm::write32(ctrl + 0x44, cmd & 0x1FFFFFFC);
-            continue;
-        }
-        if ((cmd & 0xE0000003) == 0x00000001) {
-            vm::write32(ctrl + 0x44, cmd & 0xFFFFFFFC);
+        if ((cmd & 0xE0000003) == 0x20000000 || (cmd & 0xE0000003) == 0x00000001) {
+            uint32_t target = (cmd & 3) == 1 ? cmd & 0xFFFFFFFC : cmd & 0x1FFFFFFC;
+            if (target == get) {
+                if (++idle < 256) std::this_thread::yield();
+                else Sleep(1);
+                continue;
+            }
+            vm::write32(ctrl + 0x44, target);
             continue;
         }
         if ((cmd & 3) == 2) {

@@ -7,6 +7,11 @@
 #include <string>
 
 #define WIN32_LEAN_AND_MEAN
+#include <thread>
+#include <map>
+#include <vector>
+#include <algorithm>
+#include <chrono>
 #include <windows.h>
 #include <dbghelp.h>
 
@@ -170,6 +175,62 @@ std::string sample_stack(void* native, int depth) {
     }
     ResumeThread(h);
     return line;
+}
+
+void profile_thread(void* native, const char* name) {
+    std::thread([native, name] {
+        HANDLE h = static_cast<HANDLE>(native);
+        std::map<std::string, uint64_t> counts;
+        uint64_t total = 0;
+        auto last = std::chrono::steady_clock::now();
+        for (;;) {
+            Sleep(1);
+            if (SuspendThread(h) == static_cast<DWORD>(-1)) return;
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_FULL;
+            DWORD64 pcs[3] = {};
+            int n = 0;
+            if (GetThreadContext(h, &c)) {
+                for (; n < 3; n++) {
+                    pcs[n] = c.Rip;
+                    DWORD64 image = 0;
+                    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
+                    if (!fn) {
+                        n++;
+                        break;
+                    }
+                    PVOID handler_data = nullptr;
+                    DWORD64 frame = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, fn, &c, &handler_data, &frame, nullptr);
+                    if (!c.Rip) {
+                        n++;
+                        break;
+                    }
+                }
+            }
+            ResumeThread(h);
+            std::string key;
+            for (int i = 0; i < n; i++) {
+                std::string sym = symbol_of(pcs[i]);
+                size_t plus = sym.rfind('+');
+                if (plus != std::string::npos) sym.resize(plus);
+                key += (i ? " <- " : "") + sym;
+            }
+            counts[key]++;
+            total++;
+            auto now = std::chrono::steady_clock::now();
+            if (now - last > std::chrono::seconds(5)) {
+                last = now;
+                std::vector<std::pair<uint64_t, std::string>> top;
+                for (auto& [k, v] : counts) top.push_back({v, k});
+                std::sort(top.rbegin(), top.rend());
+                LOG_INFO("profile", "%s: %llu samples", name, static_cast<unsigned long long>(total));
+                for (size_t i = 0; i < top.size() && i < 12; i++) LOG_INFO("profile", "  %5.1f%% %s", 100.0 * top[i].first / total, top[i].second.c_str());
+                counts.clear();
+                total = 0;
+            }
+        }
+    }).detach();
 }
 
 void log_here(const char* tag) {
