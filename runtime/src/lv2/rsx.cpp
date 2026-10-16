@@ -1,12 +1,14 @@
 #include "runtime/hostsleep.h"
 #include "event.h"
 #include "gpu/presenter.h"
+#include "gpu/rsx.h"
 #include "ppu/ops.h"
 #include "runtime/reservation.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <string>
 #include <thread>
 
 #define WIN32_LEAN_AND_MEAN
@@ -94,7 +96,6 @@ void flip_done(uint32_t buffer) {
     vm::write64(h, ppu::timebase());
     vm::write32(h + 0x10, buffer);
     std::memset(vm::ptr(g_rsx.reports + 0x10), 0, 16);
-    gpu::flip(buffer);
     g_rsx.flips++;
     if ((g_rsx.flips % 60) == 1) LOG_INFO("rsx", "flip %llu (buffer %u)", static_cast<unsigned long long>(g_rsx.flips), buffer);
     send_event(1u << 4);
@@ -111,6 +112,7 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
         uint32_t v = static_cast<uint32_t>(a4);
         uint32_t buffer = (v & 0x80000000u) ? (v & 0xF) : 0;
         if ((v & 0x80000000u) && buffer > 7) buffer = vm::read32(head_addr(head) + 0x14);
+        if (!gpu::rsx::present(buffer)) gpu::flip(buffer);
         g_rsx.pending_flip = buffer;
         while (g_rsx.pending_flip >= 0 && g_rsx.running) Sleep(0);
         return CELL_OK;
@@ -176,12 +178,16 @@ void semaphore_wait(uint32_t addr, uint32_t value) {
     }
 }
 
+std::atomic<uint64_t> g_method_counts[0x4000];
+
 void execute(uint32_t reg, uint32_t arg) {
+    g_method_counts[(reg >> 2) & 0x3FFF].fetch_add(1, std::memory_order_relaxed);
     g_rsx.last_method.store(reg, std::memory_order_relaxed);
     g_rsx.last_arg.store(arg, std::memory_order_relaxed);
     if (reg >= 0xE000) LOG_DEBUG("rsx", "driver method 0x%04x arg 0x%08x", reg, arg);
     static const bool trace = std::getenv("GOWA_RSX_TRACE") != nullptr;
     if (trace) LOG_INFO("rsxm", "0x%04x 0x%08x", reg, arg);
+    if (reg < 0xE000) gpu::rsx::method(reg, arg);
     switch (reg) {
     case 0x50: vm::write32(g_rsx.dma_control + 0x48, arg); break;
     case 0x60: g_rsx.sema_ctx_406e = arg; break;
@@ -303,6 +309,22 @@ void vblank_thread() {
 
 void rsx_status() {
     if (!g_rsx.dma_control) return;
+    if (std::getenv("GOWA_RSX_STATS")) {
+        std::string line;
+        char b[32];
+        int n = 0;
+        for (uint32_t i = 0; i < 0x4000; i++) {
+            uint64_t c = g_method_counts[i].load();
+            if (!c) continue;
+            std::snprintf(b, sizeof b, " %04x:%llu", i * 4, static_cast<unsigned long long>(c));
+            line += b;
+            if (++n % 16 == 0) {
+                LOG_INFO("rsxstat", "%s", line.c_str());
+                line.clear();
+            }
+        }
+        if (!line.empty()) LOG_INFO("rsxstat", "%s", line.c_str());
+    }
     uint32_t put = vm::read32(g_rsx.dma_control + 0x40), get = vm::read32(g_rsx.dma_control + 0x44);
     LOG_INFO("status", "rsx handlers 0x%08x head1 flags 0x%08x vblanks %llu", vm::read32(g_rsx.driver_info + 0x12C0), vm::read32(head_addr(1) + 8),
              static_cast<unsigned long long>(vm::read64(head_addr(1) + 0x30)));

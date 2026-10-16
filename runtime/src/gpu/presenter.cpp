@@ -1,11 +1,7 @@
 #include "gpu/presenter.h"
+#include "vk_context.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
-
-#define VK_USE_PLATFORM_WIN32_KHR
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <volk.h>
 
 #include <atomic>
 #include <condition_variable>
@@ -57,6 +53,8 @@ struct State {
     std::mutex m;
     bool ready = false;
     bool resized = false;
+    bool recording = false;
+    VkCtx ctx;
 };
 
 State g;
@@ -75,7 +73,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 }
 
-uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags flags) {
+uint32_t find_memory_impl(uint32_t bits, VkMemoryPropertyFlags flags) {
     VkPhysicalDeviceMemoryProperties props;
     vkGetPhysicalDeviceMemoryProperties(g.phys, &props);
     for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
@@ -150,7 +148,7 @@ bool ensure_frame(uint32_t w, uint32_t h) {
     vkGetImageMemoryRequirements(g.device, g.frame, &req);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
-    ai.memoryTypeIndex = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    ai.memoryTypeIndex = find_memory_impl(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     vkAllocateMemory(g.device, &ai, nullptr, &g.frame_mem);
     vkBindImageMemory(g.device, g.frame, g.frame_mem, 0);
     g.staging_size = VkDeviceSize(w) * h * 4;
@@ -160,13 +158,23 @@ bool ensure_frame(uint32_t w, uint32_t h) {
     vkCreateBuffer(g.device, &bi, nullptr, &g.staging);
     vkGetBufferMemoryRequirements(g.device, g.staging, &req);
     ai.allocationSize = req.size;
-    ai.memoryTypeIndex = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    ai.memoryTypeIndex = find_memory_impl(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     vkAllocateMemory(g.device, &ai, nullptr, &g.staging_mem);
     vkBindBufferMemory(g.device, g.staging, g.staging_mem, 0);
     vkMapMemory(g.device, g.staging_mem, 0, g.staging_size, 0, &g.staging_ptr);
     g.frame_w = w;
     g.frame_h = h;
     return true;
+}
+
+void begin_frame() {
+    if (g.recording) return;
+    vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
+    vkResetCommandBuffer(g.cmd, 0);
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(g.cmd, &begin);
+    g.recording = true;
 }
 
 void barrier(VkImage img, VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst) {
@@ -235,7 +243,7 @@ bool init() {
     }
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "gowa";
-    app.apiVersion = VK_API_VERSION_1_2;
+    app.apiVersion = VK_API_VERSION_1_3;
     const char* exts[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
@@ -279,7 +287,12 @@ bool init() {
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
     const char* dexts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    f13.dynamicRendering = VK_TRUE;
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &f13;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = 1;
@@ -287,6 +300,7 @@ bool init() {
     if (vkCreateDevice(g.phys, &dci, nullptr, &g.device) != VK_SUCCESS) return false;
     volkLoadDevice(g.device);
     vkGetDeviceQueue(g.device, g.queue_family, 0, &g.queue);
+    g.ctx = {g.phys, g.device, g.queue, g.queue_family};
     if (!create_swapchain()) return false;
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -321,46 +335,35 @@ void set_display_buffer(uint32_t id, uint32_t offset, uint32_t pitch, uint32_t w
     LOG_INFO("gpu", "display buffer %u: offset 0x%x pitch %u %ux%u", id, offset, pitch, width, height);
 }
 
-void flip(uint32_t id) {
-    if (!g_enabled || id >= 8) return;
-    std::lock_guard lk(g.m);
-    const DisplayBuffer d = g.buffers[id];
-    if (!d.width || !d.height || !d.pitch) return;
-    if (g.resized) {
-        vkDeviceWaitIdle(g.device);
-        if (!create_swapchain()) return;
-        g.resized = false;
-    }
-    vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
-    if (!ensure_frame(d.width, d.height)) return;
-    uint32_t index = 0;
-    VkResult r = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX, g.acquired, VK_NULL_HANDLE, &index);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
-        g.resized = true;
-        return;
-    }
-    vkResetFences(g.device, 1, &g.fence);
-    convert(d);
-    vkResetCommandBuffer(g.cmd, 0);
-    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(g.cmd, &begin);
-    barrier(g.frame, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-    VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {d.width, d.height, 1};
-    vkCmdCopyBufferToImage(g.cmd, g.staging, g.frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    barrier(g.frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    VkImage dst = g.swap_images[index];
-    barrier(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-    VkImageBlit blit{};
-    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.srcOffsets[1] = {int32_t(d.width), int32_t(d.height), 1};
-    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.dstOffsets[1] = {int32_t(g.swap_extent.width), int32_t(g.swap_extent.height), 1};
-    vkCmdBlitImage(g.cmd, g.frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-    barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+const VkCtx& vk() { return g.ctx; }
+
+VkCommandBuffer frame_cmd() {
+    begin_frame();
+    return g.cmd;
+}
+
+uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags flags) { return find_memory_impl(bits, flags); }
+
+void image_barrier(VkCommandBuffer cmd, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to) {
+    if (from == to) return;
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange = {aspect, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+namespace {
+
+void submit_and_present(uint32_t index) {
     vkEndCommandBuffer(g.cmd);
+    g.recording = false;
+    vkResetFences(g.device, 1, &g.fence);
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.waitSemaphoreCount = 1;
@@ -377,8 +380,92 @@ void flip(uint32_t id) {
     pi.swapchainCount = 1;
     pi.pSwapchains = &g.swapchain;
     pi.pImageIndices = &index;
-    r = vkQueuePresentKHR(g.queue, &pi);
+    VkResult r = vkQueuePresentKHR(g.queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
+}
+
+void flush_without_present() {
+    if (!g.recording) return;
+    vkEndCommandBuffer(g.cmd);
+    g.recording = false;
+    vkResetFences(g.device, 1, &g.fence);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g.cmd;
+    vkQueueSubmit(g.queue, 1, &si, g.fence);
+}
+
+bool acquire(uint32_t& index) {
+    if (g.resized) {
+        flush_without_present();
+        vkDeviceWaitIdle(g.device);
+        if (!create_swapchain()) return false;
+        g.resized = false;
+        begin_frame();
+    }
+    VkResult r = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX, g.acquired, VK_NULL_HANDLE, &index);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        g.resized = true;
+        flush_without_present();
+        return false;
+    }
+    return true;
+}
+
+void blit_to_swapchain(VkImage src, uint32_t w, uint32_t h, uint32_t index) {
+    VkImage dst = g.swap_images[index];
+    barrier(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {int32_t(w), int32_t(h), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[1] = {int32_t(g.swap_extent.width), int32_t(g.swap_extent.height), 1};
+    vkCmdBlitImage(g.cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+}
+
+}
+
+void present_image(VkImage img, VkImageLayout& layout, uint32_t w, uint32_t h) {
+    if (!g_enabled) return;
+    std::lock_guard lk(g.m);
+    begin_frame();
+    uint32_t index = 0;
+    if (!acquire(index)) return;
+    image_barrier(g.cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    blit_to_swapchain(img, w, h, index);
+    submit_and_present(index);
+}
+
+void flip(uint32_t id) {
+    if (!g_enabled || id >= 8) return;
+    std::lock_guard lk(g.m);
+    const DisplayBuffer d = g.buffers[id];
+    if (!d.width || !d.height || !d.pitch) return;
+    begin_frame();
+    if (!ensure_frame(d.width, d.height)) return;
+    uint32_t index = 0;
+    if (!acquire(index)) return;
+    convert(d);
+    barrier(g.frame, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {d.width, d.height, 1};
+    vkCmdCopyBufferToImage(g.cmd, g.staging, g.frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    barrier(g.frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    blit_to_swapchain(g.frame, d.width, d.height, index);
+    submit_and_present(index);
+}
+
+bool display_buffer(uint32_t id, uint32_t& offset, uint32_t& pitch, uint32_t& width, uint32_t& height) {
+    if (id >= 8) return false;
+    std::lock_guard lk(g.m);
+    offset = g.buffers[id].offset;
+    pitch = g.buffers[id].pitch;
+    width = g.buffers[id].width;
+    height = g.buffers[id].height;
+    return width != 0;
 }
 
 }
