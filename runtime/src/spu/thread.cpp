@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <map>
+#include <unordered_map>
 #include <string>
 #include <chrono>
 #include <cstdio>
@@ -408,7 +409,7 @@ bool SpuThread::run_list(uint32_t tag, uint32_t cmd, uint32_t lsa, uint32_t list
         if (stall && size >= 8) {
             std::lock_guard lk(m);
             stalled[tag] = {true, cmd, cur, list, size};
-            if (!stall_stat) set_events(EV_SN);
+            set_events(EV_SN);
             stall_stat |= 1u << tag;
             stall_stat_count = true;
             cv.notify_all();
@@ -644,6 +645,35 @@ void SpuThread::run() {
         return v;
     }();
     const bool aot_on = aot::active();
+    const bool verify = std::getenv("GOWA_SPU_AOT_VERIFY") != nullptr;
+    const bool pure_only = std::getenv("GOWA_SPU_AOT_PURE_ONLY") != nullptr;
+    std::vector<uint8_t> verify_ls(verify ? LS_SIZE : 0);
+    std::unordered_map<const CompiledBlock*, int> verify_count;
+    auto verify_block = [&](const CompiledBlock* b) -> bool {
+        int& cnt = verify_count[b];
+        if (cnt >= 30) return false;
+        cnt++;
+        Context copy = ctx;
+        std::memcpy(verify_ls.data(), ls, LS_SIZE);
+        copy.ls = verify_ls.data();
+        b->fn(copy, *this);
+        uint32_t start = ctx.pc;
+        for (uint32_t k = 0; k < b->words; k++) step(ctx, *this);
+        bool bad = copy.pc != ctx.pc || std::memcmp(copy.gpr, ctx.gpr, sizeof ctx.gpr) != 0 || std::memcmp(verify_ls.data(), ls, LS_SIZE) != 0;
+        if (bad) {
+            std::string diff;
+            for (int r = 0; r < 128; r++) {
+                if (std::memcmp(&copy.gpr[r], &ctx.gpr[r], 16) == 0) continue;
+                char t[96];
+                std::snprintf(t, sizeof t, " r%d aot=%08x%08x%08x%08x int=%08x%08x%08x%08x", r, copy.gpr[r].u32[3], copy.gpr[r].u32[2], copy.gpr[r].u32[1], copy.gpr[r].u32[0], ctx.gpr[r].u32[3], ctx.gpr[r].u32[2],
+                              ctx.gpr[r].u32[1], ctx.gpr[r].u32[0]);
+                diff += t;
+            }
+            LOG_ERROR("spuaot", "MISMATCH block lsa 0x%05x words %u: pc aot 0x%05x int 0x%05x ls %s%s", start, b->words, copy.pc, ctx.pc,
+                      std::memcmp(verify_ls.data(), ls, LS_SIZE) ? "differs" : "same", diff.c_str());
+        }
+        return true;
+    };
     std::vector<const CompiledBlock*> block_cache(aot_on ? LS_SIZE / 4 : 0, nullptr);
     uint32_t irq_countdown = 64;
     const bool rec = aot::recording();
@@ -660,6 +690,12 @@ void SpuThread::run() {
                     b = aot::find(ls, ctx.pc);
                     slot = b;
                 }
+                if (b && verify && b->pure && verify_block(b)) {
+                    n += b->words;
+                    block_start = true;
+                    continue;
+                }
+                if (b && pure_only && !b->pure) b = nullptr;
                 if (b) {
                     bool ok = b->fn(ctx, *this);
                     n += b->words;

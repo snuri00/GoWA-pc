@@ -34,6 +34,10 @@ uint64_t snapshot(uint32_t line, uint8_t* out) {
     Entry& e = entry(line);
     for (;;) {
         uint64_t v1 = e.ver.load(std::memory_order_acquire);
+        if (v1 & 64) {
+            _mm_pause();
+            continue;
+        }
         std::memcpy(out, vm::ptr(line), 128);
         std::atomic_thread_fence(std::memory_order_acquire);
         if (e.ver.load(std::memory_order_acquire) == v1) return v1;
@@ -79,6 +83,7 @@ bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uin
     if (e.ver.load(std::memory_order_acquire) != rtime) return false;
     if (std::memcmp(vm::ptr(line + offset), expected, size) != 0) return false;
     log_change(line, offset, data, size, size == 128 ? "putllc" : "stcx");
+    e.ver.fetch_add(64, std::memory_order_acq_rel);
     uint8_t* dst = vm::ptr(line + offset);
     for (uint32_t i = 0; i < size; i += 8) {
         uint64_t want, was;
@@ -89,7 +94,7 @@ bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uin
             if (data[i + b] != expected[i + b]) dst[i + b] = data[i + b];
         }
     }
-    e.ver.fetch_add(128, std::memory_order_release);
+    e.ver.fetch_add(64, std::memory_order_release);
     e.ver.notify_all();
     return true;
 }
@@ -98,8 +103,9 @@ void store_unconditional(uint32_t line, const uint8_t* data) {
     Entry& e = entry(line);
     std::lock_guard lk(e.lock);
     log_change(line, 0, data, 128, "putlluc");
+    e.ver.fetch_add(64, std::memory_order_acq_rel);
     std::memcpy(vm::ptr(line), data, 128);
-    e.ver.fetch_add(128, std::memory_order_release);
+    e.ver.fetch_add(64, std::memory_order_release);
     e.ver.notify_all();
 }
 
@@ -107,8 +113,9 @@ void store_locked(uint32_t addr, const void* data, uint32_t size) {
     Entry& e = entry(addr & ~127u);
     std::lock_guard lk(e.lock);
     log_change(addr & ~127u, addr & 127u, static_cast<const uint8_t*>(data), size, "store");
+    e.ver.fetch_add(64, std::memory_order_acq_rel);
     std::memcpy(vm::ptr(addr), data, size);
-    e.ver.fetch_add(128, std::memory_order_release);
+    e.ver.fetch_add(64, std::memory_order_release);
     e.ver.notify_all();
 }
 

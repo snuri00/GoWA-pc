@@ -14,6 +14,7 @@ struct CompiledBlock {
     uint32_t words;
     const uint32_t* code;
     BlockFn fn;
+    bool pure;
 };
 
 const CompiledBlock* compiled_blocks(size_t& count);

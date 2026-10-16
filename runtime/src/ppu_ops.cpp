@@ -1,3 +1,4 @@
+#include <immintrin.h>
 #include "ppu/ops.h"
 #include "ppu/estimate_tables.h"
 #include "runtime/reservation.h"
@@ -32,20 +33,43 @@ uint64_t timebase() {
     return static_cast<uint64_t>(static_cast<double>(c.QuadPart) * scale);
 }
 
+namespace {
+
+void reserve(Context& ctx, uint8_t* base, uint32_t blk) {
+    auto& ver = rsv::version(blk);
+    for (;;) {
+        uint64_t v1 = ver.load(std::memory_order_acquire);
+        if (v1 & 64) {
+            _mm_pause();
+            continue;
+        }
+        std::memcpy(ctx.rdata, base + blk, 8);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (ver.load(std::memory_order_acquire) == v1) {
+            ctx.rtime = v1;
+            return;
+        }
+    }
+}
+
+}
+
 uint32_t lwarx(Context& ctx, uint8_t* base, uint32_t ea) {
     uint32_t blk = ea & ~7u;
-    ctx.rtime = rsv::version(blk).load(std::memory_order_acquire);
-    std::memcpy(ctx.rdata, base + blk, 8);
+    reserve(ctx, base, blk);
     ctx.raddr = ea | 1;
-    return ld32(base, ea);
+    uint32_t v;
+    std::memcpy(&v, ctx.rdata + (ea & 7u), 4);
+    return __builtin_bswap32(v);
 }
 
 uint64_t ldarx(Context& ctx, uint8_t* base, uint32_t ea) {
     uint32_t blk = ea & ~7u;
-    ctx.rtime = rsv::version(blk).load(std::memory_order_acquire);
-    std::memcpy(ctx.rdata, base + blk, 8);
+    reserve(ctx, base, blk);
     ctx.raddr = ea | 1;
-    return ld64(base, ea);
+    uint64_t v;
+    std::memcpy(&v, ctx.rdata, 8);
+    return __builtin_bswap64(v);
 }
 
 namespace {

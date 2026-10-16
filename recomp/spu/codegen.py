@@ -16,6 +16,12 @@ CONTROL = {
 }
 
 
+BRANCHES = {
+    "op_iret", "op_bisled", "op_br", "op_bra", "op_brsl", "op_brasl", "op_brz", "op_brnz", "op_brhz", "op_brhnz",
+    "op_bi", "op_bisl", "op_biz", "op_binz", "op_bihz", "op_bihnz", "op_stop",
+}
+
+
 def decode_table():
     src = open(INTERP, encoding="utf-8").read()
     table = ["op_illegal"] * 2048
@@ -43,6 +49,15 @@ def load_blocks(paths):
     return sorted(blocks.keys())
 
 
+def is_pure(table, raw):
+    for k, r in enumerate(raw):
+        w = struct.unpack(">I", struct.pack("<I", r))[0]
+        name = table[w >> 21]
+        if name in CONTROL and not (k == len(raw) - 1 and name in BRANCHES and name not in ("op_bisled", "op_stop", "op_iret")):
+            return False
+    return True
+
+
 def emit_block(table, idx, lsa, raw, out):
     out.append("bool b%d(Context& c, Host& h) {" % idx)
     out.append("    (void)h;")
@@ -55,6 +70,8 @@ def emit_block(table, idx, lsa, raw, out):
         if name in CONTROL:
             out.append("    c.pc = 0x%x;" % ((pc + 4) & 0x3FFFC))
             out.append("    if (!%s(c, h, 0x%08xu, 0x%xu)) return false;" % (name, w, pc))
+            if k != n - 1 and name not in BRANCHES:
+                out.append("    if (c.pc != 0x%x) return true;" % ((pc + 4) & 0x3FFFC))
             last_branch = k == n - 1
         else:
             out.append("    %s(c, h, 0x%08xu, 0x%xu);" % (name, w, pc))
@@ -102,7 +119,7 @@ def main():
     if blocks:
         reg.append("const CompiledBlock g_blocks[] = {")
         for i, (lsa, raw) in enumerate(blocks):
-            reg.append("    {0x%xu, %du, gen::w%d, gen::b%d}," % (lsa, len(raw), i, i))
+            reg.append("    {0x%xu, %du, gen::w%d, gen::b%d, %s}," % (lsa, len(raw), i, i, "true" if is_pure(table, raw) else "false"))
         reg.append("};")
         reg.append("")
         reg.append("const CompiledBlock* compiled_blocks(size_t& count) {")
