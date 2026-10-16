@@ -70,6 +70,11 @@ void status_dump() {
         LOG_INFO("status", "ppu 0x%x '%s' %s%u (r3 0x%llx r31 0x%llx) syscalls +%llu lr 0x%llx", id, t->name.c_str(), sc ? "blocked in " : "running, last ", sc ? sc - 1 : 0,
                  static_cast<unsigned long long>(t->ctx.gpr[3]), static_cast<unsigned long long>(t->ctx.gpr[31]), static_cast<unsigned long long>(n - t->syscalls_seen), static_cast<unsigned long long>(t->ctx.lr));
         t->syscalls_seen = n;
+        if (!sc) {
+            auto& g = t->ctx.gpr;
+            LOG_INFO("status", "   regs r3 %llx r4 %llx r5 %llx r6 %llx r7 %llx r9 %llx r10 %llx r11 %llx", (unsigned long long)g[3], (unsigned long long)g[4], (unsigned long long)g[5],
+                     (unsigned long long)g[6], (unsigned long long)g[7], (unsigned long long)g[9], (unsigned long long)g[10], (unsigned long long)g[11]);
+        }
         if (sc == 98) lv2::lwmutex_debug(static_cast<uint32_t>(t->ctx.gpr[3]));
         if ((!sc || sc == 142 || t->name == "main_thread") && t->native) LOG_INFO("status", "   %s", crash::sample_stack(t->native, 14).c_str());
     }

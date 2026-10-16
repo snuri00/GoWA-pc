@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <vector>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -37,16 +39,27 @@ uint64_t snapshot(uint32_t line, uint8_t* out) {
     }
 }
 
-uint32_t watched_line() {
-    static const uint32_t w = [] {
-        const char* e = std::getenv("GOWA_RSV_LOG");
-        return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 16)) & ~127u : 0u;
+bool watched_line(uint32_t line) {
+    static const std::vector<uint32_t> lines = [] {
+        std::vector<uint32_t> v;
+        if (const char* e = std::getenv("GOWA_RSV_LOG")) {
+            std::string s = e;
+            size_t pos = 0;
+            while (pos < s.size()) {
+                size_t end = s.find(',', pos);
+                if (end == std::string::npos) end = s.size();
+                v.push_back(static_cast<uint32_t>(std::strtoul(s.substr(pos, end - pos).c_str(), nullptr, 16)) & ~127u);
+                pos = end + 1;
+            }
+        }
+        return v;
     }();
-    return w;
+    for (uint32_t l : lines) if (l == line) return true;
+    return false;
 }
 
 void log_change(uint32_t line, uint32_t offset, const uint8_t* data, uint32_t size, const char* how) {
-    if (!watched_line() || line != watched_line()) return;
+    if (!watched_line(line)) return;
     const uint8_t* cur = vm::ptr(line);
     char buf[512];
     int n = 0;

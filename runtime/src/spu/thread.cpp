@@ -583,6 +583,7 @@ void SpuThread::run() {
     wchar_t w[64];
     swprintf(w, 64, L"SPU %u %hs", slot, name.c_str());
     SetThreadDescription(GetCurrentThread(), w);
+    if (!std::getenv("GOWA_SPU_NORMAL_PRIO")) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
     LOG_INFO("spu", "thread 0x%x '%s' start pc 0x%05x args 0x%llx 0x%llx", id, name.c_str(), ctx.pc,
              static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));

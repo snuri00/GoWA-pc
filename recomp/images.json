@@ -1,5 +1,5 @@
 [
- {"name": "gowa", "elf": "../bin/01.12/GOWA.elf", "file": "bin/01.12/GOWA.elf"},
+ {"name": "gowa", "elf": "../bin/01.12/GOWA.patched.elf", "file": "bin/01.12/GOWA.patched.elf"},
  {"name": "liblv2", "elf": "../fw/4.91/reloc/liblv2.elf", "file": "fw/4.91/reloc/liblv2.elf"},
  {"name": "libsysmodule", "elf": "../fw/4.91/reloc/libsysmodule.elf", "file": "fw/4.91/reloc/libsysmodule.elf"},
  {"name": "libsre", "elf": "../fw/4.91/reloc/libsre.elf", "file": "fw/4.91/reloc/libsre.elf"},
