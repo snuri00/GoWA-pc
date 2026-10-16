@@ -58,6 +58,11 @@ def process_param(elf):
 
 def prx_param(elf):
     p = elf.phdr(0x60000002)
+    if not p and struct.unpack(">H", elf.d[0x10:0x12])[0] == 0xFFA4:
+        b = elf.d[elf.phdrs[0][4]:elf.phdrs[0][4] + 0x34]
+        attr, version = struct.unpack(">HH", b[:4])
+        toc, libent_start, libent_end, libstub_start, libstub_end = struct.unpack(">5I", b[32:52])
+        return {"module": b[4:32].split(b"\0")[0].decode(), "attr": hex(attr), "version": hex(version), "toc": hex(toc), "libent": (libent_start, libent_end), "libstub": (libstub_start, libstub_end)}
     if not p:
         return None
     _, magic, version, _, libent_start, libent_end, libstub_start, libstub_end = struct.unpack(">8I", elf.read(p[3], 32))
