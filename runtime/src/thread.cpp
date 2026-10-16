@@ -9,6 +9,14 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+namespace crash {
+std::string sample_stack(void* native, int depth);
+}
+
+namespace lv2 {
+void lwmutex_debug(uint32_t id);
+}
+
 namespace guest {
 
 namespace {
@@ -26,6 +34,7 @@ void set_host_name(const std::string& name) {
 
 void body(std::shared_ptr<Thread> t) {
     t_current = t.get();
+    t->native = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
     set_host_name("PPU " + t->name);
     LOG_INFO("ppu", "thread 0x%x '%s' start entry opd 0x%08x", t->id, t->name.c_str(), t->entry_opd);
     uint64_t status = 0;
@@ -51,6 +60,20 @@ void body(std::shared_ptr<Thread> t) {
 }
 
 Thread* current() { return t_current; }
+
+void status_dump() {
+    std::lock_guard lk(g_lock);
+    for (auto& [id, t] : g_threads) {
+        if (t->exited) continue;
+        uint64_t n = t->syscalls.load();
+        uint32_t sc = t->in_syscall.load();
+        LOG_INFO("status", "ppu 0x%x '%s' %s%u (r3 0x%llx) syscalls +%llu lr 0x%llx", id, t->name.c_str(), sc ? "blocked in " : "running, last ", sc ? sc - 1 : 0,
+                 static_cast<unsigned long long>(t->ctx.gpr[3]), static_cast<unsigned long long>(n - t->syscalls_seen), static_cast<unsigned long long>(t->ctx.lr));
+        t->syscalls_seen = n;
+        if (sc == 98) lv2::lwmutex_debug(static_cast<uint32_t>(t->ctx.gpr[3]));
+        if ((!sc || sc == 142 || t->name == "main_thread") && t->native) LOG_INFO("status", "   %s", crash::sample_stack(t->native, 14).c_str());
+    }
+}
 
 std::shared_ptr<Thread> find(uint32_t id) {
     std::lock_guard lk(g_lock);

@@ -14,7 +14,7 @@ int64_t LwMutex::sleep(std::unique_lock<std::mutex>& lk, LwWaiter& w, uint64_t t
 
 void LwMutex::release(int64_t result) {
     if (sleepers.empty()) {
-        signaled = result == CELL_OK ? 1 : 2;
+        signaled |= result == CELL_OK ? 1 : static_cast<int>(0x80000000u);
         return;
     }
     LwWaiter* w = sleepers.front();
@@ -22,6 +22,15 @@ void LwMutex::release(int64_t result) {
     w->woken = true;
     w->result = result;
     cv.notify_all();
+}
+
+void lwmutex_debug(uint32_t id) {
+    auto m = get<LwMutex>(id);
+    if (!m) return;
+    std::lock_guard lk(m->m);
+    LOG_INFO("status", "   lwmutex 0x%x '%s' control 0x%08x owner 0x%08x waiters %u attr 0x%x recursive %u signaled 0x%x sleepers %zu lwcond_waiters %d", id,
+             m->name.c_str(), m->control, vm::read32(m->control), vm::read32(m->control + 4), vm::read32(m->control + 8), vm::read32(m->control + 12),
+             m->signaled, m->sleepers.size(), m->lwcond_waiters);
 }
 
 LV2_SYSCALL(95, _sys_lwmutex_create) {

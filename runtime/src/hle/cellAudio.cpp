@@ -1,3 +1,4 @@
+#include "runtime/hostsleep.h"
 #include "common.h"
 
 #include <atomic>
@@ -33,7 +34,7 @@ void audio_thread() {
     const auto period = std::chrono::microseconds(5333);
     while (g_init) {
         next += period;
-        std::this_thread::sleep_until(next);
+        host::sleep_until_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
         std::lock_guard lk(g_lock);
         for (uint32_t i = 0; i < 8; i++) {
             Port& p = g_ports[i];

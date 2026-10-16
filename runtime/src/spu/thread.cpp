@@ -11,6 +11,7 @@
 #include <string>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <malloc.h>
 
@@ -561,7 +562,12 @@ void SpuThread::run() {
     register_thread(this);
     uint32_t n = 0;
     while (step(ctx, *this)) {
-        if (ctx.interrupts_enabled && (n & 63) == 0) check_interrupt();
+        if (ctx.irq_check) {
+            ctx.irq_check = false;
+            check_interrupt();
+        } else if (ctx.interrupts_enabled && (n & 63) == 0) {
+            check_interrupt();
+        }
         if ((++n & 1023) == 0) {
             insns.fetch_add(1024, std::memory_order_relaxed);
             pc_samples[pc_sample_pos.fetch_add(1, std::memory_order_relaxed) & 255] = ctx.pc;
@@ -588,9 +594,21 @@ void register_thread(SpuThread* t) {
 }
 
 void status_dump() {
+    if (const char* e = std::getenv("GOWA_DUMP")) {
+        uint32_t a = static_cast<uint32_t>(std::strtoul(e, nullptr, 16));
+        for (uint32_t off = 0; off < 0x100; off += 32) {
+            std::string hex;
+            char b[12];
+            for (uint32_t i = 0; i < 32; i += 4) {
+                std::snprintf(b, sizeof b, "%08x ", vm::read32(a + off + i));
+                hex += b;
+            }
+            LOG_INFO("status", "mem %08x: %s", a + off, hex.c_str());
+        }
+    }
     std::lock_guard lk(g_reg_lock);
     for (SpuThread* t : g_reg) {
-        LOG_INFO("status", "spu 0x%x '%s' pc 0x%05x insns %llu mask 0x%x events 0x%x raddr 0x%08x running %d", t->id, t->name.c_str(), t->ctx.pc,
+        LOG_INFO("status", "spu 0x%x '%s' pc 0x%05x ie %d srr0 0x%05x insns %llu mask 0x%x events 0x%x raddr 0x%08x running %d", t->id, t->name.c_str(), t->ctx.pc, t->ctx.interrupts_enabled ? 1 : 0, t->ctx.srr0,
                  static_cast<unsigned long long>(t->insns.load()), t->event_mask, t->events, t->raddr, t->running ? 1 : 0);
         std::map<uint32_t, int> hist;
         for (uint32_t pc : t->pc_samples) hist[pc & ~0x3Fu]++;

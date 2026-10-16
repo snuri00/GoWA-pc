@@ -28,7 +28,7 @@ target_compile_options(gowa_ppu PRIVATE ${GOWA_ARCH_FLAGS} /clang:${GOWA_GENERAT
 set_source_files_properties(${GOWA_GENERATED_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 add_executable(gowa runtime/src/main.cpp $<TARGET_OBJECTS:gowa_runtime>)
-target_link_libraries(gowa PRIVATE gowa_ppu gowa_ppu_ops dbghelp)
+target_link_libraries(gowa PRIVATE gowa_ppu gowa_ppu_ops dbghelp winmm)
 target_include_directories(gowa PRIVATE runtime/include)
 target_compile_options(gowa PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
 

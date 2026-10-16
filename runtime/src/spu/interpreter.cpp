@@ -105,7 +105,10 @@ bool op_brhz(Context& c, Host&, uint32_t w, uint32_t pc) { if (G(RT(w)).u16[6] =
 bool op_brhnz(Context& c, Host&, uint32_t w, uint32_t pc) { if (G(RT(w)).u16[6] != 0) c.pc = (pc + (S16(w) << 2)) & PC_MASK; return true; }
 
 inline void interrupt_bits(Context& c, uint32_t w) {
-    if (w & 0x40000) c.interrupts_enabled = true;
+    if (w & 0x40000) {
+        c.interrupts_enabled = true;
+        c.irq_check = true;
+    }
     if (w & 0x80000) c.interrupts_enabled = false;
 }
 

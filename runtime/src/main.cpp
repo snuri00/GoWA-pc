@@ -3,10 +3,18 @@
 #include "runtime/log.h"
 #include "runtime/memory.h"
 #include "runtime/thread.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <timeapi.h>
 #include "runtime/vfs.h"
 
 namespace spu {
 void status_dump();
+}
+
+namespace lv2 {
+void rsx_status();
 }
 
 #include <chrono>
@@ -43,6 +51,7 @@ void arm_watch();
 
 int main(int argc, char** argv) {
     crash::install();
+    timeBeginPeriod(1);
     if (const char* root = std::getenv("GOWA_ROOT")) loader::g_root = root;
     if (const char* lvl = std::getenv("GOWA_LOG")) {
         if (!std::strcmp(lvl, "trace")) logging::set_level(logging::Level::Trace);
@@ -85,11 +94,17 @@ int main(int argc, char** argv) {
     c.gpr[10] = pi.tls_memsz;
     c.gpr[11] = pi.entry_opd;
     c.gpr[12] = pi.malloc_pagesize;
-    crash::arm_watch();
+    int watch_delay = std::getenv("GOWA_WATCH_DELAY") ? std::atoi(std::getenv("GOWA_WATCH_DELAY")) : 0;
+    if (!watch_delay) crash::arm_watch();
     guest::start(main_thread);
     bool status = std::getenv("GOWA_STATUS") != nullptr;
     for (int tick = 0;; tick++) {
-        if (status && tick % 3 == 2) spu::status_dump();
+        if (watch_delay && tick == watch_delay) crash::arm_watch();
+        if (status && tick % 3 == 2) {
+            spu::status_dump();
+            guest::status_dump();
+            lv2::rsx_status();
+        }
         std::unique_lock lk(main_thread->lock);
         if (main_thread->cv.wait_for(lk, std::chrono::seconds(1), [&] { return main_thread->exited; })) break;
     }

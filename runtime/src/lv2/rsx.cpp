@@ -1,3 +1,4 @@
+#include "runtime/hostsleep.h"
 #include "event.h"
 #include "ppu/ops.h"
 
@@ -33,6 +34,10 @@ struct RsxState {
     uint32_t report_ctx = 0;
     uint32_t call_return = 0;
     uint64_t flips = 0;
+    std::atomic<uint32_t> last_method{0};
+    std::atomic<uint32_t> last_arg{0};
+    std::atomic<uint32_t> waiting_addr{0};
+    std::atomic<uint32_t> waiting_value{0};
     std::atomic<int64_t> pending_flip{-1};
 };
 
@@ -132,22 +137,32 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
 }
 
 void semaphore_wait(uint32_t addr, uint32_t value) {
+    g_rsx.waiting_addr = addr;
+    g_rsx.waiting_value = value;
     for (int spins = 0; g_rsx.running; spins++) {
-        if (vm::read32(addr) == value) return;
+        if (vm::read32(addr) == value) {
+            g_rsx.waiting_addr = 0;
+            return;
+        }
         if (spins < 64) std::this_thread::yield();
         else Sleep(0);
     }
 }
 
 void execute(uint32_t reg, uint32_t arg) {
+    g_rsx.last_method.store(reg, std::memory_order_relaxed);
+    g_rsx.last_arg.store(arg, std::memory_order_relaxed);
+    if (reg >= 0xE000) LOG_DEBUG("rsx", "driver method 0x%04x arg 0x%08x", reg, arg);
     switch (reg) {
     case 0x50: vm::write32(g_rsx.dma_control + 0x48, arg); break;
     case 0x60: g_rsx.sema_ctx_406e = arg; break;
     case 0x64: g_rsx.sema_off_406e = arg; break;
     case 0x68:
+        LOG_DEBUG("rsx", "acquire ctx 0x%08x off 0x%x == 0x%x", g_rsx.sema_ctx_406e, g_rsx.sema_off_406e, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_406e, g_rsx.sema_ctx_406e)) semaphore_wait(a, arg);
         break;
     case 0x6C:
+        LOG_DEBUG("rsx", "release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_406e, g_rsx.sema_off_406e, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_406e, g_rsx.sema_ctx_406e)) {
             if (a == g_rsx.device_addr + 0x30 && !arg) arg = 1;
             vm::write32(a, arg);
@@ -157,11 +172,13 @@ void execute(uint32_t reg, uint32_t arg) {
     case 0x1A8: g_rsx.report_ctx = arg; break;
     case 0x1D6C: g_rsx.sema_off_4097 = arg; break;
     case 0x1D70:
+        LOG_DEBUG("rsx", "backend release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_4097, g_rsx.sema_off_4097, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) {
             vm::write32(a, (arg & 0xFF00FF00u) | ((arg & 0xFF) << 16) | ((arg >> 16) & 0xFF));
         }
         break;
     case 0x1D74:
+        LOG_DEBUG("rsx", "texture release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_4097, g_rsx.sema_off_4097, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) vm::write32(a, arg);
         break;
     case 0x1800: {
@@ -236,7 +253,7 @@ void vblank_thread() {
     auto next = std::chrono::steady_clock::now();
     while (g_rsx.running) {
         next += std::chrono::nanoseconds(16683333);
-        std::this_thread::sleep_until(next);
+        host::sleep_until_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
         uint32_t h = head_addr(1);
         vm::write64(h + 0x30, vm::read64(h + 0x30) + 1);
         uint64_t tb = ppu::timebase();
@@ -248,6 +265,14 @@ void vblank_thread() {
     }
 }
 
+}
+
+void rsx_status() {
+    if (!g_rsx.dma_control) return;
+    uint32_t put = vm::read32(g_rsx.dma_control + 0x40), get = vm::read32(g_rsx.dma_control + 0x44);
+    LOG_INFO("status", "rsx put 0x%08x get 0x%08x ref 0x%08x flips %llu last method 0x%04x arg 0x%08x wait 0x%08x==0x%08x (now 0x%08x)", put, get,
+             vm::read32(g_rsx.dma_control + 0x48), static_cast<unsigned long long>(g_rsx.flips), g_rsx.last_method.load(), g_rsx.last_arg.load(),
+             g_rsx.waiting_addr.load(), g_rsx.waiting_value.load(), g_rsx.waiting_addr ? vm::read32(g_rsx.waiting_addr) : 0);
 }
 
 LV2_SYSCALL(666, sys_rsx_device_open) { return CELL_OK; }

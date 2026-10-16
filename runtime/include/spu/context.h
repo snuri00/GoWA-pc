@@ -18,6 +18,7 @@ struct Context {
     uint32_t srr0 = 0;
     uint8_t* ls = nullptr;
     bool interrupts_enabled = false;
+    bool irq_check = false;
     bool halted = false;
 };
 

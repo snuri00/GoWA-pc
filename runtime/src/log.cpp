@@ -49,7 +49,7 @@ void write(Level level, const char* channel, const char* fmt, ...) {
     int n = std::snprintf(line, sizeof line, "%s %10.6f [%5lu] %s: %s\n", tag(level), t, GetCurrentThreadId(), channel, msg);
     if (g_file) {
         std::fwrite(line, 1, n, g_file);
-        if (level >= Level::Warning) std::fflush(g_file);
+        if (level >= Level::Info) std::fflush(g_file);
     }
     if (level >= Level::Info) std::fwrite(line, 1, n, stderr);
     if (level == Level::Fatal) {

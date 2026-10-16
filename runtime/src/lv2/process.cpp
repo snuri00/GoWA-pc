@@ -1,3 +1,4 @@
+#include "runtime/hostsleep.h"
 #include "object.h"
 #include "runtime/loader.h"
 #include "runtime/vfs.h"
@@ -91,8 +92,7 @@ LV2_SYSCALL(144, sys_time_get_timezone) {
 
 LV2_SYSCALL(141, sys_timer_usleep) {
     uint64_t us = u64arg(ctx, 0);
-    if (us) std::this_thread::sleep_for(std::chrono::microseconds(us));
-    else std::this_thread::yield();
+    host::sleep_us(us);
     return CELL_OK;
 }
 
