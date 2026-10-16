@@ -246,6 +246,21 @@ void execute(uint32_t reg, uint32_t arg) {
 
 HANDLE g_fifo_handle = nullptr;
 
+struct LineReader {
+    uint32_t line = ~0u;
+    alignas(16) uint8_t buf[128];
+    uint32_t read(uint32_t ea) {
+        uint32_t l = ea & ~127u;
+        if (l != line) {
+            rsv::snapshot(l, buf);
+            line = l;
+        }
+        uint32_t v;
+        std::memcpy(&v, buf + (ea & 127u), 4);
+        return __builtin_bswap32(v);
+    }
+};
+
 void fifo_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX FIFO");
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_fifo_handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
@@ -273,12 +288,24 @@ void fifo_thread() {
                     uint32_t k = (hist_n + i) & 63;
                     LOG_ERROR("rsx", "  hist get 0x%08x cmd 0x%08x put 0x%08x", hist_get[k], hist_cmd[k], hist_put[k]);
                 }
+                for (uint32_t h = 1; h <= 4; h++) {
+                uint32_t lastget = hist_get[(hist_n - h) & 63];
+                uint32_t lea = io_to_ea(lastget & ~0x3Fu);
+                if (lea) {
+                    for (int r = -4; r < 4; r++) {
+                        uint32_t a = lea + r * 32;
+                        LOG_ERROR("rsx", "  mem io 0x%08x: %08x %08x %08x %08x %08x %08x %08x %08x", (lastget & ~0x3Fu) + r * 32, vm::read32(a), vm::read32(a + 4), vm::read32(a + 8), vm::read32(a + 12),
+                                  vm::read32(a + 16), vm::read32(a + 20), vm::read32(a + 24), vm::read32(a + 28));
+                    }
+                }
+                }
             }
             LOG_ERROR("rsx", "FIFO get 0x%08x not IO-mapped (put 0x%08x)", get, put);
             Sleep(10);
             continue;
         }
-        uint32_t cmd = vm::read32(ea);
+        LineReader reader;
+        uint32_t cmd = reader.read(ea);
         if (cmd) {
             hist_get[hist_n & 63] = get;
             hist_cmd[hist_n & 63] = cmd;
@@ -290,7 +317,7 @@ void fifo_thread() {
         if ((cmd & 0xE0000003) == 0x20000000 || (cmd & 0xE0000003) == 0x00000001) {
             uint32_t target = (cmd & 3) == 1 ? cmd & 0xFFFFFFFC : cmd & 0x1FFFFFFC;
             if (target == get) {
-                if (++idle < 256) std::this_thread::yield();
+                if (++idle < 20000) std::this_thread::yield();
                 else Sleep(1);
                 continue;
             }
@@ -322,7 +349,7 @@ void fifo_thread() {
         uint32_t method = cmd & 0xFFFC;
         bool noninc = (cmd & 0xE0030003) == 0x40000000;
         for (uint32_t i = 0; i < count; i++) {
-            execute(noninc ? method : method + i * 4, vm::read32(ea + 4 + i * 4));
+            execute(noninc ? method : method + i * 4, reader.read(ea + 4 + i * 4));
         }
         vm::write32(ctrl + 0x44, get + 4 + count * 4);
     }
