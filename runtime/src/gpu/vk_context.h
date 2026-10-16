@@ -2,6 +2,9 @@
 
 #define VK_USE_PLATFORM_WIN32_KHR
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <volk.h>
 
@@ -14,6 +17,7 @@ struct VkCtx {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queue_family = 0;
+    VkPhysicalDeviceFeatures features{};
 };
 
 const VkCtx& vk();

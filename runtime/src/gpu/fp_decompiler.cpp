@@ -396,6 +396,8 @@ private:
             std::string v = m == 0 ? "c0" : (full ? r_out[m] : h_out[m]);
             s << "    out_color" << m << " = ((fflags.x & 2u) != 0u && " << (full ? "false" : "true") << ") ? lin2srgb(" << v << ") : " << v << ";\n";
         }
+        s << "    if ((fflags.w & 1u) != 0u) out_color0 = vec4(1.0, 0.0, 1.0, 1.0);\n";
+        s << "    if ((fflags.w & 2u) != 0u) out_color0 = vec4(c0.rgb, 1.0);\n";
         if (key_.control & 0xE) s << "    gl_FragDepth = R[1].z;\n";
         s << "}\n";
         return s.str();

@@ -87,10 +87,8 @@ public:
         src << "    out_tex9 = (omask & 8192u) != 0u ? o[6] : vec4(0.0, 0.0, 0.0, 1.0);\n";
         src << "    gl_PointSize = (omask & 32u) != 0u ? o[6].x : uintBitsToFloat(flags.z);\n";
         src << "    vec4 p = o[0];\n";
-        src << "    float iw = p.w != 0.0 ? 1.0 / p.w : 0.0;\n";
-        src << "    vec3 win = p.xyz * iw * vp_scale.xyz + vp_offset.xyz;\n";
-        src << "    vec2 ndc = win.xy * surface.zw * 2.0 - 1.0;\n";
-        src << "    gl_Position = vec4(ndc * p.w, win.z * p.w, p.w);\n";
+        src << "    vec2 xy = (vp_scale.xy * p.xy + (vp_offset.xy - surface.xy * 0.5) * p.w) * surface.zw * 2.0;\n";
+        src << "    gl_Position = vec4(xy, vp_scale.z * p.z + vp_offset.z * p.w, p.w);\n";
         src << "}\n";
         info.glsl = src.str();
         info.input_mask = inputs_;
