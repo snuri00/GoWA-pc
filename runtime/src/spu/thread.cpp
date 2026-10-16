@@ -285,10 +285,13 @@ void SpuThread::write_channel(uint32_t ch, uint32_t value) {
                     r = lv2::push_event(queue, {SPU_USER_EVENT_KEY, id, (uint64_t(port) << 32) | data0, data1});
                 }
             }
+            LOG_DEBUG("spu", "thread 0x%x %s port %u data0 0x%x data1 0x%x queue 0x%x -> 0x%llx", id, reply ? "send_event" : "throw_event", port, data0, data1,
+                      spup[port], static_cast<unsigned long long>(r));
             if (reply) push_in_mbox(static_cast<uint32_t>(r));
             else if (r) LOG_WARN("spu", "thread 0x%x throw_event port %u failed 0x%llx", id, port, static_cast<unsigned long long>(r));
         } else if (code == 128 || code == 192) {
             int64_t r = lv2::event_flag_set_bits(data1, 1ull << (data0 & 63));
+            LOG_DEBUG("spu", "thread 0x%x event_flag_set 0x%x bit %u -> 0x%llx", id, data1, data0 & 63, static_cast<unsigned long long>(r));
             if (code == 128) push_in_mbox(static_cast<uint32_t>(r));
         } else {
             LOG_ERROR("spu", "thread 0x%x unknown WrOutIntrMbox code %u", id, code);
@@ -337,6 +340,16 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
     }
     lsa &= 0x3FFFF;
     bool put = (cmd & 0xF0) == 0x20 || (cmd & 0xF0) == 0x30 || (cmd & 0xF0) == 0xA0;
+    static const uint64_t dma_watch = [] {
+        const char* e = std::getenv("GOWA_SPU_DMA");
+        if (!e) return uint64_t(0);
+        const char* dash = std::strchr(e, '-');
+        uint64_t lo = std::strtoul(e, nullptr, 16), hi = dash ? std::strtoul(dash + 1, nullptr, 16) : lo + 1;
+        return (hi << 32) | lo;
+    }();
+    if (dma_watch && ea < (dma_watch >> 32) && ea + size > static_cast<uint32_t>(dma_watch)) {
+        LOG_INFO("spudma", "thread 0x%x pc 0x%05x %s cmd 0x%02x ea 0x%08x lsa 0x%05x size 0x%x", id, ctx.pc, put ? "PUT" : "GET", cmd, ea, lsa, size);
+    }
     bool handled;
     uint8_t* p = translate(ea, size, put, handled, lsa);
     if (handled || !p) return;
@@ -344,8 +357,22 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         std::memset(p, 0, size);
         return;
     }
-    if (put) std::memcpy(p, ls + lsa, size);
-    else std::memcpy(ls + lsa, p, size);
+    if (put) {
+        uint32_t guest = ea;
+        if (ea < 0xF0000000u) {
+            uint32_t done = 0;
+            while (done < size) {
+                uint32_t a = guest + done;
+                uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+                rsv::store_locked(a, ls + lsa + done, chunk);
+                done += chunk;
+            }
+        } else {
+            std::memcpy(p, ls + lsa, size);
+        }
+    } else {
+        std::memcpy(ls + lsa, p, size);
+    }
 }
 
 bool SpuThread::run_list(uint32_t tag, uint32_t cmd, uint32_t lsa, uint32_t list, uint32_t size) {
@@ -595,15 +622,22 @@ void register_thread(SpuThread* t) {
 
 void status_dump() {
     if (const char* e = std::getenv("GOWA_DUMP")) {
-        uint32_t a = static_cast<uint32_t>(std::strtoul(e, nullptr, 16));
-        for (uint32_t off = 0; off < 0x100; off += 32) {
-            std::string hex;
-            char b[12];
-            for (uint32_t i = 0; i < 32; i += 4) {
-                std::snprintf(b, sizeof b, "%08x ", vm::read32(a + off + i));
-                hex += b;
+        std::string list = e;
+        size_t pos = 0;
+        while (pos < list.size()) {
+            size_t end = list.find(',', pos);
+            if (end == std::string::npos) end = list.size();
+            uint32_t a = static_cast<uint32_t>(std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16));
+            for (uint32_t off = 0; off < 0x100; off += 32) {
+                std::string hex;
+                char b[12];
+                for (uint32_t i = 0; i < 32; i += 4) {
+                    std::snprintf(b, sizeof b, "%08x ", vm::read32(a + off + i));
+                    hex += b;
+                }
+                LOG_INFO("status", "mem %08x: %s", a + off, hex.c_str());
             }
-            LOG_INFO("status", "mem %08x: %s", a + off, hex.c_str());
+            pos = end + 1;
         }
     }
     std::lock_guard lk(g_reg_lock);

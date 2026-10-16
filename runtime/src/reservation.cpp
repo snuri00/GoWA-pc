@@ -52,6 +52,14 @@ void store_unconditional(uint32_t line, const uint8_t* data) {
     e.ver.notify_all();
 }
 
+void store_locked(uint32_t addr, const void* data, uint32_t size) {
+    Entry& e = entry(addr & ~127u);
+    std::lock_guard lk(e.lock);
+    std::memcpy(vm::ptr(addr), data, size);
+    e.ver.fetch_add(128, std::memory_order_release);
+    e.ver.notify_all();
+}
+
 bool lost(uint32_t line, uint64_t rtime, const uint8_t* rdata) {
     if (entry(line).ver.load(std::memory_order_acquire) != rtime) return true;
     return std::memcmp(vm::ptr(line), rdata, 128) != 0;

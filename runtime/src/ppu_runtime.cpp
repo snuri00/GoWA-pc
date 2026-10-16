@@ -108,6 +108,7 @@ struct ImportSlot {
     std::atomic<int32_t> state{kUnresolved};
     hle::Fn hle = nullptr;
     std::atomic<bool> warned{false};
+    bool log_args = false;
 };
 
 std::vector<ImportSlot>& import_slots() {
@@ -117,6 +118,10 @@ std::vector<ImportSlot>& import_slots() {
 
 int32_t resolve(uint32_t index, ImportSlot& slot) {
     const image::ImportEntry& imp = image::imports[index];
+    if (const char* list = std::getenv("GOWA_IMPORT_ARGS")) {
+        std::string l = std::string(",") + list + ",";
+        if (imp.name && *imp.name && l.find(std::string(",") + imp.name + ",") != std::string::npos) slot.log_args = true;
+    }
     for (uint32_t i = 0; i < image::export_count; i++) {
         const image::ExportEntry& e = image::exports[i];
         if (e.nid == imp.nid && std::strcmp(e.module, imp.module) == 0 && loader::image_loaded(static_cast<int>(e.image))) {
@@ -150,6 +155,11 @@ void call_import(Context& ctx, uint8_t* base, uint32_t index) {
         slot.state.store(st, std::memory_order_release);
     }
     const image::ImportEntry& imp = image::imports[index];
+    if (slot.log_args) {
+        LOG_INFO("import", "%s::%s(0x%llx, 0x%llx, 0x%llx, 0x%llx) lr 0x%llx", imp.module, imp.name, static_cast<unsigned long long>(ctx.gpr[3]),
+                 static_cast<unsigned long long>(ctx.gpr[4]), static_cast<unsigned long long>(ctx.gpr[5]), static_cast<unsigned long long>(ctx.gpr[6]),
+                 static_cast<unsigned long long>(ctx.lr));
+    }
     if (st >= 0) {
         const image::ExportEntry& e = image::exports[st];
         uint32_t sp = static_cast<uint32_t>(ctx.gpr[1]);

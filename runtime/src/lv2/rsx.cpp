@@ -1,8 +1,10 @@
 #include "runtime/hostsleep.h"
 #include "event.h"
 #include "ppu/ops.h"
+#include "runtime/reservation.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <thread>
 
 #define WIN32_LEAN_AND_MEAN
@@ -79,6 +81,11 @@ uint32_t get_address(uint32_t offset, uint32_t loc) {
     }
 }
 
+void rsx_write32(uint32_t addr, uint32_t value) {
+    uint32_t be = __builtin_bswap32(value);
+    rsv::store_locked(addr, &be, 4);
+}
+
 void flip_done(uint32_t buffer) {
     uint32_t h = head_addr(1);
     vm::write32(h + 8, vm::read32(h + 8) | 0x80000000u);
@@ -153,6 +160,8 @@ void execute(uint32_t reg, uint32_t arg) {
     g_rsx.last_method.store(reg, std::memory_order_relaxed);
     g_rsx.last_arg.store(arg, std::memory_order_relaxed);
     if (reg >= 0xE000) LOG_DEBUG("rsx", "driver method 0x%04x arg 0x%08x", reg, arg);
+    static const bool trace = std::getenv("GOWA_RSX_TRACE") != nullptr;
+    if (trace) LOG_INFO("rsxm", "0x%04x 0x%08x", reg, arg);
     switch (reg) {
     case 0x50: vm::write32(g_rsx.dma_control + 0x48, arg); break;
     case 0x60: g_rsx.sema_ctx_406e = arg; break;
@@ -165,7 +174,7 @@ void execute(uint32_t reg, uint32_t arg) {
         LOG_DEBUG("rsx", "release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_406e, g_rsx.sema_off_406e, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_406e, g_rsx.sema_ctx_406e)) {
             if (a == g_rsx.device_addr + 0x30 && !arg) arg = 1;
-            vm::write32(a, arg);
+            rsx_write32(a, arg);
         }
         break;
     case 0x1A4: g_rsx.sema_ctx_4097 = arg; break;
@@ -174,20 +183,23 @@ void execute(uint32_t reg, uint32_t arg) {
     case 0x1D70:
         LOG_DEBUG("rsx", "backend release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_4097, g_rsx.sema_off_4097, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) {
-            vm::write32(a, (arg & 0xFF00FF00u) | ((arg & 0xFF) << 16) | ((arg >> 16) & 0xFF));
+            rsx_write32(a, (arg & 0xFF00FF00u) | ((arg & 0xFF) << 16) | ((arg >> 16) & 0xFF));
         }
         break;
     case 0x1D74:
         LOG_DEBUG("rsx", "texture release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_4097, g_rsx.sema_off_4097, arg);
-        if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) vm::write32(a, arg);
+        if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) rsx_write32(a, arg);
         break;
     case 0x1800: {
         uint32_t offset = arg & 0xFFFFFF;
         uint32_t loc = g_rsx.report_ctx ? g_rsx.report_ctx : 0x66626660;
         if (uint32_t a = get_address(offset, loc)) {
-            vm::write64(a, ppu::timebase());
-            vm::write32(a + 8, 0);
-            vm::write32(a + 12, 0);
+            uint8_t rep[16];
+            uint64_t t = __builtin_bswap64(ppu::timebase());
+            std::memcpy(rep, &t, 8);
+            std::memset(rep + 8, 0, 8);
+            rsv::store_locked(a, rep, 16);
+            LOG_DEBUG("rsx", "report type %u loc 0x%08x off 0x%x -> ea 0x%08x", arg >> 24, loc, offset, a);
         }
         break;
     }
@@ -221,6 +233,8 @@ void fifo_thread() {
             continue;
         }
         uint32_t cmd = vm::read32(ea);
+        static const bool trace = std::getenv("GOWA_RSX_TRACE") != nullptr;
+        if (trace) LOG_INFO("rsxc", "get 0x%08x cmd 0x%08x", get, cmd);
         if ((cmd & 0xE0000003) == 0x20000000) {
             vm::write32(ctrl + 0x44, cmd & 0x1FFFFFFC);
             continue;
@@ -270,6 +284,8 @@ void vblank_thread() {
 void rsx_status() {
     if (!g_rsx.dma_control) return;
     uint32_t put = vm::read32(g_rsx.dma_control + 0x40), get = vm::read32(g_rsx.dma_control + 0x44);
+    LOG_INFO("status", "rsx handlers 0x%08x head1 flags 0x%08x vblanks %llu", vm::read32(g_rsx.driver_info + 0x12C0), vm::read32(head_addr(1) + 8),
+             static_cast<unsigned long long>(vm::read64(head_addr(1) + 0x30)));
     LOG_INFO("status", "rsx put 0x%08x get 0x%08x ref 0x%08x flips %llu last method 0x%04x arg 0x%08x wait 0x%08x==0x%08x (now 0x%08x)", put, get,
              vm::read32(g_rsx.dma_control + 0x48), static_cast<unsigned long long>(g_rsx.flips), g_rsx.last_method.load(), g_rsx.last_arg.load(),
              g_rsx.waiting_addr.load(), g_rsx.waiting_value.load(), g_rsx.waiting_addr ? vm::read32(g_rsx.waiting_addr) : 0);
@@ -334,7 +350,7 @@ LV2_SYSCALL(670, sys_rsx_context_allocate) {
     vm::write32(d + 0x2C, 0x1000);
     vm::write32(d + 0x30, 0);
     vm::write32(d + 0x34, 0x1400);
-    vm::write32(d + 0x50, static_cast<uint32_t>(u64arg(ctx, 5)));
+    vm::write32(d + 0x54, static_cast<uint32_t>(u64arg(ctx, 5)));
     auto q = std::make_shared<EventQueue>();
     q->size = 0x20;
     q->name = "_gcmQ";
