@@ -10,12 +10,12 @@ set(GOWA_GENERATED_OPT "-O1" CACHE STRING "Optimization level for generated code
 
 set(GOWA_ARCH_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing)
 
-add_library(gowa_ppu_ops STATIC runtime/src/ppu_ops.cpp)
+add_library(gowa_ppu_ops STATIC runtime/src/ppu_ops.cpp runtime/src/reservation.cpp runtime/src/memory.cpp runtime/src/log.cpp)
 target_include_directories(gowa_ppu_ops PUBLIC runtime/include "${CMAKE_SOURCE_DIR}/out/include")
 target_compile_options(gowa_ppu_ops PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
 
 file(GLOB GOWA_RUNTIME_SOURCES CONFIGURE_DEPENDS runtime/src/*.cpp runtime/src/lv2/*.cpp runtime/src/hle/*.cpp runtime/src/spu/*.cpp runtime/src/rsx/*.cpp)
-list(REMOVE_ITEM GOWA_RUNTIME_SOURCES "${CMAKE_SOURCE_DIR}/runtime/src/ppu_ops.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/main.cpp")
+list(REMOVE_ITEM GOWA_RUNTIME_SOURCES "${CMAKE_SOURCE_DIR}/runtime/src/ppu_ops.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/main.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/reservation.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/memory.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/log.cpp")
 add_library(gowa_runtime OBJECT ${GOWA_RUNTIME_SOURCES})
 target_link_libraries(gowa_runtime PUBLIC gowa_ppu_ops)
 target_compile_options(gowa_runtime PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
@@ -28,7 +28,7 @@ target_compile_options(gowa_ppu PRIVATE ${GOWA_ARCH_FLAGS} /clang:${GOWA_GENERAT
 set_source_files_properties(${GOWA_GENERATED_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 add_executable(gowa runtime/src/main.cpp $<TARGET_OBJECTS:gowa_runtime>)
-target_link_libraries(gowa PRIVATE gowa_ppu gowa_ppu_ops)
+target_link_libraries(gowa PRIVATE gowa_ppu gowa_ppu_ops dbghelp)
 target_include_directories(gowa PRIVATE runtime/include)
 target_compile_options(gowa PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
 

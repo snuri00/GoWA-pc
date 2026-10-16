@@ -31,7 +31,12 @@ uint32_t push_strings(uint32_t& sp, const char* const* list, int count) {
 
 }
 
+namespace crash {
+void install();
+}
+
 int main(int argc, char** argv) {
+    crash::install();
     if (const char* root = std::getenv("GOWA_ROOT")) loader::g_root = root;
     if (const char* lvl = std::getenv("GOWA_LOG")) {
         if (!std::strcmp(lvl, "trace")) logging::set_level(logging::Level::Trace);
