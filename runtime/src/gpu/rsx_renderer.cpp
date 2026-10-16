@@ -2,6 +2,12 @@
 #include "gpu/rsx.h"
 #include "runtime/log.h"
 #include "vk_context.h"
+#include "shader_compiler.h"
+#include "vp_decompiler.h"
+
+#include <cstdio>
+#include <cstring>
+#include <unordered_map>
 
 #include <map>
 #include <memory>
@@ -35,6 +41,12 @@ enum : uint32_t {
     CLEAR_SURFACE = 0x1D94,
     SCISSOR_HORIZONTAL = 0x08C0,
     SCISSOR_VERTICAL = 0x08C4,
+    TRANSFORM_PROGRAM = 0x0B80,
+    TRANSFORM_PROGRAM_LOAD = 0x1E9C,
+    TRANSFORM_PROGRAM_START = 0x1EA0,
+    TRANSFORM_CONSTANT_LOAD = 0x1EFC,
+    TRANSFORM_CONSTANT = 0x1F00,
+    BEGIN_END = 0x1808,
 };
 
 constexpr uint32_t CELL_GCM_LOCATION_LOCAL = 0xFEED0000;
@@ -53,8 +65,60 @@ struct Surface {
 uint32_t g_regs[0x4000];
 std::map<std::tuple<uint32_t, VkFormat, uint32_t, uint32_t>, std::unique_ptr<Surface>> g_surfaces;
 uint64_t g_clears = 0;
+uint32_t g_vp_ucode[544 * 4];
+uint32_t g_vp_load_word = 0;
+float g_vp_constants[468 * 4];
+struct VpEntry {
+    bool ok = false;
+};
+std::unordered_map<uint64_t, VpEntry> g_vp_cache;
+uint32_t g_vp_failures = 0;
 
 uint32_t R(uint32_t method) { return g_regs[(method >> 2) & 0x3FFF]; }
+
+uint64_t hash_program(uint32_t start) {
+    uint64_t h = 1469598103934665603ull ^ start;
+    for (uint32_t s = start; s < 544; s++) {
+        for (uint32_t k = 0; k < 4; k++) {
+            h ^= g_vp_ucode[s * 4 + k];
+            h *= 1099511628211ull;
+        }
+        if (g_vp_ucode[s * 4 + 3] & 1) {
+            bool flow = false;
+            for (uint32_t t = start; t <= s; t++) {
+                uint32_t sca = (g_vp_ucode[t * 4 + 1] >> 27) & 0x1F;
+                if (sca >= 0x08 && sca <= 0x12 && sca != 0x0D && sca != 0x0E && sca != 0x0F && sca != 0x10) flow = true;
+            }
+            if (!flow) break;
+        }
+    }
+    return h;
+}
+
+void check_vertex_program() {
+    uint32_t start = R(TRANSFORM_PROGRAM_START);
+    uint64_t h = hash_program(start);
+    if (g_vp_cache.count(h)) return;
+    VpEntry& e = g_vp_cache[h];
+    VertexProgramInfo vp = decompile_vertex_program(g_vp_ucode, start);
+    std::vector<uint32_t> spirv;
+    std::string log;
+    e.ok = vp.valid && compile_glsl(ShaderStage::Vertex, vp.glsl, spirv, log);
+    if (!e.ok && g_vp_failures++ < 20) {
+        char fn[64];
+        std::snprintf(fn, sizeof fn, "vp_fail_%016llx.vert", static_cast<unsigned long long>(h));
+        if (FILE* f = std::fopen(fn, "w")) {
+            std::fputs(vp.glsl.c_str(), f);
+            std::fputs("\n/*\n", f);
+            std::fputs(log.c_str(), f);
+            std::fputs("\n*/\n", f);
+            std::fclose(f);
+        }
+        LOG_WARN("rsx", "vertex program %016llx failed to compile (start %u)", static_cast<unsigned long long>(h), start);
+    }
+    LOG_INFO("rsx", "vertex program %016llx start %u: %s (%zu seen, %u failures)", static_cast<unsigned long long>(h), start, e.ok ? "ok" : "FAILED", g_vp_cache.size(), g_vp_failures);
+}
+
 
 VkFormat color_format(uint32_t fmt) {
     switch (fmt & 0x1F) {
@@ -178,10 +242,27 @@ void clear(uint32_t mask) {
 uint32_t reg(uint32_t method) { return R(method); }
 
 void method(uint32_t reg, uint32_t arg) {
+    if (reg >= TRANSFORM_PROGRAM && reg < TRANSFORM_PROGRAM + 128) {
+        uint32_t load = R(TRANSFORM_PROGRAM_LOAD);
+        if (g_vp_load_word / 4 != load && (g_vp_load_word % 4) == 0) g_vp_load_word = load * 4;
+        if (g_vp_load_word < 544 * 4) g_vp_ucode[g_vp_load_word] = arg;
+        g_vp_load_word++;
+        g_regs[(TRANSFORM_PROGRAM_LOAD >> 2)] = g_vp_load_word / 4;
+        return;
+    }
+    if (reg == TRANSFORM_PROGRAM_LOAD) g_vp_load_word = arg * 4;
+    if (reg >= TRANSFORM_CONSTANT && reg < TRANSFORM_CONSTANT + 128) {
+        uint32_t idx = R(TRANSFORM_CONSTANT_LOAD) * 4 + ((reg - TRANSFORM_CONSTANT) >> 2);
+        if (idx < 468 * 4) std::memcpy(&g_vp_constants[idx], &arg, 4);
+        return;
+    }
     g_regs[(reg >> 2) & 0x3FFF] = arg;
     if (!enabled()) return;
     switch (reg) {
     case CLEAR_SURFACE: clear(arg); break;
+    case BEGIN_END:
+        if (arg) check_vertex_program();
+        break;
     default: break;
     }
 }
