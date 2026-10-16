@@ -16,12 +16,21 @@ target_compile_options(gowa_ppu_ops PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
 
 file(GLOB GOWA_RUNTIME_SOURCES CONFIGURE_DEPENDS runtime/src/*.cpp runtime/src/lv2/*.cpp runtime/src/hle/*.cpp runtime/src/spu/*.cpp runtime/src/rsx/*.cpp runtime/src/gpu/*.cpp)
 list(REMOVE_ITEM GOWA_RUNTIME_SOURCES "${CMAKE_SOURCE_DIR}/runtime/src/ppu_ops.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/main.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/reservation.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/memory.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/log.cpp")
+set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/glslang EXCLUDE_FROM_ALL)
+
 add_library(gowa_volk OBJECT third_party/volk/volk.c)
 target_include_directories(gowa_volk PUBLIC third_party/volk third_party/Vulkan-Headers/include)
 target_compile_definitions(gowa_volk PUBLIC VK_USE_PLATFORM_WIN32_KHR VK_NO_PROTOTYPES)
 
 add_library(gowa_runtime OBJECT ${GOWA_RUNTIME_SOURCES})
-target_include_directories(gowa_runtime PRIVATE third_party/volk third_party/Vulkan-Headers/include)
+target_include_directories(gowa_runtime PRIVATE third_party/volk third_party/Vulkan-Headers/include third_party/glslang "${CMAKE_BINARY_DIR}/include")
 target_compile_definitions(gowa_runtime PRIVATE VK_NO_PROTOTYPES)
 target_link_libraries(gowa_runtime PUBLIC gowa_ppu_ops)
 target_compile_options(gowa_runtime PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
@@ -34,7 +43,7 @@ target_compile_options(gowa_ppu PRIVATE ${GOWA_ARCH_FLAGS} /clang:${GOWA_GENERAT
 set_source_files_properties(${GOWA_GENERATED_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 add_executable(gowa runtime/src/main.cpp $<TARGET_OBJECTS:gowa_runtime> $<TARGET_OBJECTS:gowa_volk>)
-target_link_libraries(gowa PRIVATE gowa_ppu gowa_ppu_ops dbghelp winmm)
+target_link_libraries(gowa PRIVATE gowa_ppu gowa_ppu_ops dbghelp winmm glslang SPIRV glslang-default-resource-limits)
 target_include_directories(gowa PRIVATE runtime/include)
 target_compile_options(gowa PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
 
