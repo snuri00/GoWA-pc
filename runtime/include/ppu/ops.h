@@ -25,6 +25,8 @@ double fres(double x);
 double frsqrte(double x);
 float vrefp(float x);
 float vrsqrtefp(float x);
+uint32_t vlogefp(uint32_t x, bool nj);
+uint32_t vexptefp(uint32_t x, bool nj);
 
 inline uint8_t ld8(uint8_t* b, uint32_t ea) { return b[ea]; }
 inline uint16_t ld16(uint8_t* b, uint32_t ea) { uint16_t v; std::memcpy(&v, b + ea, 2); return __builtin_bswap16(v); }
@@ -130,7 +132,7 @@ inline double fctiw(double x, bool trunc) {
         double t = trunc ? std::trunc(x) : std::nearbyint(x);
         r = t >= 2147483647.0 ? INT32_MAX : t <= -2147483648.0 ? INT32_MIN : static_cast<int32_t>(t);
     }
-    return u2f(0xFFF8000000000000ull | static_cast<uint32_t>(r));
+    return u2f(static_cast<uint64_t>(static_cast<int64_t>(r)));
 }
 inline double fctid(double x, bool trunc) {
     int64_t r;
@@ -147,6 +149,23 @@ inline void fcmp(Context& c, int f, double a, double b) {
     c.cr[f] = {uint8_t(!un && a < b), uint8_t(!un && a > b), uint8_t(!un && a == b), uint8_t(un)};
     c.fpscr = (c.fpscr & ~0xF000u) | (uint32_t(c.cr[f].lt) << 15 | uint32_t(c.cr[f].gt) << 14 | uint32_t(c.cr[f].eq) << 13 | uint32_t(c.cr[f].so) << 12);
 }
+inline double qnan(double x) { return u2f(f2u(x) | 0x0008000000000000ull); }
+inline double fnan(double r, double a) {
+    if (!std::isnan(r)) [[likely]] return r;
+    return std::isnan(a) ? qnan(a) : u2f(0x7FF8000000000000ull);
+}
+inline double fnan(double r, double a, double b) {
+    if (!std::isnan(r)) [[likely]] return r;
+    return std::isnan(a) ? qnan(a) : std::isnan(b) ? qnan(b) : u2f(0x7FF8000000000000ull);
+}
+inline double fnan(double r, double a, double b, double c) {
+    if (!std::isnan(r)) [[likely]] return r;
+    return std::isnan(a) ? qnan(a) : std::isnan(b) ? qnan(b) : std::isnan(c) ? qnan(c) : u2f(0x7FF8000000000000ull);
+}
+inline double fneg_r(double r, double a, double b, double c) {
+    if (!std::isnan(r)) [[likely]] return -r;
+    return fnan(r, a, b, c);
+}
 inline double fsel(double a, double b, double c) { return a >= 0.0 ? b : c; }
 inline double fmadds(double a, double c, double b) { return frsp(std::fma(a, c, b)); }
 
@@ -155,12 +174,32 @@ inline __m128 vflush(__m128 x) {
     __m128i z = _mm_cmpeq_epi32(e, _mm_setzero_si128());
     return _mm_castsi128_ps(_mm_andnot_si128(_mm_andnot_si128(_mm_set1_epi32(0x80000000), z), _mm_castps_si128(x)));
 }
-inline __m128 vnan(__m128 x) {
-    __m128 n = _mm_cmpunord_ps(x, x);
-    return _mm_or_ps(_mm_andnot_ps(n, x), _mm_and_ps(n, _mm_castsi128_ps(_mm_set1_epi32(0x7FC00000))));
+inline __m128 vquiet(__m128 x) { return _mm_or_ps(x, _mm_castsi128_ps(_mm_set1_epi32(0x00400000))); }
+inline __m128 vnan(__m128 r, __m128 a, __m128 b, __m128 c) {
+    __m128 rn = _mm_cmpunord_ps(r, r);
+    if (_mm_movemask_ps(rn) == 0) [[likely]] return r;
+    __m128 out = _mm_blendv_ps(r, _mm_castsi128_ps(_mm_set1_epi32(0x7FC00000)), rn);
+    out = _mm_blendv_ps(out, vquiet(c), _mm_and_ps(rn, _mm_cmpunord_ps(c, c)));
+    out = _mm_blendv_ps(out, vquiet(b), _mm_and_ps(rn, _mm_cmpunord_ps(b, b)));
+    out = _mm_blendv_ps(out, vquiet(a), _mm_and_ps(rn, _mm_cmpunord_ps(a, a)));
+    return out;
 }
-inline __m128 vfix(const Context& c, __m128 x) { return vnan(c.vscr_nj ? vflush(x) : x); }
+inline __m128 vmax(__m128 a, __m128 b) {
+    __m128 r = _mm_max_ps(a, b);
+    r = _mm_blendv_ps(r, _mm_and_ps(a, b), _mm_cmpeq_ps(a, b));
+    return _mm_blendv_ps(r, _mm_castsi128_ps(_mm_set1_epi32(0x7FC00000)), _mm_cmpunord_ps(a, b));
+}
+inline __m128 vmin(__m128 a, __m128 b) {
+    __m128 r = _mm_min_ps(a, b);
+    r = _mm_blendv_ps(r, _mm_or_ps(a, b), _mm_cmpeq_ps(a, b));
+    return _mm_blendv_ps(r, _mm_castsi128_ps(_mm_set1_epi32(0x7FC00000)), _mm_cmpunord_ps(a, b));
+}
 inline __m128 vin(const Context& c, __m128 x) { return c.vscr_nj ? vflush(x) : x; }
+inline __m128 vfix0(const Context& c, __m128 x) {
+    x = c.vscr_nj ? vflush(x) : x;
+    return _mm_blendv_ps(x, _mm_castsi128_ps(_mm_set1_epi32(0x7FC00000)), _mm_cmpunord_ps(x, x));
+}
+inline __m128 vfix(const Context& c, __m128 x, __m128 a, __m128 b, __m128 d) { return vnan(c.vscr_nj ? vflush(x) : x, a, b, d); }
 
 inline __m128i vperm(__m128i a, __m128i b, __m128i c) {
     __m128i idx = _mm_andnot_si128(c, _mm_set1_epi8(15));
