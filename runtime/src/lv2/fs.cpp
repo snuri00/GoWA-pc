@@ -9,6 +9,10 @@
 #include <io.h>
 #include <sys/stat.h>
 
+namespace crash {
+void log_here(const char* tag);
+}
+
 namespace lv2 {
 
 namespace {
@@ -140,6 +144,10 @@ int64_t do_write(Fd& fd, uint32_t buf, uint64_t n, uint64_t& put) {
 }
 
 LV2_SYSCALL(801, sys_fs_open) {
+    if (const char* k = std::getenv("GOWA_OPEN_STACK")) {
+        std::string g;
+        if (!read_path(u32arg(ctx, 0), g) && g.find(k) != std::string::npos) crash::log_here(g.c_str());
+    }
     std::string guest, host;
     if (int64_t e = resolve(u32arg(ctx, 0), guest, host)) return e;
     int32_t flags = s32arg(ctx, 1);
@@ -279,6 +287,7 @@ LV2_SYSCALL(808, sys_fs_stat) {
         return CELL_ENOENT;
     }
     write_stat(u32arg(ctx, 1), (st.st_mode & _S_IFDIR) != 0, static_cast<uint64_t>(st.st_size), st.st_atime, st.st_mtime, st.st_ctime, guest);
+    LOG_DEBUG("fs", "stat '%s' -> size %llu mtime %lld", guest.c_str(), static_cast<unsigned long long>(st.st_size), static_cast<long long>(st.st_mtime));
     return CELL_OK;
 }
 

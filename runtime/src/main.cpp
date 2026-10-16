@@ -3,6 +3,11 @@
 #include "runtime/log.h"
 #include "runtime/memory.h"
 #include "runtime/thread.h"
+#include "runtime/vfs.h"
+
+namespace spu {
+void status_dump();
+}
 
 #include <chrono>
 #include <cstdio>
@@ -33,6 +38,7 @@ uint32_t push_strings(uint32_t& sp, const char* const* list, int count) {
 
 namespace crash {
 void install();
+void arm_watch();
 }
 
 int main(int argc, char** argv) {
@@ -63,7 +69,8 @@ int main(int argc, char** argv) {
     auto main_thread = guest::create("main_thread", image::images[lv2].entry, 0, 0, pi.primary_prio, stack_size, 0, true);
     if (!main_thread) return 1;
     uint32_t sp = main_thread->stack_addr + main_thread->stack_size;
-    const char* args[] = {"/app_home/EBOOT.BIN"};
+    std::string self_path = vfs::patch_sfo().strings.empty() ? "/dev_bdvd/PS3_GAME/USRDIR/GOWA.SELF" : "/dev_hdd0/game/BCES01741/USRDIR/GOWA.SELF";
+    const char* args[] = {self_path.c_str()};
     uint32_t argv_addr = push_strings(sp, args, 1);
     uint32_t envp_addr = push_strings(sp, nullptr, 0);
     ppu::Context& c = main_thread->ctx;
@@ -78,8 +85,11 @@ int main(int argc, char** argv) {
     c.gpr[10] = pi.tls_memsz;
     c.gpr[11] = pi.entry_opd;
     c.gpr[12] = pi.malloc_pagesize;
+    crash::arm_watch();
     guest::start(main_thread);
-    for (;;) {
+    bool status = std::getenv("GOWA_STATUS") != nullptr;
+    for (int tick = 0;; tick++) {
+        if (status && tick % 3 == 2) spu::status_dump();
         std::unique_lock lk(main_thread->lock);
         if (main_thread->cv.wait_for(lk, std::chrono::seconds(1), [&] { return main_thread->exited; })) break;
     }
