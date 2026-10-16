@@ -1,5 +1,6 @@
 #include "ppu/ops.h"
 #include "ppu/estimate_tables.h"
+#include "runtime/reservation.h"
 
 #include <atomic>
 #include <cstdio>
@@ -24,7 +25,7 @@ uint64_t timebase() {
     static const double scale = [] {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
-        return 79800000.0 / static_cast<double>(f.QuadPart);
+        return 80000000.0 / static_cast<double>(f.QuadPart);
     }();
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
@@ -32,33 +33,46 @@ uint64_t timebase() {
 }
 
 uint32_t lwarx(Context& ctx, uint8_t* base, uint32_t ea) {
-    ctx.raddr = ea;
-    uint32_t v = ld32(base, ea);
-    ctx.rtime = v;
-    return v;
+    uint32_t blk = ea & ~7u;
+    ctx.rtime = rsv::version(blk).load(std::memory_order_acquire);
+    std::memcpy(ctx.rdata, base + blk, 8);
+    ctx.raddr = ea | 1;
+    return ld32(base, ea);
 }
 
 uint64_t ldarx(Context& ctx, uint8_t* base, uint32_t ea) {
+    uint32_t blk = ea & ~7u;
+    ctx.rtime = rsv::version(blk).load(std::memory_order_acquire);
+    std::memcpy(ctx.rdata, base + blk, 8);
     ctx.raddr = ea | 1;
-    uint64_t v = ld64(base, ea);
-    ctx.rtime = v;
-    return v;
+    return ld64(base, ea);
+}
+
+namespace {
+
+bool store_conditional(Context& ctx, uint8_t* base, uint32_t ea, const void* bytes, uint32_t size) {
+    if (!(ctx.raddr & 1) || ((ctx.raddr & ~7u) != (ea & ~7u))) {
+        ctx.raddr = 0;
+        return false;
+    }
+    ctx.raddr = 0;
+    uint32_t blk = ea & ~7u;
+    uint8_t data[8];
+    std::memcpy(data, ctx.rdata, 8);
+    std::memcpy(data + (ea - blk), bytes, size);
+    return rsv::commit_if(blk & ~127u, ctx.rtime, ctx.rdata, data, blk & 127u, 8);
+}
+
 }
 
 bool stwcx(Context& ctx, uint8_t* base, uint32_t ea, uint32_t value) {
-    if (ctx.raddr != ea) return false;
-    ctx.raddr = 0;
-    auto* p = reinterpret_cast<std::atomic<uint32_t>*>(base + ea);
-    uint32_t expected = __builtin_bswap32(static_cast<uint32_t>(ctx.rtime));
-    return p->compare_exchange_strong(expected, __builtin_bswap32(value));
+    uint32_t be = __builtin_bswap32(value);
+    return store_conditional(ctx, base, ea, &be, 4);
 }
 
 bool stdcx(Context& ctx, uint8_t* base, uint32_t ea, uint64_t value) {
-    if (ctx.raddr != (ea | 1)) return false;
-    ctx.raddr = 0;
-    auto* p = reinterpret_cast<std::atomic<uint64_t>*>(base + ea);
-    uint64_t expected = __builtin_bswap64(ctx.rtime);
-    return p->compare_exchange_strong(expected, __builtin_bswap64(value));
+    uint64_t be = __builtin_bswap64(value);
+    return store_conditional(ctx, base, ea, &be, 8);
 }
 
 void notify_store(uint8_t* base, uint32_t ea, uint32_t size) {}
