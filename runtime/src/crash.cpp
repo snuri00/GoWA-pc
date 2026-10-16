@@ -179,6 +179,13 @@ void log_here(const char* tag) {
     log_stack(c, 14);
 }
 
+void rearm_watch() {
+    for (int i = 0; i < g_watch_count; i++) {
+        DWORD old;
+        VirtualProtect(g_watches[i].page, 4096, g_watches[i].reads ? PAGE_NOACCESS : PAGE_READONLY, &old);
+    }
+}
+
 void arm_watch() {
     const char* env = std::getenv("GOWA_WATCH");
     if (!env) return;

@@ -67,8 +67,8 @@ void status_dump() {
         if (t->exited) continue;
         uint64_t n = t->syscalls.load();
         uint32_t sc = t->in_syscall.load();
-        LOG_INFO("status", "ppu 0x%x '%s' %s%u (r3 0x%llx) syscalls +%llu lr 0x%llx", id, t->name.c_str(), sc ? "blocked in " : "running, last ", sc ? sc - 1 : 0,
-                 static_cast<unsigned long long>(t->ctx.gpr[3]), static_cast<unsigned long long>(n - t->syscalls_seen), static_cast<unsigned long long>(t->ctx.lr));
+        LOG_INFO("status", "ppu 0x%x '%s' %s%u (r3 0x%llx r31 0x%llx) syscalls +%llu lr 0x%llx", id, t->name.c_str(), sc ? "blocked in " : "running, last ", sc ? sc - 1 : 0,
+                 static_cast<unsigned long long>(t->ctx.gpr[3]), static_cast<unsigned long long>(t->ctx.gpr[31]), static_cast<unsigned long long>(n - t->syscalls_seen), static_cast<unsigned long long>(t->ctx.lr));
         t->syscalls_seen = n;
         if (sc == 98) lv2::lwmutex_debug(static_cast<uint32_t>(t->ctx.gpr[3]));
         if ((!sc || sc == 142 || t->name == "main_thread") && t->native) LOG_INFO("status", "   %s", crash::sample_stack(t->native, 14).c_str());

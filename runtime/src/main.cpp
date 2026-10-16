@@ -47,6 +47,7 @@ uint32_t push_strings(uint32_t& sp, const char* const* list, int count) {
 namespace crash {
 void install();
 void arm_watch();
+void rearm_watch();
 }
 
 int main(int argc, char** argv) {
@@ -100,6 +101,7 @@ int main(int argc, char** argv) {
     bool status = std::getenv("GOWA_STATUS") != nullptr;
     for (int tick = 0;; tick++) {
         if (watch_delay && tick == watch_delay) crash::arm_watch();
+        else if (tick > watch_delay) crash::rearm_watch();
         if (status && tick % 3 == 2) {
             spu::status_dump();
             guest::status_dump();

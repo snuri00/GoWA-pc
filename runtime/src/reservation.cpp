@@ -1,7 +1,11 @@
 #include "runtime/reservation.h"
 #include "runtime/memory.h"
 
+#include "runtime/log.h"
+
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -33,11 +37,32 @@ uint64_t snapshot(uint32_t line, uint8_t* out) {
     }
 }
 
+uint32_t watched_line() {
+    static const uint32_t w = [] {
+        const char* e = std::getenv("GOWA_RSV_LOG");
+        return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 16)) & ~127u : 0u;
+    }();
+    return w;
+}
+
+void log_change(uint32_t line, uint32_t offset, const uint8_t* data, uint32_t size, const char* how) {
+    if (!watched_line() || line != watched_line()) return;
+    const uint8_t* cur = vm::ptr(line);
+    char buf[512];
+    int n = 0;
+    for (uint32_t i = 0; i < size && n < 480; i++) {
+        uint32_t o = offset + i;
+        if (cur[o] != data[i]) n += std::snprintf(buf + n, sizeof buf - n, " [%02x]%02x->%02x", o, cur[o], data[i]);
+    }
+    if (n) LOG_INFO("rsv", "%s line 0x%08x:%s", how, line, buf);
+}
+
 bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uint8_t* data, uint32_t offset, uint32_t size) {
     Entry& e = entry(line);
     std::lock_guard lk(e.lock);
     if (e.ver.load(std::memory_order_acquire) != rtime) return false;
     if (std::memcmp(vm::ptr(line + offset), expected, size) != 0) return false;
+    log_change(line, offset, data, size, size == 128 ? "putllc" : "stcx");
     std::memcpy(vm::ptr(line + offset), data, size);
     e.ver.fetch_add(128, std::memory_order_release);
     e.ver.notify_all();
@@ -47,6 +72,7 @@ bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uin
 void store_unconditional(uint32_t line, const uint8_t* data) {
     Entry& e = entry(line);
     std::lock_guard lk(e.lock);
+    log_change(line, 0, data, 128, "putlluc");
     std::memcpy(vm::ptr(line), data, 128);
     e.ver.fetch_add(128, std::memory_order_release);
     e.ver.notify_all();
@@ -55,6 +81,7 @@ void store_unconditional(uint32_t line, const uint8_t* data) {
 void store_locked(uint32_t addr, const void* data, uint32_t size) {
     Entry& e = entry(addr & ~127u);
     std::lock_guard lk(e.lock);
+    log_change(addr & ~127u, addr & 127u, static_cast<const uint8_t*>(data), size, "store");
     std::memcpy(vm::ptr(addr), data, size);
     e.ver.fetch_add(128, std::memory_order_release);
     e.ver.notify_all();
