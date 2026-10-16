@@ -1,5 +1,6 @@
 #include "object.h"
 #include "runtime/loader.h"
+#include "runtime/vfs.h"
 
 #include <cstdio>
 #include <ctime>
@@ -11,7 +12,7 @@
 namespace lv2 {
 
 LV2_SYSCALL(1, sys_process_getpid) {
-    return 0x01000500;
+    return 1;
 }
 
 LV2_SYSCALL(14, sys_process_is_spu_lock_line_reservation_address) {
@@ -31,7 +32,12 @@ LV2_SYSCALL(25, sys_process_get_sdk_version) {
 }
 
 LV2_SYSCALL(30, _sys_process_get_paramsfo) {
-    return CELL_ENOENT;
+    uint32_t buf = u32arg(ctx, 0);
+    std::string id = vfs::disc_sfo().str("TITLE_ID");
+    if (id.empty()) return CELL_ENOENT;
+    std::memset(vm::ptr(buf), 0, 0x40);
+    std::memcpy(vm::ptr(buf + 1), id.data(), id.size() < 9 ? id.size() : 9);
+    return CELL_OK;
 }
 
 LV2_SYSCALL(988, sys_dbg_register_ppu_exception_handler) {
@@ -39,8 +45,7 @@ LV2_SYSCALL(988, sys_dbg_register_ppu_exception_handler) {
 }
 
 LV2_SYSCALL(402, sys_tty_read) {
-    if (uint32_t p = u32arg(ctx, 3)) vm::write32(p, 0);
-    return CELL_OK;
+    return CELL_EIO;
 }
 
 LV2_SYSCALL(403, sys_tty_write) {
@@ -56,11 +61,15 @@ LV2_SYSCALL(403, sys_tty_write) {
 }
 
 LV2_SYSCALL(147, sys_time_get_timebase_frequency) {
-    return 79800000;
+    return 80000000;
 }
 
-LV2_SYSCALL(146, sys_time_get_system_time) {
-    return static_cast<int64_t>(system_time_us());
+LV2_SYSCALL(146, sys_time_set_current_time) {
+    return CELL_ENOSYS;
+}
+
+LV2_SYSCALL(149, sys_time_get_system_time) {
+    return 0;
 }
 
 LV2_SYSCALL(145, sys_time_get_current_time) {

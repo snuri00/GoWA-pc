@@ -84,6 +84,7 @@ LV2_SYSCALL(52, _sys_ppu_thread_create) {
     uint32_t tls = vm::read32(param + 4);
     if (!entry) return CELL_EFAULT;
     if (prio < 0 || prio > 3071) return CELL_EINVAL;
+    if ((flags & 3) == 3) return CELL_EPERM;
     std::string name = namep ? reinterpret_cast<const char*>(vm::ptr(namep)) : "";
     auto t = guest::create(name, entry, arg, unk, prio, stack ? stack : 0x4000, tls, (flags & 1) != 0);
     if (!t) return CELL_ENOMEM;

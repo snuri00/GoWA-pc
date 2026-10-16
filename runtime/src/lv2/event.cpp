@@ -21,7 +21,7 @@ int64_t push_event(const std::shared_ptr<EventQueue>& q, const Event& e) {
     if (q->destroyed) return CELL_ESRCH;
     if (q->events.size() >= q->size) return CELL_EBUSY;
     q->events.push_back(e);
-    q->cv.notify_one();
+    q->cv.notify_all();
     return CELL_OK;
 }
 
@@ -185,7 +185,7 @@ LV2_SYSCALL(138, sys_event_port_send) {
     if (!qid) return CELL_ENOTCONN;
     auto q = get<EventQueue>(qid);
     if (!q) return CELL_ENOTCONN;
-    uint64_t source = p->port_name ? p->port_name : (uint64_t(0x01000500) << 32) | id;
+    uint64_t source = p->port_name ? p->port_name : (uint64_t(1) << 32) | id;
     return push_event(q, {source, u64arg(ctx, 1), u64arg(ctx, 2), u64arg(ctx, 3)});
 }
 

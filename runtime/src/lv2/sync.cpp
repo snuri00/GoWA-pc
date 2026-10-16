@@ -1,4 +1,5 @@
 #include "object.h"
+#include "sync.h"
 
 #include <algorithm>
 #include <list>
@@ -81,7 +82,8 @@ LV2_SYSCALL(101, sys_mutex_destroy) {
     auto m = get<Mutex>(u32arg(ctx, 0));
     if (!m) return CELL_ESRCH;
     std::lock_guard lk(m->m);
-    if (m->owner || m->cond_count) return CELL_EBUSY;
+    if (m->cond_count) return CELL_EPERM;
+    if (m->owner) return CELL_EBUSY;
     remove_object(u32arg(ctx, 0));
     return CELL_OK;
 }
@@ -411,13 +413,17 @@ LV2_SYSCALL(86, sys_event_flag_trywait) {
     return CELL_OK;
 }
 
-LV2_SYSCALL(87, sys_event_flag_set) {
-    auto f = get<EventFlag>(u32arg(ctx, 0));
+int64_t event_flag_set_bits(uint32_t id, uint64_t bits) {
+    auto f = get<EventFlag>(id);
     if (!f) return CELL_ESRCH;
     std::lock_guard lk(f->m);
-    f->pattern |= u64arg(ctx, 1);
+    f->pattern |= bits;
     f->cv.notify_all();
     return CELL_OK;
+}
+
+LV2_SYSCALL(87, sys_event_flag_set) {
+    return event_flag_set_bits(u32arg(ctx, 0), u64arg(ctx, 1));
 }
 
 LV2_SYSCALL(118, sys_event_flag_clear) {

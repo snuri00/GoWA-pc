@@ -12,9 +12,15 @@ std::map<uint32_t, uint32_t> g_next;
 
 uint32_t add_object(uint32_t base, std::shared_ptr<Object> obj) {
     std::lock_guard lk(g_lock);
-    uint32_t& next = g_next[base];
-    uint32_t id = base | (++next * 0x100 + 0x01);
-    while (g_objects.count(id)) id = base | (++next * 0x100 + 0x01);
+    uint32_t id;
+    if (base == 0x3F000000) {
+        uint32_t& next = g_next[base];
+        id = base + 1 + next++;
+    } else {
+        static uint32_t shared_index = 0;
+        id = base + (shared_index++ % 8192) * 0x100;
+        while (g_objects.count(id)) id = base + (shared_index++ % 8192) * 0x100;
+    }
     g_objects[id] = std::move(obj);
     return id;
 }
