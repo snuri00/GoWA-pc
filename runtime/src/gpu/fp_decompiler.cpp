@@ -1,6 +1,7 @@
 #include "fp_decompiler.h"
 
 #include <map>
+#include <set>
 #include <sstream>
 
 namespace gpu {
@@ -130,6 +131,14 @@ private:
     uint32_t used_tex_ = 0;
     bool uses_kil_ = false;
 
+    std::set<std::string> regs_;
+
+    std::string reg_name(bool half, uint32_t idx) {
+        std::string n = (half ? "h" : "r") + std::to_string(idx);
+        regs_.insert(n);
+        return n;
+    }
+
     uint32_t dim(uint32_t unit) const { return (key_.texture_dims >> (unit * 2)) & 3; }
 
     std::string input(uint32_t attr) {
@@ -151,7 +160,7 @@ private:
         std::string v;
         if (type == 0) {
             uint32_t idx = (w >> 2) & 0x3F;
-            v = ((w >> 8) & 1) ? "H[" + std::to_string(idx) + "]" : "R[" + std::to_string(idx) + "]";
+            v = reg_name((w >> 8) & 1, idx);
         } else if (type == 1) {
             v = input((sl.w[0] >> 13) & 0xF);
         } else if (type == 2) {
@@ -292,7 +301,7 @@ private:
         if (cond) o << in << "bvec4 ct = " << cc_test(sl) << ";\n";
         uint32_t mask = (d >> 9) & 0xF;
         bool no_dest = (d >> 30) & 1;
-        std::string dst = fp16 ? "H[" + std::to_string((d >> 1) & 0x3F) + "]" : "R[" + std::to_string((d >> 1) & 0x3F) + "]";
+        std::string dst = reg_name(fp16, (d >> 1) & 0x3F);
         bool set_cc = (d >> 8) & 1;
         std::string cc = "CC[" + std::to_string((sl.w[1] >> 30) & 1) + "]";
         for (uint32_t l = 0; l < 4; l++) {
@@ -352,7 +361,13 @@ private:
         }
         uint32_t mrt = key_.mrt_count > 4 ? 4 : key_.mrt_count;
         for (uint32_t m = 0; m < (mrt ? mrt : 1); m++) s << "layout(location = " << m << ") out vec4 out_color" << m << ";\n";
-        s << "vec4 R[48];\nvec4 H[96];\nvec4 CC[2];\n";
+        bool full = key_.control & 0x40;
+        const char* r_out[4] = {"r0", "r2", "r3", "r4"};
+        const char* h_out[4] = {"h0", "h4", "h6", "h8"};
+        for (uint32_t m = 0; m < 4; m++) regs_.insert(full ? r_out[m] : h_out[m]);
+        regs_.insert("r1");
+        for (const std::string& r : regs_) s << "vec4 " << r << " = vec4(0.0);\n";
+        s << "vec4 CC[2];\n";
         s << "vec4 sat(vec4 v) { return clamp(mix(v, vec4(0.0), isnan(v)), 0.0, 1.0); }\n";
         s << "bvec4 cctest(vec4 v, uint b) {\n"
              "    bvec4 r = bvec4(false);\n"
@@ -381,11 +396,8 @@ private:
         s << "vec4 srgb2lin(vec4 c) { vec3 x = c.rgb; vec3 r = mix(pow((x + 0.055) / 1.055, vec3(2.4)), x / 12.92, lessThanEqual(x, vec3(0.04045))); return vec4(r, c.a); }\n";
         s << "void program() {\n" << body << "}\n";
         s << "void main() {\n";
-        s << "    for (int i = 0; i < 48; i++) R[i] = vec4(0.0);\n    for (int i = 0; i < 96; i++) H[i] = vec4(0.0);\n    CC[0] = vec4(0.0); CC[1] = vec4(0.0);\n";
+        s << "    CC[0] = vec4(0.0); CC[1] = vec4(0.0);\n";
         s << "    program();\n";
-        bool full = key_.control & 0x40;
-        const char* r_out[4] = {"R[0]", "R[2]", "R[3]", "R[4]"};
-        const char* h_out[4] = {"H[0]", "H[4]", "H[6]", "H[8]"};
         s << "    vec4 c0 = " << (full ? r_out[0] : h_out[0]) << ";\n";
         s << "    if ((fflags.x & 1u) != 0u) {\n"
              "        uint f = fflags.z & 7u; float a = c0.a; float r = window.w; bool pass = true;\n"
@@ -398,7 +410,7 @@ private:
         }
         s << "    if ((fflags.w & 1u) != 0u) out_color0 = vec4(1.0, 0.0, 1.0, 1.0);\n";
         s << "    if ((fflags.w & 2u) != 0u) out_color0 = vec4(c0.rgb, 1.0);\n";
-        if (key_.control & 0xE) s << "    gl_FragDepth = R[1].z;\n";
+        if (key_.control & 0xE) s << "    gl_FragDepth = r1.z;\n";
         s << "}\n";
         return s.str();
     }

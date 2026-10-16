@@ -201,14 +201,7 @@ void morton_tables(uint32_t w, uint32_t h, std::vector<uint32_t>& xs, std::vecto
 
 }
 
-VkComponentMapping texture_mapping(uint32_t base_format, uint32_t control1) {
-    const FormatInfo* f = find_format(base_format);
-    VkComponentSwizzle base[4] = {A, R, G, B};
-    bool remap = true;
-    if (f) {
-        std::copy(f->base, f->base + 4, base);
-        remap = f->remap;
-    }
+VkComponentMapping remap_mapping(const VkComponentSwizzle base[4], bool remap, uint32_t control1) {
     VkComponentSwizzle out[4];
     for (uint32_t i = 0; i < 4; i++) {
         if (!remap) {
@@ -220,6 +213,13 @@ VkComponentMapping texture_mapping(uint32_t base_format, uint32_t control1) {
         out[i] = ctl == 0 ? Z : ctl == 1 ? I : base[sel];
     }
     return {out[1], out[2], out[3], out[0]};
+}
+
+VkComponentMapping texture_mapping(uint32_t base_format, uint32_t control1) {
+    const FormatInfo* f = find_format(base_format);
+    static const VkComponentSwizzle identity[4] = {A, R, G, B};
+    if (!f) return remap_mapping(identity, true, control1);
+    return remap_mapping(f->base, f->remap, control1);
 }
 
 bool describe_texture(const TextureRegs& regs, TextureLayout& out) {

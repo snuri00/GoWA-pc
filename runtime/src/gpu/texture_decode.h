@@ -44,5 +44,6 @@ struct TextureLayout {
 bool describe_texture(const TextureRegs& regs, TextureLayout& out);
 void decode_texture(const uint8_t* src, const TextureRegs& regs, const TextureLayout& layout, uint8_t* dst);
 VkComponentMapping texture_mapping(uint32_t base_format, uint32_t control1);
+VkComponentMapping remap_mapping(const VkComponentSwizzle base[4], bool remap, uint32_t control1);
 
 }

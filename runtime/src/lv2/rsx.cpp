@@ -14,6 +14,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+namespace crash {
+std::string sample_stack(void* native, int depth);
+}
+
 namespace lv2 {
 
 namespace {
@@ -238,8 +242,11 @@ void execute(uint32_t reg, uint32_t arg) {
     }
 }
 
+HANDLE g_fifo_handle = nullptr;
+
 void fifo_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX FIFO");
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_fifo_handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
     LOG_INFO("rsx", "null RSX FIFO thread started");
     uint32_t ctrl = g_rsx.dma_control;
     uint32_t idle = 0;
@@ -311,6 +318,7 @@ uint32_t rsx_address(uint32_t offset, uint32_t loc) { return get_address(offset,
 
 void rsx_status() {
     if (!g_rsx.dma_control) return;
+    if (g_fifo_handle) LOG_INFO("status", "rsx fifo stack: %s", crash::sample_stack(g_fifo_handle, 16).c_str());
     if (std::getenv("GOWA_RSX_STATS")) {
         std::string line;
         char b[32];

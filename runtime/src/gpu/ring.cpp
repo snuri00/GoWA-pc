@@ -18,7 +18,7 @@ bool create() {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = RING_SIZE;
     bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-               VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+               VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (vkCreateBuffer(c.device, &bi, nullptr, &g_buffer) != VK_SUCCESS) return false;
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(c.device, g_buffer, &req);

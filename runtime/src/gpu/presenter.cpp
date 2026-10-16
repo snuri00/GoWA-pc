@@ -172,7 +172,18 @@ uint64_t g_frame_serial = 0;
 
 void begin_frame() {
     if (g.recording) return;
+    LARGE_INTEGER a, b, f;
+    QueryPerformanceCounter(&a);
     vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
+    QueryPerformanceCounter(&b);
+    QueryPerformanceFrequency(&f);
+    static double total = 0;
+    static uint64_t n = 0;
+    total += double(b.QuadPart - a.QuadPart) * 1000.0 / double(f.QuadPart);
+    if (++n % 60 == 0) {
+        LOG_INFO("gpu", "fence wait %.2f ms per frame", total / 60.0);
+        total = 0;
+    }
     g_frame_serial++;
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};

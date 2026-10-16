@@ -135,6 +135,7 @@ struct Surface {
     VkImageView view = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::map<uint64_t, VkImageView> sample_views;
+    uint64_t generation = 0;
     bool depth() const { return aspect != VK_IMAGE_ASPECT_COLOR_BIT; }
 };
 
@@ -200,6 +201,8 @@ Dummy g_dummy[4];
 VkDescriptorSetLayout g_set_layout = VK_NULL_HANDLE;
 VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
 bool g_ready = false;
+bool g_trace = false;
+uint32_t g_experiment = std::getenv("GOWA_GPU_EXPERIMENT") ? std::atoi(std::getenv("GOWA_GPU_EXPERIMENT")) : 0;
 
 uint32_t g_prim = 0;
 bool g_in_begin = false;
@@ -214,7 +217,20 @@ struct Stats {
     uint64_t vertices = 0;
     uint64_t pipelines = 0;
     uint64_t uploads = 0;
+    uint64_t draw_ticks = 0;
+    uint64_t tex_ticks = 0;
+    uint64_t present_ticks = 0;
+    uint64_t phase[8] = {};
+    uint64_t copies = 0;
+    uint64_t copy_bytes = 0;
+    uint64_t redirects = 0;
 } g_stats;
+
+uint64_t ticks() {
+    LARGE_INTEGER v;
+    QueryPerformanceCounter(&v);
+    return static_cast<uint64_t>(v.QuadPart);
+}
 
 uint32_t R(uint32_t method) { return g_regs[(method >> 2) & 0x3FFF]; }
 float RF(uint32_t method) {
@@ -499,6 +515,7 @@ void transition(Surface* s, VkImageLayout to) {
 }
 
 void clear(uint32_t mask) {
+    if (g_trace) LOG_INFO("rsx", "trace clear 0x%x color 0x%x zeta 0x%x clip %ux%u target 0x%x", mask, R(SURFACE_COLOR_AOFFSET), R(SURFACE_ZETA_OFFSET), clip_w(), clip_h(), R(SURFACE_COLOR_TARGET));
     end_pass();
     VkCommandBuffer cmd = frame_cmd();
     if (mask & 0xF0) {
@@ -512,6 +529,7 @@ void clear(uint32_t mask) {
             transition(s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdClearColorImage(cmd, s->image, s->layout, &cv, 1, &range);
+            s->generation++;
         }
     }
     if (mask & 0x3) {
@@ -527,6 +545,7 @@ void clear(uint32_t mask) {
             transition(s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             VkImageSubresourceRange range{s->aspect, 0, 1, 0, 1};
             vkCmdClearDepthStencilImage(cmd, s->image, s->layout, &dv, 1, &range);
+            s->generation++;
         }
     }
     g_clears++;
@@ -740,7 +759,237 @@ struct Binding {
     VkSampler sampler = VK_NULL_HANDLE;
 };
 
+const char* g_bind_kind = "";
+
+struct TempImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    std::map<uint64_t, VkImageView> views;
+    uint64_t generation = ~0ull;
+};
+
+std::map<std::tuple<Surface*, uint32_t, uint32_t, bool>, std::unique_ptr<TempImage>> g_temps;
+
+TempImage* temp_image(Surface* src, VkFormat format, uint32_t w, uint32_t h, bool redirect) {
+    auto key = std::make_tuple(src, w, h, redirect);
+    auto it = g_temps.find(key);
+    if (it != g_temps.end()) return it->second.get();
+    auto t = std::make_unique<TempImage>();
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = format;
+    ii.extent = {w, h, 1};
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (!allocate_image(ii, t->image, t->memory)) return nullptr;
+    t->format = format;
+    t->width = w;
+    t->height = h;
+    TempImage* raw = t.get();
+    g_temps[key] = std::move(t);
+    return raw;
+}
+
+VkImageView temp_view(TempImage* t, VkComponentMapping m) {
+    uint64_t k = fnv(&m, sizeof m);
+    auto it = t->views.find(k);
+    if (it != t->views.end()) return it->second;
+    VkImageView v = make_view(t->image, t->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 1);
+    t->views[k] = v;
+    return v;
+}
+
+VkDescriptorSetLayout g_redirect_set = VK_NULL_HANDLE;
+VkPipelineLayout g_redirect_layout = VK_NULL_HANDLE;
+VkPipeline g_redirect_pipeline = VK_NULL_HANDLE;
+VkSampler g_point_sampler = VK_NULL_HANDLE;
+
+bool redirect_pipeline() {
+    if (g_redirect_pipeline) return true;
+    const VkCtx& c = vk();
+    const char* vs_src =
+        "#version 450\n"
+        "void main() { vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+    const char* fs_src =
+        "#version 450\n"
+        "layout(set = 0, binding = 0) uniform sampler2D depth_tex;\n"
+        "layout(location = 0) out vec4 color;\n"
+        "void main() {\n"
+        "    uint d = uint(clamp(texelFetch(depth_tex, ivec2(gl_FragCoord.xy), 0).r, 0.0, 1.0) * 16777215.0 + 0.5);\n"
+        "    color = vec4(float(d & 255u), float((d >> 8) & 255u), float((d >> 16) & 255u), 0.0) / 255.0;\n"
+        "}\n";
+    std::vector<uint32_t> vs, fs;
+    std::string log;
+    if (!compile_glsl(ShaderStage::Vertex, vs_src, vs, log) || !compile_glsl(ShaderStage::Fragment, fs_src, fs, log)) {
+        LOG_WARN("rsx", "redirect shader failed: %s", log.c_str());
+        return false;
+    }
+    VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    dl.bindingCount = 1;
+    dl.pBindings = &b;
+    vkCreateDescriptorSetLayout(c.device, &dl, nullptr, &g_redirect_set);
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &g_redirect_set;
+    vkCreatePipelineLayout(c.device, &pl, nullptr, &g_redirect_layout);
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    vkCreateSampler(c.device, &si, nullptr, &g_point_sampler);
+    VkShaderModule vm_ = make_module(vs), fm = make_module(fs);
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vm_, "main", nullptr};
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fm, "main", nullptr};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState att{};
+    att.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &att;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachmentFormats = &fmt;
+    VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gi.pNext = &ri;
+    gi.stageCount = 2;
+    gi.pStages = stages;
+    gi.pVertexInputState = &vi;
+    gi.pInputAssemblyState = &ia;
+    gi.pViewportState = &vp;
+    gi.pRasterizationState = &rs;
+    gi.pMultisampleState = &ms;
+    gi.pDepthStencilState = &ds;
+    gi.pColorBlendState = &cb;
+    gi.pDynamicState = &dy;
+    gi.layout = g_redirect_layout;
+    return vkCreateGraphicsPipelines(c.device, VK_NULL_HANDLE, 1, &gi, nullptr, &g_redirect_pipeline) == VK_SUCCESS;
+}
+
+VkImageView depth_view(Surface* s) {
+    VkComponentMapping m{};
+    uint64_t mk = fnv(&m, sizeof m);
+    auto it = s->sample_views.find(mk);
+    if (it != s->sample_views.end()) return it->second;
+    VkImageView v = make_view(s->image, s->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, m, 1, 1);
+    s->sample_views[mk] = v;
+    return v;
+}
+
+void redirect_pass(Surface* s, TempImage* t, uint32_t w, uint32_t h) {
+    transition(s, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    VkCommandBuffer cmd = frame_cmd();
+    image_barrier(cmd, t->image, VK_IMAGE_ASPECT_COLOR_BIT, t->layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkImageView target = temp_view(t, VkComponentMapping{});
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = target;
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {w, h}};
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(cmd, &ri);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_redirect_pipeline);
+    VkDescriptorImageInfo ii{g_point_sampler, depth_view(s), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii, nullptr, nullptr};
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_redirect_layout, 0, 1, &wr);
+    VkViewport viewport{0, 0, float(w), float(h), 0.0f, 1.0f};
+    VkRect2D scissor{{0, 0}, {w, h}};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+    image_barrier(cmd, t->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    t->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+TempImage* copy_to_temp(Surface* s, uint32_t w, uint32_t h, bool redirect) {
+    if (g_experiment & 2) return nullptr;
+    if ((g_experiment & 4) && redirect) return nullptr;
+    if ((g_experiment & 8) && !redirect) return nullptr;
+    TempImage* t = temp_image(s, redirect ? VK_FORMAT_R8G8B8A8_UNORM : s->format, w, h, redirect);
+    if (!t) return nullptr;
+    if (t->generation == s->generation) return t;
+    t->generation = s->generation;
+    g_stats.copies++;
+    g_stats.copy_bytes += uint64_t(w) * h * 4;
+    if (redirect) g_stats.redirects++;
+    if (redirect) {
+        if (!redirect_pipeline()) return nullptr;
+        redirect_pass(s, t, w, h);
+        return t;
+    }
+    transition(s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkCommandBuffer cmd = frame_cmd();
+    image_barrier(cmd, t->image, VK_IMAGE_ASPECT_COLOR_BIT, t->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    if (redirect) {
+        RingAlloc staging;
+        if (!ring_alloc(uint64_t(w) * h * 4, 16, staging)) return nullptr;
+        VkBufferImageCopy c{};
+        c.bufferOffset = staging.offset;
+        c.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        c.imageExtent = {w, h, 1};
+        vkCmdCopyImageToBuffer(cmd, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.buffer, 1, &c);
+        VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.buffer = staging.buffer;
+        bb.offset = staging.offset;
+        bb.size = uint64_t(w) * h * 4;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        vkCmdCopyBufferToImage(cmd, staging.buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    } else {
+        VkImageCopy c{};
+        c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.extent = {w, h, 1};
+        vkCmdCopyImage(cmd, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    }
+    image_barrier(cmd, t->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    t->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    return t;
+}
+
+Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth);
+
 Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth) {
+    g_bind_kind = "dummy";
+    Binding b = bind_texture_impl(unit, dim, colors, depth);
+    if (g_trace) {
+        TextureRegs t = texture_regs(unit);
+        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind);
+    }
+    return b;
+}
+
+Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth) {
     Binding b{g_dummy[dim].view, VK_NULL_HANDLE};
     TextureRegs t = texture_regs(unit);
     b.sampler = sampler(t, 1, false);
@@ -748,17 +997,40 @@ Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& c
     uint32_t loc = (t.format & 3) - 1;
     uint32_t code = ((t.format >> 8) & 0xFF) & ~0x60u;
     bool depth_fmt = code >= 0x90 && code <= 0x93;
-    if (loc == 0) {
-        uint32_t w = t.rect >> 16;
-        Surface* best = nullptr;
+    if (loc == 0 && dim == 1) {
+        uint32_t w = t.rect >> 16, h = t.rect & 0xFFFF;
+        Surface* exact = nullptr;
+        Surface* larger = nullptr;
+        Surface* redirect = nullptr;
         for (auto& [k, s] : g_surfaces) {
-            if (s->offset != (t.offset) || s->width != w) continue;
-            if (s->depth() != depth_fmt) continue;
-            best = s.get();
+            if (s->offset != t.offset || s->width < w || s->height < h) continue;
+            if (s->depth() == depth_fmt) {
+                if (s->width == w && s->height == h) exact = s.get();
+                else if (!larger) larger = s.get();
+            } else if (s->depth() && !depth_fmt && s->format == VK_FORMAT_D24_UNORM_S8_UINT) {
+                redirect = s.get();
+            }
         }
-        if (best && dim == 1) {
-            bool target = std::find(colors.begin(), colors.end(), best) != colors.end() || best == depth;
-            if (target) return b;
+        Surface* src = exact ? exact : larger ? larger : redirect;
+        bool target = src && (std::find(colors.begin(), colors.end(), src) != colors.end() || src == depth);
+        if (src && (src != exact || target || src == redirect)) {
+            TempImage* tmp = copy_to_temp(src, w, h, src == redirect);
+            if (!tmp) return b;
+            VkComponentMapping m;
+            if (src == redirect) {
+                static const VkComponentSwizzle base[4] = {VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ZERO};
+                m = remap_mapping(base, true, t.control1);
+            } else {
+                m = texture_mapping(0x85, t.control1);
+            }
+            g_bind_kind = src == redirect ? "depth redirect" : target ? "feedback copy" : "surface region";
+            b.view = temp_view(tmp, m);
+            b.sampler = sampler(t, 1, false);
+            return b;
+        }
+        Surface* best = exact;
+        if (best) {
+            g_bind_kind = best->depth() ? "depth surface" : "color surface";
             transition(best, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             VkComponentMapping m = best->depth() ? VkComponentMapping{} : texture_mapping(0x85, t.control1);
             uint64_t mk = fnv(&m, sizeof m);
@@ -778,11 +1050,14 @@ Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& c
     }
     uint32_t ea = lv2::rsx_address(t.offset, loc);
     if (!ea) return b;
+    uint64_t tt = ticks();
     Texture* tex = memory_texture(t, ea);
+    g_stats.tex_ticks += ticks() - tt;
     if (!tex) return b;
     VkImageViewType want = dim == 0 ? VK_IMAGE_VIEW_TYPE_1D : dim == 2 ? VK_IMAGE_VIEW_TYPE_CUBE : dim == 3 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
     if (tex->layout.view_type != want) return b;
     b.view = tex->view;
+    g_bind_kind = "memory";
     b.sampler = sampler(t, tex->layout.levels, false);
     return b;
 }
@@ -1143,8 +1418,14 @@ void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w,
     for (uint32_t i = 0; same && i < colors.size(); i++) same = g_pass.colors[i] == colors[i];
     if (same) return;
     end_pass();
-    for (Surface* s : colors) transition(s, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (depth) transition(depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    for (Surface* s : colors) {
+        transition(s, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        s->generation++;
+    }
+    if (depth) {
+        transition(depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        depth->generation++;
+    }
     VkRenderingAttachmentInfo ca[4]{};
     for (size_t i = 0; i < colors.size(); i++) {
         ca[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -1179,6 +1460,7 @@ void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w,
 bool draw() {
     VkCommandBuffer cmd = frame_cmd();
     if (!init_objects()) return false;
+    uint64_t ph = ticks();
     VpEntry* vp = vertex_program();
     if (!vp || !vp->ok) return false;
     uint32_t fp_ea = fp_address();
@@ -1192,6 +1474,8 @@ bool draw() {
     std::vector<uint32_t> raw;
     bool inline_draw = false;
     uint32_t inline_stride = 0;
+    g_stats.phase[0] += ticks() - ph;
+    ph = ticks();
     build_indices(raw, inline_draw, inline_stride);
     std::vector<uint32_t> indices;
     bool restart = false;
@@ -1211,6 +1495,8 @@ bool draw() {
     uint32_t x0 = std::min(sx, w), y0 = std::min(sy, h), x1 = std::min(sx + sw, w), y1 = std::min(sy + sh, h);
     if (x1 <= x0 || y1 <= y0) return false;
 
+    g_stats.phase[1] += ticks() - ph;
+    ph = ticks();
     VkWriteDescriptorSet writes[24]{};
     VkDescriptorImageInfo images[20]{};
     uint32_t nw = 0, ni = 0;
@@ -1297,6 +1583,8 @@ bool draw() {
         nw++;
     }
 
+    g_stats.phase[2] += ticks() - ph;
+    ph = ticks();
     VkBuffer vbufs[16];
     VkDeviceSize voffs[16];
     VkDeviceSize vstrides[16];
@@ -1356,6 +1644,8 @@ bool draw() {
         voffs[i] = a.offset;
         vstrides[i] = 16;
     }
+    g_stats.phase[3] += ticks() - ph;
+    ph = ticks();
     RingAlloc ib;
     if (!ring_alloc(indices.size() * 4, 16, ib)) return false;
     uint32_t* idx_out = reinterpret_cast<uint32_t*>(ib.ptr);
@@ -1377,14 +1667,16 @@ bool draw() {
     uint32_t pm = R(FRONT_POLYGON_MODE);
     k.polygon_mode = pm == 0x1B00 ? VK_POLYGON_MODE_POINT : pm == 0x1B01 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     k.topology_class = topology_class(topo);
+    g_stats.phase[4] += ticks() - ph;
+    ph = ticks();
     VkPipeline pipe = pipeline(k, vp->module, fp->module);
     if (!pipe) return false;
 
     static int draw_log = std::getenv("GOWA_DRAW_LOG") ? std::atoi(std::getenv("GOWA_DRAW_LOG")) : 0;
     static uint64_t draw_every = std::getenv("GOWA_DRAW_LOG_EVERY") ? std::strtoull(std::getenv("GOWA_DRAW_LOG_EVERY"), nullptr, 0) : 1;
     static uint64_t draw_counter = 0;
-    if (draw_log > 0 && (draw_counter++ % draw_every) == 0) {
-        draw_log--;
+    if (g_trace || (draw_log > 0 && (draw_counter++ % draw_every) == 0)) {
+        if (!g_trace) draw_log--;
         float p0[4] = {};
         if (vstrides[0] == 16 || vstrides[0] == 0) {
             RingAlloc dummy;
@@ -1420,6 +1712,8 @@ bool draw() {
             LOG_INFO("rsx", "  tex0 ea 0x%08x center %02x%02x%02x%02x %02x%02x%02x%02x", tea, tp[0], tp[1], tp[2], tp[3], tp[4], tp[5], tp[6], tp[7]);
         }
     }
+    g_stats.phase[5] += ticks() - ph;
+    ph = ticks();
     begin_pass(colors, depth, w, h);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
@@ -1468,7 +1762,8 @@ bool draw() {
     vkCmdSetFrontFace(cmd, R(FRONT_FACE) == 0x900 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
     vkCmdSetPrimitiveTopology(cmd, topo);
     vkCmdSetPrimitiveRestartEnable(cmd, restart ? VK_TRUE : VK_FALSE);
-    vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    if (!(g_experiment & 1)) vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    g_stats.phase[6] += ticks() - ph;
     g_stats.draws++;
     g_stats.vertices += vcount;
     return true;
@@ -1518,6 +1813,7 @@ void nv0039_transfer() {
 }
 
 void nv3089_transfer(uint32_t arg) {
+    if (g_trace) LOG_INFO("rsx", "trace nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x size 0x%x dst 0x%x dma 0x%x surf 0x%x dsdx 0x%x", R(0xC408), R(0xC184), R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC30C), R(0x630C), R(0x6188), R(0xC198), R(0xC318));
     if (R(0xC304) != 3) return;
     uint32_t in_size = R(0xC400), in_fmt = R(0xC404);
     uint32_t in_w = in_size & 0xFFFF, in_h = in_size >> 16;
@@ -1705,7 +2001,9 @@ void method(uint32_t reg, uint32_t arg) {
             g_indexed = false;
         } else if (g_in_begin) {
             g_in_begin = false;
+            uint64_t t0 = ticks();
             if (!draw()) g_stats.skipped++;
+            g_stats.draw_ticks += ticks() - t0;
         }
         break;
     default: break;
@@ -1716,7 +2014,23 @@ bool present(uint32_t buffer_id) {
     if (!enabled()) return false;
     end_pass();
     static uint64_t presents = 0;
-    if (++presents % 600 == 0) {
+    static uint64_t trace_frame = std::getenv("GOWA_TRACE_FRAME") ? std::strtoull(std::getenv("GOWA_TRACE_FRAME"), nullptr, 0) : 0;
+    ++presents;
+    if (g_trace) LOG_INFO("rsx", "trace present buffer %u", buffer_id);
+    g_trace = trace_frame && presents == trace_frame;
+    if (presents % 60 == 0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        double ms = 1000.0 / double(f.QuadPart) / 60.0;
+        LOG_INFO("rsx", "renderer per frame: draw %.2f ms (textures %.2f ms), present %.2f ms", g_stats.draw_ticks * ms, g_stats.tex_ticks * ms, g_stats.present_ticks * ms);
+        LOG_INFO("rsx", "  phases: programs %.2f indices %.2f textures+ubo %.2f vertices %.2f misc %.2f pipeline %.2f record %.2f", g_stats.phase[0] * ms, g_stats.phase[1] * ms, g_stats.phase[2] * ms,
+                 g_stats.phase[3] * ms, g_stats.phase[4] * ms, g_stats.phase[5] * ms, g_stats.phase[6] * ms);
+        std::memset(g_stats.phase, 0, sizeof g_stats.phase);
+        LOG_INFO("rsx", "  copies %.1f per frame (%.1f MB), redirects %.1f", g_stats.copies / 60.0, g_stats.copy_bytes / 60.0 / 1048576.0, g_stats.redirects / 60.0);
+        g_stats.copies = g_stats.copy_bytes = g_stats.redirects = 0;
+        g_stats.draw_ticks = g_stats.tex_ticks = g_stats.present_ticks = 0;
+    }
+    if (presents % 600 == 0) {
         LOG_INFO("rsx", "renderer: %llu draws, %llu skipped, %llu vertices, %llu pipelines, %llu uploads, %zu textures, %zu surfaces", (unsigned long long)g_stats.draws,
                  (unsigned long long)g_stats.skipped, (unsigned long long)g_stats.vertices, (unsigned long long)g_stats.pipelines, (unsigned long long)g_stats.uploads, g_textures.size(),
                  g_surfaces.size());
@@ -1725,7 +2039,9 @@ bool present(uint32_t buffer_id) {
     if (!display_buffer(buffer_id, offset, pitch, width, height)) return false;
     for (auto& [key, s] : g_surfaces) {
         if (s->offset == offset && !s->depth() && s->width >= width && s->height >= height) {
+            uint64_t pt = ticks();
             present_image(s->image, s->layout, width, height);
+            g_stats.present_ticks += ticks() - pt;
             return true;
         }
     }

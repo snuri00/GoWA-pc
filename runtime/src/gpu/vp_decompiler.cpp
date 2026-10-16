@@ -36,7 +36,7 @@ public:
         std::ostringstream body;
         if (has_flow_) {
             body << "    int pc = " << start_ << ";\n    int stk[8];\n    int sp = 0;\n    int guard = 0;\n";
-            body << "    while (guard++ < 65536) {\n        switch (pc) {\n";
+            body << "    while (guard++ < 512) {\n        switch (pc) {\n";
             for (uint32_t s : slots_) {
                 body << "        case " << s << ": {\n";
                 emit(body, s, "            ");
@@ -250,7 +250,10 @@ private:
         std::string in = ind + "    ";
         if (cond && condv == 0) {
             o << ind << "}\n";
-            if (has_flow_) o << ind << (i.end() ? "pc = -1; break;\n" : "");
+            if (has_flow_) {
+                if (i.end()) o << ind << "pc = -1; break;\n";
+                else if (!slots_.count(s + 1)) o << ind << "pc = " << (s + 1) << "; continue;\n";
+            }
             return;
         }
         if (cond) o << in << "bvec4 ct = " << cond_mask(i) << ";\n";
@@ -288,7 +291,7 @@ private:
             if (!wrote || upd_s) masked_write(o, in, "CC[" + std::to_string(cc_sel) + "]", "sr", smask, cond);
         }
         if (has_flow_ && is_flow(sop)) {
-            std::string take = cond ? "any(ct)" : "true";
+            std::string take = condv == 7 ? "true" : condv == 0 ? "false" : "any(" + cond_mask(i) + ")";
             uint32_t t = i.target();
             switch (sop) {
             case 0x09: o << in << "if (" << take << ") { pc = " << t << "; continue; }\n"; break;
