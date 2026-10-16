@@ -38,3 +38,8 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/out/conformance/tests.cpp")
     target_link_libraries(ppu_conformance PRIVATE gowa_ppu_ops)
     target_compile_options(ppu_conformance PRIVATE ${GOWA_ARCH_FLAGS} /clang:${GOWA_GENERATED_OPT})
 endif()
+
+add_executable(spu_conformance tests/spu_conformance/harness.cpp runtime/src/spu/interpreter.cpp)
+target_include_directories(spu_conformance PRIVATE runtime/include)
+target_link_libraries(spu_conformance PRIVATE gowa_ppu_ops)
+target_compile_options(spu_conformance PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
