@@ -43,6 +43,7 @@ struct RsxState {
     uint32_t sema_ctx_4097 = 0;
     uint32_t sema_off_4097 = 0;
     uint32_t report_ctx = 0;
+    bool call_active = false;
     uint32_t call_return = 0;
     uint64_t flips = 0;
     std::atomic<uint32_t> last_method{0};
@@ -261,13 +262,29 @@ void fifo_thread() {
             continue;
         }
         idle = 0;
+        static uint32_t hist_get[64], hist_cmd[64], hist_put[64];
+        static uint32_t hist_n = 0;
         uint32_t ea = io_to_ea(get);
         if (!ea) {
+            static uint32_t dumped = 0xFFFFFFFF;
+            if (dumped != get) {
+                dumped = get;
+                for (uint32_t i = 0; i < 64; i++) {
+                    uint32_t k = (hist_n + i) & 63;
+                    LOG_ERROR("rsx", "  hist get 0x%08x cmd 0x%08x put 0x%08x", hist_get[k], hist_cmd[k], hist_put[k]);
+                }
+            }
             LOG_ERROR("rsx", "FIFO get 0x%08x not IO-mapped (put 0x%08x)", get, put);
             Sleep(10);
             continue;
         }
         uint32_t cmd = vm::read32(ea);
+        if (cmd) {
+            hist_get[hist_n & 63] = get;
+            hist_cmd[hist_n & 63] = cmd;
+            hist_put[hist_n & 63] = put;
+            hist_n++;
+        }
         static const bool trace = std::getenv("GOWA_RSX_TRACE") != nullptr;
         if (trace) LOG_INFO("rsxc", "get 0x%08x cmd 0x%08x", get, cmd);
         if ((cmd & 0xE0000003) == 0x20000000 || (cmd & 0xE0000003) == 0x00000001) {
@@ -281,11 +298,23 @@ void fifo_thread() {
             continue;
         }
         if ((cmd & 3) == 2) {
+            if (g_rsx.call_active) LOG_WARN("rsx", "nested FIFO call at 0x%08x (return 0x%08x)", get, g_rsx.call_return);
+            g_rsx.call_active = true;
             g_rsx.call_return = get + 4;
             vm::write32(ctrl + 0x44, cmd & 0x1FFFFFFC);
             continue;
         }
         if ((cmd & 0xFFFF0003) == 0x00020000) {
+            if (!g_rsx.call_active) {
+                LOG_ERROR("rsx", "FIFO return without call at 0x%08x", get);
+                for (uint32_t i = 0; i < 64; i++) {
+                    uint32_t k = (hist_n + i) & 63;
+                    LOG_ERROR("rsx", "  hist get 0x%08x cmd 0x%08x put 0x%08x", hist_get[k], hist_cmd[k], hist_put[k]);
+                }
+                vm::write32(ctrl + 0x44, get + 4);
+                continue;
+            }
+            g_rsx.call_active = false;
             vm::write32(ctrl + 0x44, g_rsx.call_return);
             continue;
         }

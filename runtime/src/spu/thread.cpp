@@ -1,3 +1,4 @@
+#include "spu/aot.h"
 #include "thread.h"
 #include "../lv2/event.h"
 #include "../lv2/sync.h"
@@ -17,6 +18,10 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+
+namespace crash {
+void profile_thread(void* native, const char* name);
+}
 
 namespace spu {
 
@@ -615,6 +620,14 @@ void SpuThread::run() {
     LOG_INFO("spu", "thread 0x%x '%s' start pc 0x%05x args 0x%llx 0x%llx", id, name.c_str(), ctx.pc,
              static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));
     register_thread(this);
+    if (const char* e = std::getenv("GOWA_PROFILE_SPU")) {
+        if (static_cast<uint32_t>(std::atoi(e)) == slot) {
+            HANDLE h = nullptr;
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            static std::string label = "spu " + std::string(e);
+            crash::profile_thread(h, label.c_str());
+        }
+    }
     uint32_t n = 0;
     static const std::vector<uint32_t> bps = [] {
         std::vector<uint32_t> v;
@@ -630,7 +643,54 @@ void SpuThread::run() {
         }
         return v;
     }();
-    while (step(ctx, *this)) {
+    const bool aot_on = aot::active();
+    std::vector<const CompiledBlock*> block_cache(aot_on ? LS_SIZE / 4 : 0, nullptr);
+    uint32_t irq_countdown = 64;
+    const bool rec = aot::recording();
+    bool block_start = true;
+    uint32_t block_len = 0;
+    for (;;) {
+        if (block_start) {
+            block_start = false;
+            block_len = 0;
+            if (aot_on) {
+                const CompiledBlock*& slot = block_cache[ctx.pc >> 2];
+                const CompiledBlock* b = slot;
+                if (!b || std::memcmp(ls + ctx.pc, b->code, b->words * 4) != 0) {
+                    b = aot::find(ls, ctx.pc);
+                    slot = b;
+                }
+                if (b) {
+                    bool ok = b->fn(ctx, *this);
+                    n += b->words;
+                    if (!ok) break;
+                    block_start = true;
+                    if (ctx.irq_check) {
+                        ctx.irq_check = false;
+                        check_interrupt();
+                    } else if (ctx.interrupts_enabled) {
+                        if (irq_countdown <= b->words) {
+                            irq_countdown = 64;
+                            check_interrupt();
+                        } else {
+                            irq_countdown -= b->words;
+                        }
+                    }
+                    if ((n & ~1023u) != ((n - b->words) & ~1023u)) {
+                        insns.fetch_add(1024, std::memory_order_relaxed);
+                        pc_samples[pc_sample_pos.fetch_add(1, std::memory_order_relaxed) & 255] = ctx.pc;
+                        if (stop_flag.load(std::memory_order_relaxed)) break;
+                    }
+                    continue;
+                }
+            }
+            if (rec) aot::record(ls, ctx.pc);
+        }
+        uint32_t word;
+        std::memcpy(&word, ls + ctx.pc, 4);
+        word = __builtin_bswap32(word);
+        if (!step(ctx, *this)) break;
+        if (aot::is_terminator(word) || ++block_len >= aot::MAX_BLOCK_WORDS) block_start = true;
         if (!bps.empty()) {
             for (uint32_t bp : bps) {
                 if (ctx.pc == bp) {
@@ -654,6 +714,7 @@ void SpuThread::run() {
             if (stop_flag.load(std::memory_order_relaxed)) break;
         }
     }
+    if (rec) aot::flush();
     LOG_INFO("spu", "thread 0x%x '%s' stopped at 0x%05x", id, name.c_str(), ctx.pc);
     {
         std::lock_guard lk(m);
