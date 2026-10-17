@@ -16,6 +16,7 @@ void call_indirect(Context& ctx, uint8_t* base, uint32_t addr);
 void trap(Context& ctx, uint8_t* base, uint32_t pc);
 void unimplemented(Context& ctx, uint8_t* base, uint32_t pc, uint32_t word);
 uint64_t timebase();
+double time_scale();
 uint32_t lwarx(Context& ctx, uint8_t* base, uint32_t ea);
 uint64_t ldarx(Context& ctx, uint8_t* base, uint32_t ea);
 bool stwcx(Context& ctx, uint8_t* base, uint32_t ea, uint32_t value);

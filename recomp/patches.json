@@ -1,0 +1,14 @@
+{
+ "gowa": {
+  "source": "../bin/01.12/GOWA.elf",
+  "output": "../bin/01.12/GOWA.patched.elf",
+  "patches": [
+   {
+    "name": "Disable SPU MLAA",
+    "origin": "RPCS3 patch.yml (illusion, ZEROx), PPU-3a0b43e4a5f4bfea64f53612ee7c5d990f88129c",
+    "enabled": true,
+    "writes": [["byte", "0x0083d007", "0x00"], ["be32", "0x00397754", "0x60000000"], ["be32", "0x00397784", "0x60000000"]]
+   }
+  ]
+ }
+}

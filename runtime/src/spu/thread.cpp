@@ -1,0 +1,960 @@
+#include "spu/aot.h"
+#include "thread.h"
+#include "../lv2/event.h"
+#include "../lv2/sync.h"
+#include "ppu/ops.h"
+#include "runtime/log.h"
+#include "runtime/trace.h"
+#include "runtime/memory.h"
+#include "runtime/reservation.h"
+
+#include <algorithm>
+#include <map>
+#include <unordered_map>
+#include <string>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <malloc.h>
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+namespace crash {
+void profile_thread(void* native, const char* name);
+}
+
+namespace spu {
+
+namespace {
+
+enum : uint32_t {
+    EV_LR = 0x400, EV_S1 = 0x200, EV_S2 = 0x100, EV_TM = 0x20, EV_SN = 0x2,
+};
+
+constexpr uint64_t SPU_USER_EVENT_KEY = 0xFFFFFFFF53505501ull;
+constexpr uint64_t SPU_GROUP_RUN_KEY = 0xFFFFFFFF53505500ull;
+
+uint64_t timebase_now() { return ppu::timebase(); }
+
+}
+
+SpuThread::SpuThread() {
+    ls = static_cast<uint8_t*>(_aligned_malloc(LS_SIZE + 16, 128));
+    std::memset(ls, 0, LS_SIZE + 16);
+    ctx.ls = ls;
+}
+
+SpuThread::~SpuThread() { _aligned_free(ls); }
+
+template <class Pred>
+bool SpuThread::block(std::unique_lock<std::mutex>& lk, Pred pred) {
+    while (!pred()) {
+        if (stop_flag.load(std::memory_order_relaxed)) {
+            ctx.halted = true;
+            return false;
+        }
+        cv.wait_for(lk, std::chrono::microseconds(100));
+    }
+    return true;
+}
+
+uint32_t SpuThread::dec_now() {
+    if (dec_frozen) return dec_value;
+    return static_cast<uint32_t>(dec_value - (timebase_now() - dec_start));
+}
+
+void SpuThread::set_events(uint32_t bits) {
+    events |= bits;
+    if (event_mask & bits) event_count = true;
+}
+
+void SpuThread::check_interrupt() {
+    if (!ctx.interrupts_enabled) return;
+    std::lock_guard lk(m);
+    collect_events();
+    if (!event_count) return;
+    ctx.interrupts_enabled = false;
+    ctx.srr0 = ctx.pc;
+    uint32_t w;
+    std::memcpy(&w, ls, 4);
+    w = __builtin_bswap32(w);
+    ctx.pc = (w & 0xFD80007Fu) == 0x30000000u ? ((w >> 5) & 0x3FFFCu) : 0;
+}
+
+void SpuThread::collect_events() {
+    if (!dec_frozen) {
+        uint64_t elapsed = timebase_now() - dec_start;
+        if (elapsed > dec_value) {
+            set_events(EV_TM);
+            dec_start += 0x100000000ull;
+        }
+    }
+    if ((event_mask & EV_LR) && raddr && !(events & EV_LR)) {
+        if (rsv::lost(raddr, rtime, rdata)) {
+            set_events(EV_LR);
+            raddr = 0;
+        }
+    }
+    if (events & event_mask) event_count = true;
+}
+
+void SpuThread::push_snr(uint32_t number, uint32_t value) {
+    std::lock_guard lk(m);
+    bool orm = (snr_config >> number) & 1;
+    bool was = snr_count[number];
+    snr[number] = orm && was ? (snr[number] | value) : value;
+    snr_count[number] = true;
+    if (!was || !orm) set_events(number == 0 ? EV_S1 : EV_S2);
+    cv.notify_all();
+}
+
+void SpuThread::push_in_mbox(uint32_t value) {
+    std::lock_guard lk(m);
+    if (in_mbox.size() >= 4) in_mbox.back() = value;
+    else in_mbox.push_back(value);
+    cv.notify_all();
+}
+
+uint32_t SpuThread::pop_out_mbox() {
+    std::lock_guard lk(m);
+    out_mbox_full = false;
+    cv.notify_all();
+    return out_mbox;
+}
+
+uint32_t SpuThread::channel_count(uint32_t ch) {
+    std::lock_guard lk(m);
+    switch (ch) {
+    case 0: collect_events(); return event_count ? 1 : 0;
+    case 3: return snr_count[0];
+    case 4: return snr_count[1];
+    case 21: return 16;
+    case 23: return 1;
+    case 24: return tag_stat_count;
+    case 25: return stall_stat_count;
+    case 27: return atomic_stat_count;
+    case 28: return out_mbox_full ? 0 : 1;
+    case 29: return static_cast<uint32_t>(in_mbox.size());
+    case 30: return out_intr_full ? 0 : 1;
+    case 9: return 0;
+    default: return 1;
+    }
+}
+
+uint32_t SpuThread::read_channel(uint32_t ch) {
+    std::unique_lock lk(m);
+    switch (ch) {
+    case 0: {
+        collect_events();
+        while (!event_count) {
+            if (stop_flag.load(std::memory_order_relaxed)) {
+                ctx.halted = true;
+                return 0;
+            }
+            if ((event_mask & EV_LR) && raddr) {
+                uint32_t line = raddr;
+                uint64_t rt = rtime;
+                uint8_t snap[128];
+                std::memcpy(snap, rdata, 128);
+                lk.unlock();
+                rsv::wait_lost(line, rt, snap, 100);
+                lk.lock();
+            } else {
+                cv.wait_for(lk, std::chrono::microseconds(100));
+            }
+            collect_events();
+        }
+        event_count = false;
+        return events & event_mask;
+    }
+    case 3:
+    case 4: {
+        int n = ch - 3;
+        if (!block(lk, [&] { return snr_count[n]; })) return 0;
+        snr_count[n] = false;
+        uint32_t v = snr[n];
+        snr[n] = 0;
+        return v;
+    }
+    case 8: return dec_now();
+    case 11: return event_mask;
+    case 12: return tag_mask;
+    case 13: return ctx.interrupts_enabled ? 1 : 0;
+    case 15: return ctx.srr0;
+    case 24:
+        if (!block(lk, [&] { return tag_stat_count; })) return 0;
+        tag_stat_count = false;
+        return tag_stat;
+    case 25: {
+        if (!block(lk, [&] { return stall_stat_count; })) return 0;
+        stall_stat_count = false;
+        uint32_t v = stall_stat;
+        stall_stat = 0;
+        return v;
+    }
+    case 27:
+        if (!block(lk, [&] { return atomic_stat_count; })) return 0;
+        atomic_stat_count = false;
+        return atomic_stat;
+    case 29: {
+        if (!block(lk, [&] { return !in_mbox.empty(); })) return 0;
+        uint32_t v = in_mbox.front();
+        in_mbox.pop_front();
+        return v;
+    }
+    default:
+        LOG_ERROR("spu", "thread 0x%x read of unknown channel %u at 0x%05x", id, ch, ctx.pc);
+        return 0;
+    }
+}
+
+void SpuThread::write_channel(uint32_t ch, uint32_t value) {
+    std::unique_lock lk(m);
+    switch (ch) {
+    case 1:
+        collect_events();
+        event_mask = value;
+        if (events & event_mask) event_count = true;
+        lk.unlock();
+        check_interrupt();
+        return;
+    case 2:
+        collect_events();
+        if ((value & EV_TM) && !(event_mask & EV_TM)) {
+            dec_value = dec_now();
+            dec_frozen = true;
+        }
+        events &= ~value;
+        event_count = (events & event_mask) != 0;
+        lk.unlock();
+        check_interrupt();
+        return;
+    case 7:
+        collect_events();
+        dec_start = timebase_now();
+        dec_value = value;
+        dec_frozen = false;
+        return;
+    case 14: ctx.srr0 = value & 0x3FFFC; return;
+    case 16: mfc_lsa = value; return;
+    case 17: return;
+    case 18: mfc_eal = value; return;
+    case 19: mfc_size = value > 0xFFFF ? 0xFFFF : value; return;
+    case 20: mfc_tag = value & 0x1F; return;
+    case 21:
+        lk.unlock();
+        process_mfc(value & 0xFF);
+        return;
+    case 22: tag_mask = value; return;
+    case 23:
+        tag_stat = tag_mask;
+        if (value == 1 && tag_mask == 0) return;
+        tag_stat_count = true;
+        return;
+    case 26: {
+        uint32_t tag = value & 0x1F;
+        auto st = stalled[tag];
+        if (!st.active) return;
+        stalled[tag].active = false;
+        lk.unlock();
+        run_list(tag, st.cmd, st.lsa, st.list, st.remaining);
+        return;
+    }
+    case 28:
+        if (!block(lk, [&] { return !out_mbox_full; })) return;
+        out_mbox = value;
+        out_mbox_full = true;
+        return;
+    case 30: {
+        uint32_t code = value >> 24;
+        uint32_t data0 = value & 0xFFFFFF;
+        if (!out_mbox_full) {
+            LOG_ERROR("spu", "thread 0x%x WrOutIntrMbox 0x%08x with empty out mbox", id, value);
+            return;
+        }
+        uint32_t data1 = out_mbox;
+        out_mbox_full = false;
+        lk.unlock();
+        if (code < 128) {
+            uint32_t port = code & 63;
+            bool reply = code < 64;
+            if (reply) {
+                std::lock_guard l2(m);
+                if (!in_mbox.empty()) {
+                    in_mbox.assign(1, static_cast<uint32_t>(lv2::CELL_EBUSY));
+                    cv.notify_all();
+                    return;
+                }
+            }
+            int64_t r = lv2::CELL_ENOTCONN;
+            if (uint32_t q = spup[port]) {
+                if (auto queue = lv2::get<lv2::EventQueue>(q)) {
+                    r = lv2::push_event(queue, {SPU_USER_EVENT_KEY, id, (uint64_t(port) << 32) | data0, data1});
+                }
+            }
+            LOG_DEBUG("spu", "thread 0x%x %s port %u data0 0x%x data1 0x%x queue 0x%x -> 0x%llx", id, reply ? "send_event" : "throw_event", port, data0, data1,
+                      spup[port], static_cast<unsigned long long>(r));
+            if (reply) push_in_mbox(static_cast<uint32_t>(r));
+            else if (r) LOG_WARN("spu", "thread 0x%x throw_event port %u failed 0x%llx", id, port, static_cast<unsigned long long>(r));
+        } else if (code == 128 || code == 192) {
+            int64_t r = lv2::event_flag_set_bits(data1, 1ull << (data0 & 63));
+            LOG_DEBUG("spu", "thread 0x%x event_flag_set 0x%x bit %u -> 0x%llx", id, data1, data0 & 63, static_cast<unsigned long long>(r));
+            if (code == 128) push_in_mbox(static_cast<uint32_t>(r));
+        } else {
+            LOG_ERROR("spu", "thread 0x%x unknown WrOutIntrMbox code %u", id, code);
+        }
+        return;
+    }
+    case 9:
+    case 69:
+    case 70:
+    case 71:
+        return;
+    default:
+        LOG_ERROR("spu", "thread 0x%x write 0x%x to unknown channel %u at 0x%05x", id, value, ch, ctx.pc);
+        return;
+    }
+}
+
+uint8_t* SpuThread::translate(uint32_t ea, uint32_t size, bool write, bool& handled, uint32_t lsa) {
+    handled = false;
+    if (ea >= 0xF0000000 && group) {
+        uint32_t slot_n = (ea - 0xF0000000) / 0x100000;
+        uint32_t off = (ea - 0xF0000000) % 0x100000;
+        SpuThread* t = group->by_slot(slot_n);
+        if (t) {
+            if (off + size <= LS_SIZE) return t->ls + off;
+            if (write && size == 4 && (off == 0x5400C || off == 0x5C00C)) {
+                uint32_t v;
+                std::memcpy(&v, ls + (lsa & 0x3FFFF), 4);
+                t->push_snr(off == 0x5400C ? 0 : 1, __builtin_bswap32(v));
+                handled = true;
+                return nullptr;
+            }
+        }
+        LOG_ERROR("spu", "thread 0x%x DMA to unsupported SPU window 0x%08x size 0x%x", id, ea, size);
+        handled = true;
+        return nullptr;
+    }
+    return vm::ptr(ea);
+}
+
+void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
+    if (!size) return;
+    if (size > 0x4000) {
+        LOG_ERROR("spu", "thread 0x%x DMA size 0x%x too large", id, size);
+        return;
+    }
+    lsa &= 0x3FFFF;
+    bool put = (cmd & 0xF0) == 0x20 || (cmd & 0xF0) == 0x30 || (cmd & 0xF0) == 0xA0;
+    static const uint64_t dma_watch = [] {
+        const char* e = std::getenv("GOWA_SPU_DMA");
+        if (!e) return uint64_t(0);
+        const char* dash = std::strchr(e, '-');
+        uint64_t lo = std::strtoul(e, nullptr, 16), hi = dash ? std::strtoul(dash + 1, nullptr, 16) : lo + 1;
+        return (hi << 32) | lo;
+    }();
+    if (dma_watch && ea < (dma_watch >> 32) && ea + size > static_cast<uint32_t>(dma_watch)) {
+        LOG_INFO("spudma", "thread 0x%x pc 0x%05x %s cmd 0x%02x ea 0x%08x lsa 0x%05x size 0x%x", id, ctx.pc, put ? "PUT" : "GET", cmd, ea, lsa, size);
+    }
+    if (ea < 0xF0000000u && (ea < 0x10000 || !vm::is_mapped(ea) || !vm::is_mapped(ea + size - 1))) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1) < 20) {
+            LOG_ERROR("spu", "thread 0x%x '%s' DMA %s cmd 0x%02x unmapped ea 0x%08x size 0x%x lsa 0x%05x pc 0x%05x", id, name.c_str(), put ? "PUT" : "GET", cmd, ea, size, lsa, ctx.pc);
+        }
+        if (!put) std::memset(ls + lsa, 0, size);
+        return;
+    }
+    if (trace::on(trace::DMA)) trace::emit(trace::T_DMA, slot | (uint32_t(put) << 8) | (cmd << 16), ea, lsa, size, ctx.pc, id);
+    bool handled;
+    uint8_t* p = translate(ea, size, put, handled, lsa);
+    if (handled || !p) return;
+    if (cmd == 0x89) {
+        std::memset(p, 0, size);
+        return;
+    }
+    if (put) {
+        uint32_t guest = ea;
+        if (ea < 0xF0000000u) {
+            uint32_t done = 0;
+            while (done < size) {
+                uint32_t a = guest + done;
+                uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+                rsv::store_locked(a, ls + lsa + done, chunk);
+                done += chunk;
+            }
+        } else {
+            std::memcpy(p, ls + lsa, size);
+        }
+    } else if (ea < 0xF0000000u) {
+        uint32_t done = 0;
+        alignas(16) uint8_t line[128];
+        while (done < size) {
+            uint32_t a = ea + done;
+            uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+            rsv::snapshot(a & ~127u, line);
+            std::memcpy(ls + lsa + done, line + (a & 127), chunk);
+            done += chunk;
+        }
+    } else {
+        std::memcpy(ls + lsa, p, size);
+    }
+}
+
+bool SpuThread::run_list(uint32_t tag, uint32_t cmd, uint32_t lsa, uint32_t list, uint32_t size) {
+    uint32_t base_cmd = cmd & ~0xFu;
+    uint32_t cur = lsa & 0x3FFF0;
+    list &= 0x3FFF8;
+    while (size >= 8) {
+        uint8_t* e = ls + list;
+        bool stall = (e[0] & 0x80) != 0;
+        uint32_t tsize = ((uint32_t(e[2]) << 8) | e[3]) & 0x7FFF;
+        uint32_t ea;
+        std::memcpy(&ea, e + 4, 4);
+        ea = __builtin_bswap32(ea);
+        dma(base_cmd, cur | (ea & 0xF), ea, tsize);
+        cur = (cur + ((tsize + 15) & ~15u)) & 0x3FFF0;
+        list = (list + 8) & 0x3FFF8;
+        size -= 8;
+        if (stall && size >= 8) {
+            std::lock_guard lk(m);
+            stalled[tag] = {true, cmd, cur, list, size};
+            set_events(EV_SN);
+            stall_stat |= 1u << tag;
+            stall_stat_count = true;
+            cv.notify_all();
+            return false;
+        }
+    }
+    return true;
+}
+
+void SpuThread::process_mfc(uint32_t cmd) {
+    uint32_t lsa = mfc_lsa, ea = mfc_eal, size = mfc_size, tag = mfc_tag;
+    if ((cmd == 0xD0 || cmd == 0xB4 || cmd == 0xB0 || cmd == 0xB8) && (ea < 0x10000 || !vm::is_mapped(ea & ~127u))) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1) < 6) {
+            LOG_ERROR("spu", "thread 0x%x '%s' atomic cmd 0x%x on unmapped ea 0x%08x at pc 0x%05x lsa 0x%05x r0 0x%05x r1 0x%05x", id, name.c_str(), cmd, ea, ctx.pc, lsa,
+                      ctx.gpr[0].u32[3], ctx.gpr[1].u32[3]);
+            char fn[64];
+            std::snprintf(fn, sizeof fn, "spu_fault_%08x.ls", id);
+            if (FILE* f = std::fopen(fn, "wb")) {
+                std::fwrite(ls, 1, LS_SIZE, f);
+                std::fclose(f);
+            }
+        }
+        std::lock_guard lk(m);
+        atomic_stat = cmd == 0xD0 ? 4 : 1;
+        atomic_stat_count = true;
+        return;
+    }
+    switch (cmd) {
+    case 0x20: case 0x21: case 0x22: case 0x30: case 0x31: case 0x32:
+    case 0x40: case 0x41: case 0x42: case 0x89:
+        dma(cmd, lsa, ea, size);
+        break;
+    case 0xA0: case 0xA1: case 0xA2:
+        dma(0x20, lsa, ea, 4);
+        break;
+    case 0x24: case 0x25: case 0x26: case 0x34: case 0x35: case 0x36:
+    case 0x44: case 0x45: case 0x46:
+        run_list(tag, cmd, lsa, ea, size);
+        break;
+    case 0xD0: {
+        uint32_t line = ea & ~127u;
+        std::lock_guard lk(m);
+        if (raddr && raddr != line && rsv::lost(raddr, rtime, rdata)) set_events(EV_LR);
+        uint8_t snap[128];
+        uint64_t ver = rsv::snapshot(line, snap);
+        if (raddr == line && ver != rtime && std::memcmp(snap, rdata, 128) == 0) set_events(EV_LR);
+        raddr = line;
+        rtime = ver;
+        std::memcpy(rdata, snap, 128);
+        std::memcpy(ls + (lsa & 0x3FF80), snap, 128);
+        atomic_stat = 4;
+        atomic_stat_count = true;
+        return;
+    }
+    case 0xB4: {
+        uint32_t line = ea & ~127u;
+        std::lock_guard lk(m);
+        bool ok = raddr == line && rsv::commit_if(line, rtime, rdata, ls + (lsa & 0x3FF80), 0, 128);
+        if (ok && trace::on(trace::ATOMIC)) trace::emit(trace::T_ATOMIC, slot | (0xB4u << 16), line, lsa & 0x3FF80, 128, ctx.pc, id);
+        if (!ok) set_events(EV_LR);
+        raddr = 0;
+        atomic_stat = ok ? 0 : 1;
+        atomic_stat_count = true;
+        return;
+    }
+    case 0xB0:
+    case 0xB8: {
+        uint32_t line = ea & ~127u;
+        rsv::store_unconditional(line, ls + (lsa & 0x3FF80));
+        if (trace::on(trace::ATOMIC)) trace::emit(trace::T_ATOMIC, slot | (cmd << 16), line, lsa & 0x3FF80, 128, ctx.pc, id);
+        if (cmd == 0xB0) {
+            std::lock_guard lk(m);
+            atomic_stat = 2;
+            atomic_stat_count = true;
+        }
+        return;
+    }
+    case 0xC0: case 0xC8: case 0xCC: case 0x80: case 0x81:
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        break;
+    default:
+        LOG_ERROR("spu", "thread 0x%x unknown MFC command 0x%x", id, cmd);
+        break;
+    }
+}
+
+bool SpuThread::stop_and_signal(uint32_t code) {
+    switch (code) {
+    case 0x001:
+        Sleep(1);
+        return true;
+    case 0x100:
+        return true;
+    case 0x101: {
+        uint32_t status = pop_out_mbox();
+        LOG_INFO("spu", "thread 0x%x group_exit(%u)", id, status);
+        if (group) {
+            std::lock_guard lk(group->m);
+            if (!group->join_state) {
+                group->join_state = 1;
+                group->exit_status = status;
+            }
+        }
+        if (group) group->stop_all();
+        return false;
+    }
+    case 0x102: {
+        exit_status = pop_out_mbox();
+        exited_by_thread_exit = true;
+        return false;
+    }
+    case 0x110:
+    case 0x111: {
+        uint32_t spuq_num;
+        {
+            std::lock_guard lk(m);
+            spuq_num = out_mbox;
+            out_mbox_full = false;
+            if (!in_mbox.empty()) {
+                in_mbox.assign(1, static_cast<uint32_t>(lv2::CELL_EBUSY));
+                cv.notify_all();
+                return true;
+            }
+        }
+        uint32_t qid = 0;
+        for (auto& [num, q] : spuq) {
+            if (q && num == spuq_num) qid = q;
+        }
+        auto queue = qid ? lv2::get<lv2::EventQueue>(qid) : nullptr;
+        if (!queue) {
+            push_in_mbox(static_cast<uint32_t>(lv2::CELL_EINVAL));
+            return true;
+        }
+        std::unique_lock ql(queue->m);
+        while (queue->events.empty() && !queue->destroyed) {
+            if (code == 0x111) {
+                ql.unlock();
+                push_in_mbox(static_cast<uint32_t>(lv2::CELL_EBUSY));
+                return true;
+            }
+            if (stop_flag.load()) {
+                ctx.halted = true;
+                return false;
+            }
+            queue->cv.wait_for(ql, std::chrono::microseconds(500));
+        }
+        if (queue->destroyed) {
+            ql.unlock();
+            push_in_mbox(static_cast<uint32_t>(lv2::CELL_ECANCELED));
+            return true;
+        }
+        lv2::Event e = queue->events.front();
+        queue->events.pop_front();
+        ql.unlock();
+        std::lock_guard lk(m);
+        in_mbox.assign({0u, static_cast<uint32_t>(e.data1), static_cast<uint32_t>(e.data2), static_cast<uint32_t>(e.data3)});
+        cv.notify_all();
+        return true;
+    }
+    default:
+        LOG_ERROR("spu", "thread 0x%x unknown stop code 0x%x at 0x%05x", id, code, ctx.pc - 4);
+        return false;
+    }
+}
+
+void SpuThread::halt(uint32_t pc, uint32_t word) {
+    LOG_ERROR("spu", "thread 0x%x '%s' halted at 0x%05x (0x%08x)", id, name.c_str(), pc, word);
+}
+
+void SpuThread::deploy() {
+    for (auto& s : segments) {
+        uint32_t type = s[0], lsa = s[1], size = s[2], val = s[3];
+        if (type == 1) std::memcpy(ls + lsa, vm::ptr(val), size);
+        else if (type == 2) {
+            uint32_t be = __builtin_bswap32(val);
+            for (uint32_t i = 0; i + 4 <= size; i += 4) std::memcpy(ls + lsa + i, &be, 4);
+        }
+    }
+}
+
+void SpuThread::start() {
+    deploy();
+    ctx = Context{};
+    ctx.ls = ls;
+    ctx.gpr[1].u32[3] = 0x3FFF0;
+    for (int i = 0; i < 4; i++) ctx.gpr[3 + i].u64[1] = args[i];
+    ctx.pc = image_entry & 0x3FFFC;
+    ctx.interrupts_enabled = image_entry & 1;
+    tag_mask = tag_stat = stall_stat = atomic_stat = 0;
+    tag_stat_count = stall_stat_count = atomic_stat_count = false;
+    out_mbox_full = out_intr_full = false;
+    events = event_mask = 0;
+    event_count = false;
+    dec_value = (option & 2) ? ~static_cast<uint32_t>(timebase_now()) : 0;
+    dec_start = timebase_now();
+    dec_frozen = false;
+    raddr = 0;
+    exited_by_thread_exit = false;
+    stop_flag = false;
+    running = true;
+    std::thread([this] { run(); }).detach();
+}
+
+namespace {
+
+struct ChannelEvent {
+    int kind;
+    uint32_t ch;
+    uint32_t value;
+    uint32_t pc;
+    uint32_t srr0;
+    bool ie;
+    bool halted;
+    bool result;
+    std::shared_ptr<std::vector<uint8_t>> ls_after;
+};
+
+struct RecordHost : Host {
+    SpuThread& t;
+    std::vector<ChannelEvent> events;
+    explicit RecordHost(SpuThread& thread) : t(thread) {}
+    void note(int kind, uint32_t ch, uint32_t value, bool result) {
+        events.push_back({kind, ch, value, t.ctx.pc, t.ctx.srr0, t.ctx.interrupts_enabled, t.ctx.halted, result, nullptr});
+        if (kind == 1 && (ch == 21 || ch == 26)) events.back().ls_after = std::make_shared<std::vector<uint8_t>>(t.ls, t.ls + LS_SIZE);
+    }
+    uint32_t read_channel(uint32_t ch) override {
+        uint32_t v = t.read_channel(ch);
+        note(0, ch, v, true);
+        return v;
+    }
+    void write_channel(uint32_t ch, uint32_t value) override {
+        t.write_channel(ch, value);
+        note(1, ch, value, true);
+    }
+    uint32_t channel_count(uint32_t ch) override {
+        uint32_t v = t.channel_count(ch);
+        note(2, ch, v, true);
+        return v;
+    }
+    bool stop_and_signal(uint32_t code) override {
+        bool r = t.stop_and_signal(code);
+        note(3, code, 0, r);
+        return r;
+    }
+    void halt(uint32_t pc, uint32_t word) override {
+        t.halt(pc, word);
+        note(4, pc, word, true);
+    }
+};
+
+struct ReplayHost : Host {
+    Context& c;
+    const std::vector<ChannelEvent>& events;
+    size_t pos = 0;
+    std::string error;
+    ReplayHost(Context& ctx, const std::vector<ChannelEvent>& ev) : c(ctx), events(ev) {}
+    const ChannelEvent* next(int kind, uint32_t ch, uint32_t value, bool check_value) {
+        if (pos >= events.size()) {
+            if (error.empty()) error = "extra channel op kind " + std::to_string(kind) + " ch " + std::to_string(ch);
+            return nullptr;
+        }
+        const ChannelEvent& e = events[pos++];
+        if (e.kind != kind || e.ch != ch || (check_value && e.value != value)) {
+            if (error.empty()) {
+                char b[160];
+                std::snprintf(b, sizeof b, "channel op %zu: aot kind %d ch %u val 0x%x, int kind %d ch %u val 0x%x", pos - 1, kind, ch, value, e.kind, e.ch, e.value);
+                error = b;
+            }
+        }
+        c.pc = e.pc;
+        c.srr0 = e.srr0;
+        c.interrupts_enabled = e.ie;
+        c.halted = e.halted;
+        if (e.ls_after) std::memcpy(c.ls, e.ls_after->data(), LS_SIZE);
+        return &e;
+    }
+    uint32_t read_channel(uint32_t ch) override {
+        const ChannelEvent* e = next(0, ch, 0, false);
+        return e ? e->value : 0;
+    }
+    void write_channel(uint32_t ch, uint32_t value) override { next(1, ch, value, true); }
+    uint32_t channel_count(uint32_t ch) override {
+        const ChannelEvent* e = next(2, ch, 0, false);
+        return e ? e->value : 0;
+    }
+    bool stop_and_signal(uint32_t code) override {
+        const ChannelEvent* e = next(3, code, 0, false);
+        return e ? e->result : false;
+    }
+    void halt(uint32_t pc, uint32_t word) override { next(4, pc, word, true); }
+};
+
+}
+
+void SpuThread::run() {
+    wchar_t w[64];
+    swprintf(w, 64, L"SPU %u %hs", slot, name.c_str());
+    SetThreadDescription(GetCurrentThread(), w);
+    if (!std::getenv("GOWA_SPU_NORMAL_PRIO")) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
+    LOG_INFO("spu", "thread 0x%x '%s' start pc 0x%05x args 0x%llx 0x%llx", id, name.c_str(), ctx.pc,
+             static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));
+    register_thread(this);
+    if (const char* e = std::getenv("GOWA_PROFILE_SPU")) {
+        if (static_cast<uint32_t>(std::atoi(e)) == slot) {
+            HANDLE h = nullptr;
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            static std::string label = "spu " + std::string(e);
+            crash::profile_thread(h, label.c_str());
+        }
+    }
+    uint32_t n = 0;
+    static const std::vector<uint32_t> bps = [] {
+        std::vector<uint32_t> v;
+        if (const char* e = std::getenv("GOWA_SPU_BP")) {
+            std::string s = e;
+            size_t pos = 0;
+            while (pos < s.size()) {
+                size_t end = s.find(',', pos);
+                if (end == std::string::npos) end = s.size();
+                v.push_back(static_cast<uint32_t>(std::strtoul(s.substr(pos, end - pos).c_str(), nullptr, 16)));
+                pos = end + 1;
+            }
+        }
+        return v;
+    }();
+    const bool aot_on = aot::active();
+    const bool verify = std::getenv("GOWA_SPU_AOT_VERIFY") != nullptr;
+    bool halted_in_verify = false;
+    const bool pure_only = std::getenv("GOWA_SPU_AOT_PURE_ONLY") != nullptr;
+    std::vector<uint8_t> verify_ls(verify ? LS_SIZE : 0);
+    std::unordered_map<const CompiledBlock*, int> verify_count;
+    auto verify_block = [&](const CompiledBlock* b) -> bool {
+        int& cnt = verify_count[b];
+        if (cnt >= 30) return false;
+        cnt++;
+        Context copy = ctx;
+        std::memcpy(verify_ls.data(), ls, LS_SIZE);
+        copy.ls = verify_ls.data();
+        uint32_t start = ctx.pc;
+        RecordHost recorder(*this);
+        bool int_ok = true;
+        for (uint32_t k = 0; k < b->words; k++) {
+            int_ok = step(ctx, recorder);
+            if (!int_ok) break;
+            if (k + 1 < b->words && ctx.pc != ((start + 4 * (k + 1)) & PC_MASK)) break;
+        }
+        ReplayHost replay(copy, recorder.events);
+        bool aot_ok = b->fn(copy, replay);
+        if (replay.error.empty() && replay.pos != recorder.events.size()) replay.error = "aot consumed " + std::to_string(replay.pos) + " of " + std::to_string(recorder.events.size()) + " channel ops";
+        bool bad = !replay.error.empty() || aot_ok != int_ok || copy.pc != ctx.pc || copy.srr0 != ctx.srr0 || copy.interrupts_enabled != ctx.interrupts_enabled ||
+                   std::memcmp(copy.gpr, ctx.gpr, sizeof ctx.gpr) != 0 || std::memcmp(verify_ls.data(), ls, LS_SIZE) != 0;
+        if (bad) {
+            std::string diff;
+            for (int r = 0; r < 128; r++) {
+                if (std::memcmp(&copy.gpr[r], &ctx.gpr[r], 16) == 0) continue;
+                char t[96];
+                std::snprintf(t, sizeof t, " r%d aot=%08x%08x%08x%08x int=%08x%08x%08x%08x", r, copy.gpr[r].u32[3], copy.gpr[r].u32[2], copy.gpr[r].u32[1], copy.gpr[r].u32[0], ctx.gpr[r].u32[3], ctx.gpr[r].u32[2],
+                              ctx.gpr[r].u32[1], ctx.gpr[r].u32[0]);
+                diff += t;
+            }
+            LOG_ERROR("spuaot", "MISMATCH block lsa 0x%05x words %u pure %d: ok %d/%d pc aot 0x%05x int 0x%05x ie %d/%d ls %s %s%s", start, b->words, b->pure ? 1 : 0, aot_ok, int_ok, copy.pc, ctx.pc,
+                      copy.interrupts_enabled, ctx.interrupts_enabled, std::memcmp(verify_ls.data(), ls, LS_SIZE) ? "differs" : "same", replay.error.c_str(), diff.c_str());
+        }
+        if (!int_ok) halted_in_verify = true;
+        return true;
+    };
+    std::vector<const CompiledBlock*> block_cache(aot_on ? LS_SIZE / 4 : 0, nullptr);
+    uint32_t irq_countdown = 64;
+    const bool rec = aot::recording();
+    bool block_start = true;
+    uint32_t block_len = 0;
+    for (;;) {
+        if (block_start) {
+            block_start = false;
+            block_len = 0;
+            if (aot_on) {
+                const CompiledBlock*& slot = block_cache[ctx.pc >> 2];
+                const CompiledBlock* b = slot;
+                if (!b || std::memcmp(ls + ctx.pc, b->code, b->words * 4) != 0) {
+                    b = aot::find(ls, ctx.pc);
+                    slot = b;
+                }
+                if (b && verify && verify_block(b)) {
+                    n += b->words;
+                    block_start = true;
+                    if (halted_in_verify) break;
+                    continue;
+                }
+                if (b && pure_only && !b->pure) b = nullptr;
+                if (b) {
+                    bool ok = b->fn(ctx, *this);
+                    n += b->words;
+                    if (!ok) break;
+                    block_start = true;
+                    if (ctx.irq_check) {
+                        ctx.irq_check = false;
+                        check_interrupt();
+                    } else if (ctx.interrupts_enabled) {
+                        if (irq_countdown <= b->words) {
+                            irq_countdown = 64;
+                            check_interrupt();
+                        } else {
+                            irq_countdown -= b->words;
+                        }
+                    }
+                    if ((n & ~1023u) != ((n - b->words) & ~1023u)) {
+                        insns.fetch_add(1024, std::memory_order_relaxed);
+                        pc_samples[pc_sample_pos.fetch_add(1, std::memory_order_relaxed) & 255] = ctx.pc;
+                        if (stop_flag.load(std::memory_order_relaxed)) break;
+                    }
+                    continue;
+                }
+            }
+            if (rec) aot::record(ls, ctx.pc);
+        }
+        uint32_t word;
+        std::memcpy(&word, ls + ctx.pc, 4);
+        word = __builtin_bswap32(word);
+        if (!step(ctx, *this)) break;
+        if (aot::is_terminator(word) || ++block_len >= aot::MAX_BLOCK_WORDS) block_start = true;
+        if (!bps.empty()) {
+            for (uint32_t bp : bps) {
+                if (ctx.pc == bp) {
+                    uint32_t wid;
+                    std::memcpy(&wid, ls + 0x1dc, 4);
+                    LOG_INFO("spubp", "thread 0x%x pc 0x%05x wid %u r3 %08x r4 %08x r5 %08x lr(r0) %05x", id, ctx.pc, __builtin_bswap32(wid), ctx.gpr[3].u32[3], ctx.gpr[4].u32[3],
+                             ctx.gpr[5].u32[3], ctx.gpr[0].u32[3]);
+                    break;
+                }
+            }
+        }
+        if (ctx.irq_check) {
+            ctx.irq_check = false;
+            check_interrupt();
+        } else if (ctx.interrupts_enabled && (n & 63) == 0) {
+            check_interrupt();
+        }
+        if ((++n & 1023) == 0) {
+            insns.fetch_add(1024, std::memory_order_relaxed);
+            pc_samples[pc_sample_pos.fetch_add(1, std::memory_order_relaxed) & 255] = ctx.pc;
+            if (stop_flag.load(std::memory_order_relaxed)) break;
+        }
+    }
+    if (rec) aot::flush();
+    LOG_INFO("spu", "thread 0x%x '%s' stopped at 0x%05x", id, name.c_str(), ctx.pc);
+    {
+        std::lock_guard lk(m);
+        running = false;
+        in_mbox.clear();
+    }
+    if (group) group->thread_stopped(*this);
+}
+
+namespace {
+std::mutex g_reg_lock;
+std::vector<SpuThread*> g_reg;
+}
+
+void register_thread(SpuThread* t) {
+    std::lock_guard lk(g_reg_lock);
+    if (std::find(g_reg.begin(), g_reg.end(), t) == g_reg.end()) g_reg.push_back(t);
+}
+
+void status_dump() {
+    if (const char* e = std::getenv("GOWA_DUMP")) {
+        std::string list = e;
+        size_t pos = 0;
+        while (pos < list.size()) {
+            size_t end = list.find(',', pos);
+            if (end == std::string::npos) end = list.size();
+            uint32_t a = static_cast<uint32_t>(std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16));
+            for (uint32_t off = 0; off < 0x100; off += 32) {
+                std::string hex;
+                char b[12];
+                for (uint32_t i = 0; i < 32; i += 4) {
+                    std::snprintf(b, sizeof b, "%08x ", vm::read32(a + off + i));
+                    hex += b;
+                }
+                LOG_INFO("status", "mem %08x: %s", a + off, hex.c_str());
+            }
+            pos = end + 1;
+        }
+    }
+    std::lock_guard lk(g_reg_lock);
+    for (SpuThread* t : g_reg) {
+        LOG_INFO("status", "spu 0x%x '%s' pc 0x%05x ie %d srr0 0x%05x insns %llu mask 0x%x events 0x%x raddr 0x%08x running %d", t->id, t->name.c_str(), t->ctx.pc, t->ctx.interrupts_enabled ? 1 : 0, t->ctx.srr0,
+                 static_cast<unsigned long long>(t->insns.load()), t->event_mask, t->events, t->raddr, t->running ? 1 : 0);
+        std::map<uint32_t, int> hist;
+        for (uint32_t pc : t->pc_samples) hist[pc & ~0x3Fu]++;
+        std::vector<std::pair<int, uint32_t>> top;
+        for (auto& [pc, n] : hist) top.push_back({n, pc});
+        std::sort(top.rbegin(), top.rend());
+        std::string line;
+        for (size_t i = 0; i < top.size() && i < 6; i++) line += " " + std::to_string(top[i].first) + "@" + std::to_string(top[i].second);
+        LOG_INFO("status", "   hot pcs (count@addr dec):%s", line.c_str());
+        char fn[64];
+        std::snprintf(fn, sizeof fn, "spu_%08x.ls", t->id);
+        if (FILE* f = std::fopen(fn, "wb")) {
+            std::fwrite(t->ls, 1, LS_SIZE, f);
+            std::fclose(f);
+        }
+    }
+}
+
+SpuThread* Group::by_slot(uint32_t slot) {
+    for (auto& t : threads) {
+        if (t && t->slot == slot) return t.get();
+    }
+    return nullptr;
+}
+
+void Group::thread_stopped(SpuThread& t) {
+    std::lock_guard lk(m);
+    if (running) running--;
+    if (!running) {
+        state = 1;
+        if (!join_state) {
+            join_state = 2;
+            exit_status = 0;
+        }
+        cv.notify_all();
+        LOG_INFO("spu", "group 0x%x '%s' stopped (cause %u status %u)", id, name.c_str(), join_state, exit_status);
+    }
+}
+
+void Group::stop_all() {
+    for (auto& t : threads) {
+        if (!t) continue;
+        t->stop_flag = true;
+        t->cv.notify_all();
+    }
+}
+
+}
