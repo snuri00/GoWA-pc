@@ -2419,7 +2419,10 @@ uint32_t reg(uint32_t method) { return R(method); }
 
 std::atomic<uint32_t> g_zpass_draws{0};
 
-uint32_t zpass_value() { return g_zpass_draws.load(std::memory_order_relaxed) ? 0xFFFFu : 0u; }
+uint32_t zpass_value() {
+    static const uint32_t big = std::getenv("GOWA_ZPASS_VALUE") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_ZPASS_VALUE"), nullptr, 0)) : 0x100000u;
+    return g_zpass_draws.load(std::memory_order_relaxed) ? big : 0u;
+}
 
 void frame_complete() {
     complete_writebacks();
