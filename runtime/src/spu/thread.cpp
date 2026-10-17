@@ -213,6 +213,15 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
 }
 
 void SpuThread::write_channel(uint32_t ch, uint32_t value) {
+    switch (ch) {
+    case 14: ctx.srr0 = value & 0x3FFFC; return;
+    case 16: mfc_lsa = value; return;
+    case 17: return;
+    case 18: mfc_eal = value; return;
+    case 19: mfc_size = value > 0xFFFF ? 0xFFFF : value; return;
+    case 20: mfc_tag = value & 0x1F; return;
+    default: break;
+    }
     std::unique_lock lk(m);
     switch (ch) {
     case 1:
@@ -741,10 +750,12 @@ void SpuThread::run() {
              static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));
     register_thread(this);
     if (const char* e = std::getenv("GOWA_PROFILE_SPU")) {
-        if (static_cast<uint32_t>(std::atoi(e)) == slot) {
+        if (std::string(e) == "all" || static_cast<uint32_t>(std::atoi(e)) == slot) {
             HANDLE h = nullptr;
             DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
-            static std::string label = "spu " + std::string(e);
+            static std::string labels[8];
+            std::string& label = labels[slot & 7];
+            label = "spu " + std::to_string(slot);
             crash::profile_thread(h, label.c_str());
         }
     }
@@ -807,7 +818,7 @@ void SpuThread::run() {
     std::vector<const CompiledBlock*> block_cache(aot_on ? LS_SIZE / 4 : 0, nullptr);
     std::vector<uint32_t> block_valid(aot_on ? LS_SIZE / 4 : 0, 0);
     static const bool no_fresh = std::getenv("GOWA_SPU_NO_FRESH") != nullptr;
-    uint32_t irq_countdown = 64;
+    uint32_t irq_countdown = 256;
     const bool rec = aot::recording();
     bool block_start = true;
     uint32_t block_len = 0;
@@ -844,7 +855,7 @@ void SpuThread::run() {
                         check_interrupt();
                     } else if (ctx.interrupts_enabled) {
                         if (irq_countdown <= b->words) {
-                            irq_countdown = 64;
+                            irq_countdown = 256;
                             check_interrupt();
                         } else {
                             irq_countdown -= b->words;

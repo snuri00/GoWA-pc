@@ -22,15 +22,39 @@ BRANCHES = {
 }
 
 
+RRR = set()
+
+NO_WRITE = {
+    "op_stqd", "op_stqx", "op_stqa", "op_stqr", "op_br", "op_bra", "op_brz", "op_brnz", "op_brhz", "op_brhnz",
+    "op_bi", "op_biz", "op_binz", "op_bihz", "op_bihnz", "op_iret", "op_hbr", "op_hbra", "op_hbrr",
+    "op_nop", "op_lnop", "op_sync", "op_dsync", "op_mtspr",
+}
+
+
 def decode_table():
     src = open(INTERP, encoding="utf-8").read()
     table = ["op_illegal"] * 2048
     for m in re.finditer(r"set\((0x[0-9A-Fa-f]+),\s*(\d+),\s*(op_\w+)\)", src):
         opcode, bits, name = int(m.group(1), 16), int(m.group(2)), m.group(3)
+        if bits == 4:
+            RRR.add(name)
         shift = 11 - bits
         for k in range(1 << shift):
             table[(opcode << shift) | k] = name
     return table
+
+
+def reg_sets(table, raw):
+    reads, writes = set(), set()
+    for r in raw:
+        w = struct.unpack(">I", struct.pack("<I", r))[0]
+        name = table[w >> 21]
+        for shift in (0, 7, 14, 21):
+            reads.add((w >> shift) & 0x7F)
+        if name in NO_WRITE:
+            continue
+        writes.add((w >> 21) & 0x7F if name in RRR else w & 0x7F)
+    return sorted(reads | writes), sorted(writes)
 
 
 def load_blocks(paths):
@@ -58,7 +82,50 @@ def is_pure(table, raw):
     return True
 
 
+def emit_pure_block(table, idx, lsa, raw, out):
+    reads, writes = reg_sets(table, raw)
+    out.append("bool b%d(Context& c0, Host& h) {" % idx)
+    out.append("    (void)h;")
+    out.append("    Context c;")
+    out.append("    c.ls = c0.ls;")
+    out.append("    c.line_epoch = c0.line_epoch;")
+    out.append("    c.epoch = c0.epoch;")
+    out.append("    c.pc = c0.pc;")
+    out.append("    c.srr0 = c0.srr0;")
+    out.append("    c.interrupts_enabled = c0.interrupts_enabled;")
+    out.append("    c.irq_check = c0.irq_check;")
+    out.append("    c.halted = c0.halted;")
+    for r in reads:
+        out.append("    c.gpr[%d] = c0.gpr[%d];" % (r, r))
+    n = len(raw)
+    last_branch = False
+    for k, r in enumerate(raw):
+        w = struct.unpack(">I", struct.pack("<I", r))[0]
+        pc = (lsa + k * 4) & 0x3FFFC
+        name = table[w >> 21]
+        if name in CONTROL:
+            out.append("    c.pc = 0x%x;" % ((pc + 4) & 0x3FFFC))
+            out.append("    %s(c, h, 0x%08xu, 0x%xu);" % (name, w, pc))
+            last_branch = True
+        else:
+            out.append("    %s(c, h, 0x%08xu, 0x%xu);" % (name, w, pc))
+            last_branch = False
+    if not last_branch:
+        out.append("    c.pc = 0x%x;" % ((lsa + n * 4) & 0x3FFFC))
+    for r in writes:
+        out.append("    c0.gpr[%d] = c.gpr[%d];" % (r, r))
+    out.append("    c0.pc = c.pc;")
+    out.append("    c0.interrupts_enabled = c.interrupts_enabled;")
+    out.append("    c0.irq_check = c.irq_check;")
+    out.append("    return true;")
+    out.append("}")
+    out.append("")
+
+
 def emit_block(table, idx, lsa, raw, out):
+    if not os.environ.get("GOWA_SPU_NO_LOCAL") and is_pure(table, raw):
+        emit_pure_block(table, idx, lsa, raw, out)
+        return
     out.append("bool b%d(Context& c, Host& h) {" % idx)
     out.append("    (void)h;")
     n = len(raw)

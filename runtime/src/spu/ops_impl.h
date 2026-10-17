@@ -403,7 +403,7 @@ SPU_INLINE bool op_fceq(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA
 SPU_INLINE bool op_fcmeq(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)), b = G(RB(w)), r; for (int i = 0; i < 4; i++) r.u32[i] = std::fabs(a.f32[i]) == std::fabs(b.f32[i]) ? 0xFFFFFFFF : 0; G(RT(w)) = r; return true; }
 
 SPU_INLINE bool op_cflts(Context& c, Host&, uint32_t w, uint32_t) {
-    double scale = std::ldexp(1.0, int(173 - I8(w)));
+    double scale = std::bit_cast<double>(uint64_t(1023 + 173 - int(I8(w))) << 52);
     v128 a = G(RA(w)), r;
     for (int i = 0; i < 4; i++) {
         double v = double(a.f32[i]) * scale;
@@ -413,7 +413,7 @@ SPU_INLINE bool op_cflts(Context& c, Host&, uint32_t w, uint32_t) {
     return true;
 }
 SPU_INLINE bool op_cfltu(Context& c, Host&, uint32_t w, uint32_t) {
-    double scale = std::ldexp(1.0, int(173 - I8(w)));
+    double scale = std::bit_cast<double>(uint64_t(1023 + 173 - int(I8(w))) << 52);
     v128 a = G(RA(w)), r;
     for (int i = 0; i < 4; i++) {
         double v = double(a.f32[i]) * scale;
@@ -423,14 +423,14 @@ SPU_INLINE bool op_cfltu(Context& c, Host&, uint32_t w, uint32_t) {
     return true;
 }
 SPU_INLINE bool op_csflt(Context& c, Host&, uint32_t w, uint32_t) {
-    double scale = std::ldexp(1.0, int(I8(w)) - 155);
+    double scale = std::bit_cast<double>(uint64_t(1023 + int(I8(w)) - 155) << 52);
     v128 a = G(RA(w)), r;
     for (int i = 0; i < 4; i++) r.f32[i] = float(double(a.s32[i]) * scale);
     G(RT(w)) = r;
     return true;
 }
 SPU_INLINE bool op_cuflt(Context& c, Host&, uint32_t w, uint32_t) {
-    double scale = std::ldexp(1.0, int(I8(w)) - 155);
+    double scale = std::bit_cast<double>(uint64_t(1023 + int(I8(w)) - 155) << 52);
     v128 a = G(RA(w)), r;
     for (int i = 0; i < 4; i++) r.f32[i] = float(double(a.u32[i]) * scale);
     G(RT(w)) = r;

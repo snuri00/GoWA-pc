@@ -23,6 +23,8 @@ namespace crash {
 namespace {
 
 std::string symbol_of(DWORD64 addr) {
+    static std::mutex sym_lock;
+    std::lock_guard lk(sym_lock);
     alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
     auto* s = reinterpret_cast<SYMBOL_INFO*>(buf);
     s->SizeOfStruct = sizeof(SYMBOL_INFO);
@@ -302,7 +304,7 @@ void profile_thread(void* native, const char* name) {
                 for (auto& [k, v] : counts) top.push_back({v, k});
                 std::sort(top.rbegin(), top.rend());
                 LOG_INFO("profile", "%s: %llu samples", name, static_cast<unsigned long long>(total));
-                for (size_t i = 0; i < top.size() && i < 12; i++) LOG_INFO("profile", "  %5.1f%% %s", 100.0 * top[i].first / total, top[i].second.c_str());
+                for (size_t i = 0; i < top.size() && i < (std::getenv("GOWA_PROFILE_TOP") ? size_t(std::atoi(std::getenv("GOWA_PROFILE_TOP"))) : size_t(12)); i++) LOG_INFO("profile", "  %5.1f%% %s", 100.0 * top[i].first / total, top[i].second.c_str());
                 counts.clear();
                 total = 0;
             }
