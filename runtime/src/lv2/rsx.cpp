@@ -152,6 +152,8 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
         return CELL_OK;
     case 0x100: case 0x101: case 0x105: case 0x106: case 0x108: case 0x10B: case 0x10C: case 0x10D:
     case 0x300: case 0x301: case 0x302: case 0x600: case 0x601: case 0x602: case 0x603:
+        LOG_INFO("rsx", "context attribute 0x%x a3 0x%llx a4 0x%llx a5 0x%llx a6 0x%llx", package, static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                 static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6));
         return CELL_OK;
     default:
         LOG_WARN("rsx", "unknown context attribute package 0x%x", package);

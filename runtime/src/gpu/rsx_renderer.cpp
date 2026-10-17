@@ -10,11 +10,14 @@
 #include "vp_decompiler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <memory>
 #include <tuple>
 #include <unordered_map>
@@ -207,6 +210,7 @@ VkDescriptorSetLayout g_set_layout = VK_NULL_HANDLE;
 VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
 bool g_ready = false;
 bool g_trace = false;
+int g_trace_serial = 0;
 uint32_t g_trace_draws = 0;
 void schedule_dumps();
 uint32_t g_experiment = std::getenv("GOWA_GPU_EXPERIMENT") ? std::atoi(std::getenv("GOWA_GPU_EXPERIMENT")) : 0;
@@ -1007,12 +1011,66 @@ TempImage* copy_to_temp(Surface* s, uint32_t w, uint32_t h, bool redirect) {
 
 Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth);
 
+void dump_texture(const TextureRegs& t, uint32_t ea) {
+    static std::set<uint64_t> done;
+    static int pass_id = 0;
+    static uint64_t last_presents = 0;
+    pass_id = g_trace_serial;
+    uint64_t key = (uint64_t(ea) << 32) ^ t.format ^ (uint64_t(t.rect) << 8) ^ (uint64_t(pass_id) << 60);
+    if (!done.insert(key).second) return;
+    (void)last_presents;
+    TextureLayout l;
+    if (!describe_texture(t, l) || !readable(ea, l.source_size)) return;
+    std::vector<uint8_t> buf(l.decoded_size);
+    decode_texture(vm::ptr(ea), t, l, buf.data());
+    const TextureRegion& r = l.regions[0];
+    char fn[96];
+    bool bc = l.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || l.format == VK_FORMAT_BC1_RGBA_SRGB_BLOCK || l.format == VK_FORMAT_BC2_UNORM_BLOCK || l.format == VK_FORMAT_BC2_SRGB_BLOCK ||
+              l.format == VK_FORMAT_BC3_UNORM_BLOCK || l.format == VK_FORMAT_BC3_SRGB_BLOCK;
+    if (bc) {
+        uint32_t fourcc = (l.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || l.format == VK_FORMAT_BC1_RGBA_SRGB_BLOCK) ? 0x31545844u
+                          : (l.format == VK_FORMAT_BC2_UNORM_BLOCK || l.format == VK_FORMAT_BC2_SRGB_BLOCK)     ? 0x33545844u
+                                                                                                                 : 0x35545844u;
+        uint32_t bsize = fourcc == 0x31545844u ? 8 : 16;
+        uint32_t bytes = ((r.width + 3) / 4) * ((r.height + 3) / 4) * bsize;
+        std::snprintf(fn, sizeof fn, "tex_%08x_%ux%u_%02x_t%d.dds", ea, r.width, r.height, (t.format >> 8) & 0xFF, int(std::time(nullptr) % 100000));
+        if (FILE* f = std::fopen(fn, "wb")) {
+            uint32_t h[32] = {};
+            h[0] = 0x20534444u;
+            h[1] = 124;
+            h[2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000;
+            h[3] = r.height;
+            h[4] = r.width;
+            h[5] = bytes;
+            h[19] = 32;
+            h[20] = 0x4;
+            h[21] = fourcc;
+            h[27] = 0x1000;
+            std::fwrite(h, 4, 32, f);
+            std::fwrite(buf.data() + r.offset, 1, bytes, f);
+            std::fclose(f);
+        }
+    } else if (l.format == VK_FORMAT_B8G8R8A8_UNORM || l.format == VK_FORMAT_B8G8R8A8_SRGB) {
+        std::snprintf(fn, sizeof fn, "tex_%08x_%ux%u_%02x.ppm", ea, r.width, r.height, (t.format >> 8) & 0xFF);
+        if (FILE* f = std::fopen(fn, "wb")) {
+            std::fprintf(f, "P6\n%u %u\n255\n", r.width, r.height);
+            for (uint32_t i = 0; i < r.width * r.height; i++) {
+                const uint8_t* px = buf.data() + r.offset + i * 4;
+                uint8_t rgb[3] = {px[2], px[1], px[0]};
+                std::fwrite(rgb, 1, 3, f);
+            }
+            std::fclose(f);
+        }
+    }
+}
+
 Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth) {
     g_bind_kind = "dummy";
     Binding b = bind_texture_impl(unit, dim, colors, depth);
     if (g_trace) {
         TextureRegs t = texture_regs(unit);
         uint32_t tea = lv2::rsx_address(t.offset, (t.format & 3) - 1);
+        if (std::getenv("GOWA_TEX_DUMP") && tea && std::string(g_bind_kind) == "memory") dump_texture(t, tea);
         uint32_t w0 = tea && readable(tea, 64) ? vm::read32(tea) : 0, w1 = tea && readable(tea, 64) ? vm::read32(tea + 4) : 0, w8 = tea && readable(tea, 64) ? vm::read32(tea + 32) : 0;
         LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s data %08x %08x %08x", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind, w0, w1, w8);
     }
@@ -1880,6 +1938,8 @@ void nv308a_color(uint32_t index, uint32_t arg) {
 }
 
 void nv0039_transfer() {
+    if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv0039 in 0x%x dma 0x%x out 0x%x dma 0x%x pitch %d/%d len %u lines %u fmt 0x%x", R(0x230C), R(0x2184), R(0x2310), R(0x2188), int32_t(R(0x2314)),
+                                                 int32_t(R(0x2318)), R(0x231C), R(0x2320), R(0x2324));
     if (g_trace) LOG_INFO("rsx", "trace nv0039 in 0x%x dma 0x%x out 0x%x dma 0x%x pitch %d/%d len %u lines %u fmt 0x%x", R(0x230C), R(0x2184), R(0x2310), R(0x2188), int32_t(R(0x2314)), int32_t(R(0x2318)), R(0x231C), R(0x2320), R(0x2324));
     uint32_t len = R(0x231C), lines = R(0x2320), fmt = R(0x2324);
     uint32_t in_stride = fmt & 0xFF, out_stride = (fmt >> 8) & 0xFF;
@@ -1898,6 +1958,8 @@ void nv0039_transfer() {
 }
 
 void nv3089_transfer(uint32_t arg) {
+    if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x clip 0x%x/0x%x dst 0x%x dma 0x%x pitch 0x%x surf 0x%x cfmt 0x%x/0x%x dsdx 0x%x/0x%x arg 0x%x", R(0xC408), R(0xC184),
+                                                 R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC308), R(0xC30C), R(0x630C), R(0x6188), R(0x6304), R(0xC198), R(0xC300), R(0x6300), R(0xC318), R(0xC31C), arg);
     if (g_trace) LOG_INFO("rsx", "trace nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x size 0x%x dst 0x%x dma 0x%x surf 0x%x dsdx 0x%x", R(0xC408), R(0xC184), R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC30C), R(0x630C), R(0x6188), R(0xC198), R(0xC318));
     if (R(0xC304) != 3) return;
     uint32_t in_size = R(0xC400), in_fmt = R(0xC404);
@@ -1930,6 +1992,8 @@ void nv3089_transfer(uint32_t arg) {
     uint32_t x1 = std::min(clip_x + clip_w, out_x + out_w), y1 = std::min(clip_y + clip_h, out_y + out_h);
     if (x1 <= x0 || y1 <= y0) return;
     if (!readable(src, uint64_t(in_h - 1 - std::min(in_y, in_h - 1)) * in_pitch + in_w * src_bpp)) return;
+    std::vector<uint32_t> pixels(size_t(x1 - x0) * (y1 - y0));
+    size_t k = 0;
     for (uint32_t y = y0; y < y1; y++) {
         double sv = (y - out_y + 0.5) * dtdy;
         int32_t sy = std::clamp(int32_t(sv < 0 ? in_h + std::floor(sv) : std::floor(sv)), 0, int32_t(in_h - 1));
@@ -1937,9 +2001,15 @@ void nv3089_transfer(uint32_t arg) {
             double su = (x - out_x + 0.5) * dsdx;
             int32_t sx = std::clamp(int32_t(su < 0 ? in_w + std::floor(su) : std::floor(su)), 0, int32_t(in_w - 1));
             uint32_t s = src + sy * in_pitch + sx * src_bpp;
+            pixels[k++] = src_bpp == 4 ? vm::read32(s) : vm::read16(s);
+        }
+    }
+    k = 0;
+    for (uint32_t y = y0; y < y1; y++) {
+        for (uint32_t x = x0; x < x1; x++) {
+            uint32_t pixel = pixels[k++];
             uint32_t d = swizzled ? dst + morton(x, y, log_w, log_h) * dst_bpp : dst + y * dst_pitch + x * dst_bpp;
             if (!vm::is_mapped(d)) return;
-            uint32_t pixel = src_bpp == 4 ? vm::read32(s) : vm::read16(s);
             if (dst_bpp == 4) vm::write32(d, src_bpp == 4 ? pixel : 0xFF000000u | (((pixel >> 11) & 0x1F) * 255 / 31) << 16 | (((pixel >> 5) & 0x3F) * 255 / 63) << 8 | ((pixel & 0x1F) * 255 / 31));
             else vm::write16(d, src_bpp == 2 ? uint16_t(pixel) : argb_to_565(pixel));
         }
@@ -2265,6 +2335,20 @@ bool present(uint32_t buffer_id) {
         if (!std::getenv("GOWA_TRACE_DUMP_DRAW")) schedule_dumps();
     }
     g_trace = trace_frame && presents == trace_frame;
+    static const double trace_at = std::getenv("GOWA_TRACE_AT") ? std::atof(std::getenv("GOWA_TRACE_AT")) : 0.0;
+    static const auto run_start = std::chrono::steady_clock::now();
+    static const double trace_at2 = std::getenv("GOWA_TRACE_AT2") ? std::atof(std::getenv("GOWA_TRACE_AT2")) : 0.0;
+    static bool traced_at = false, traced_at2 = false;
+    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count();
+    if (trace_at > 0.0 && !traced_at && elapsed >= trace_at) {
+        traced_at = true;
+        g_trace = true;
+    } else if (trace_at2 > 0.0 && !traced_at2 && elapsed >= trace_at2) {
+        traced_at2 = true;
+        g_trace = true;
+    }
+    if (g_trace) g_trace_serial++;
+    if (g_trace) g_trace_draws = 0;
     if (presents % 60 == 0) {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
