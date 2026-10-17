@@ -1917,7 +1917,17 @@ bool draw() {
         static const uint32_t dump_at = std::getenv("GOWA_TRACE_DUMP_DRAW") ? std::atoi(std::getenv("GOWA_TRACE_DUMP_DRAW")) : 0;
         static const uint32_t dump_target = std::getenv("GOWA_TRACE_DUMP_TARGET") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_TRACE_DUMP_TARGET"), nullptr, 16)) : ~0u;
         static bool dumped_target = false;
-        bool hit_target = !dumped_target && !colors.empty() && colors[0] && colors[0]->offset == dump_target;
+        static const uint32_t after_target = std::getenv("GOWA_TRACE_DUMP_AFTER_TARGET") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_TRACE_DUMP_AFTER_TARGET"), nullptr, 16)) : ~0u;
+        static bool seen_after = false;
+        bool on_after = !colors.empty() && colors[0] && colors[0]->offset == after_target;
+        static const uint32_t dump_target_count = [] {
+            const char* e = std::getenv("GOWA_TRACE_DUMP_TARGET");
+            const char* c = e ? std::strchr(e, ':') : nullptr;
+            return c ? static_cast<uint32_t>(std::atoi(c + 1)) : 0u;
+        }();
+        bool hit_target = !dumped_target && !colors.empty() && colors[0] && colors[0]->offset == dump_target && (!dump_target_count || colors.size() == dump_target_count);
+        if (!dumped_target && seen_after && !on_after) hit_target = true;
+        if (on_after) seen_after = true;
         if (hit_target) dumped_target = true;
         if (++g_trace_draws == dump_at || hit_target) {
             end_pass();
@@ -2163,6 +2173,18 @@ void complete_dumps() {
             std::fwrite(row.data(), 1, row.size(), f);
         }
         std::fclose(f);
+        if (std::getenv("GOWA_DUMP_ALPHA") && (d.format == VK_FORMAT_B8G8R8A8_UNORM || d.format == VK_FORMAT_R8G8B8A8_UNORM)) {
+            std::string an = std::string(fn).substr(0, std::strlen(fn) - 4) + "_alpha.ppm";
+            if (FILE* af = std::fopen(an.c_str(), "wb")) {
+                std::fprintf(af, "P6\n%u %u\n255\n", d.width, d.height);
+                for (uint32_t y = 0; y < d.height; y++) {
+                    const uint8_t* p = d.data + uint64_t(y) * d.width * 4;
+                    for (uint32_t x = 0; x < d.width; x++) row[x * 3] = row[x * 3 + 1] = row[x * 3 + 2] = p[x * 4 + 3];
+                    std::fwrite(row.data(), 1, row.size(), af);
+                }
+                std::fclose(af);
+            }
+        }
         LOG_INFO("rsx", "dumped %s z %f..%f", fn, zmin, zmax);
     }
     g_dumps.clear();
