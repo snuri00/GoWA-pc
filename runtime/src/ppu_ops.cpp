@@ -1,9 +1,10 @@
 #include <immintrin.h>
 #include "ppu/ops.h"
-#include "ppu/estimate_tables.h"
 #include "runtime/reservation.h"
 
 #include <atomic>
+#include <cmath>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -143,29 +144,37 @@ bool stdcx(Context& ctx, uint8_t* base, uint32_t ea, uint64_t value) {
 void notify_store(uint8_t* base, uint32_t ea, uint32_t size) {}
 
 double fres(double x) {
-    uint64_t b = f2u(x);
-    if (std::isnan(x)) return u2f(b | 0x0008000000000000ull);
-    uint64_t e = (b >> 52) & 0x7FF;
-    uint64_t m = tables::fres_mantissa[(b >> 45) & 0x7F];
-    uint64_t r = e >= 0x47F ? 0 : ((0x7FDull - e) << 52) | (m << 29);
-    return u2f((b & 0x8000000000000000ull) | r);
+    if (std::isnan(x)) return u2f(f2u(x) | 0x0008000000000000ull);
+    return static_cast<double>(static_cast<float>(1.0 / x));
 }
 
 double frsqrte(double x) {
-    uint64_t b = f2u(x);
-    uint32_t key = static_cast<uint32_t>(b >> 49);
-    uint32_t sign = key >> 14;
-    uint32_t e = (key >> 3) & 0x7FF;
-    uint32_t hi;
-    if (e == 0) hi = 0x7FF00000u | (sign << 31);
-    else if (e == 0x7FF) hi = (key == (0x7FFu << 3)) ? 0 : 0x7FF80000u;
-    else if (sign) hi = 0x7FF80000u;
-    else hi = tables::frsqrte_mantissa[8 ^ (key & 15)] | (0x3FE00000u - (((e + 0x1C01u) >> 1) << 20));
-    return u2f(uint64_t(hi) << 32);
+    if (std::isnan(x)) return u2f(f2u(x) | 0x0008000000000000ull);
+    if (x == 0.0) return std::signbit(x) ? -HUGE_VAL : HUGE_VAL;
+    if (x < 0.0) return u2f(0x7FF8000000000000ull);
+    return 1.0 / std::sqrt(x);
 }
 float vrefp(float x) { return 1.0f / x; }
-uint32_t vlogefp(uint32_t x, bool nj) { return tables::ppu_vlogefp(x, nj); }
-uint32_t vexptefp(uint32_t x, bool nj) { return tables::ppu_vexptefp(x, nj); }
+
+uint32_t vlogefp(uint32_t x, bool nj) {
+    uint32_t e = (x >> 23) & 0xFF, m = x & 0x7FFFFF;
+    if (e == 0xFF) return m ? x | 0x400000 : (x >> 31) ? 0x7FC00000u : x;
+    if (e == 0 && (nj || m == 0)) return 0xFF800000u;
+    if (x >> 31) return 0x7FC00000u;
+    float r = std::log2(std::bit_cast<float>(x));
+    return std::bit_cast<uint32_t>(r);
+}
+
+uint32_t vexptefp(uint32_t x, bool nj) {
+    uint32_t e = (x >> 23) & 0xFF, m = x & 0x7FFFFF;
+    if (e == 0xFF) return m ? x | 0x400000 : (x >> 31) ? 0u : x;
+    float v = std::bit_cast<float>(x);
+    if (nj && e == 0) v = 0.0f;
+    float r = std::exp2(v);
+    uint32_t b = std::bit_cast<uint32_t>(r);
+    if (nj && ((b >> 23) & 0xFF) == 0) b &= 0x80000000u;
+    return b;
+}
 float vrsqrtefp(float x) { return 1.0f / std::sqrt(x); }
 
 }
