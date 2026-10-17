@@ -323,6 +323,7 @@ bool init() {
     f2.features.largePoints = avail.largePoints;
     f2.features.textureCompressionBC = avail.textureCompressionBC;
     f2.features.shaderClipDistance = avail.shaderClipDistance;
+    f2.features.occlusionQueryPrecise = avail.occlusionQueryPrecise;
     g.features = f2.features;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2;

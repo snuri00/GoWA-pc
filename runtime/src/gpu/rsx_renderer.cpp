@@ -222,6 +222,17 @@ uint32_t g_vp_failures = 0;
 uint32_t g_fp_failures = 0;
 uint64_t g_clears = 0;
 Pass g_pass;
+VkQueryPool g_qpool = VK_NULL_HANDLE;
+constexpr uint32_t QMAX = 32768;
+uint32_t g_qused = 0;
+bool g_qreset_needed = true;
+std::vector<uint32_t> g_counter_queries;
+struct PendingReport {
+    uint32_t ea;
+    std::vector<uint32_t> queries;
+};
+std::vector<PendingReport> g_pending_reports;
+std::unordered_map<uint32_t, uint32_t> g_zpass_cache;
 Dummy g_dummy[4];
 VkDescriptorSetLayout g_set_layout = VK_NULL_HANDLE;
 VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
@@ -1946,6 +1957,22 @@ bool draw() {
     }
     g_stats.phase[5] += ticks() - ph;
     ph = ticks();
+    static const bool zpass_real = std::getenv("GOWA_ZPASS_REAL") != nullptr;
+    bool zcount = zpass_real && R(0x17CC) != 0;
+    if (zcount && g_qreset_needed) {
+        if (!g_qpool) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+            qi.queryCount = QMAX;
+            vkCreateQueryPool(vk().device, &qi, nullptr, &g_qpool);
+        }
+        if (g_qpool) {
+            end_pass();
+            vkCmdResetQueryPool(frame_cmd(), g_qpool, 0, QMAX);
+            g_qused = 0;
+            g_qreset_needed = false;
+        }
+    }
     begin_pass(colors, depth, w, h);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
@@ -1999,7 +2026,17 @@ bool draw() {
     vkCmdSetFrontFace(cmd, cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
     vkCmdSetPrimitiveTopology(cmd, topo);
     vkCmdSetPrimitiveRestartEnable(cmd, restart ? VK_TRUE : VK_FALSE);
+    bool query = zcount && g_qpool && !g_qreset_needed && g_qused < QMAX;
+    uint32_t qidx = 0;
+    if (query) {
+        qidx = g_qused++;
+        vkCmdBeginQuery(cmd, g_qpool, qidx, vk().features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    }
     if (!(g_experiment & 1)) vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    if (query) {
+        vkCmdEndQuery(cmd, g_qpool, qidx);
+        g_counter_queries.push_back(qidx);
+    }
     g_stats.phase[6] += ticks() - ph;
     for (uint32_t i = 0; i < g_pass.color_count; i++) g_pass.colors[i]->generation++;
     if (g_pass.depth) g_pass.depth->generation++;
@@ -2436,12 +2473,35 @@ uint32_t reg(uint32_t method) { return R(method); }
 
 std::atomic<uint32_t> g_zpass_draws{0};
 
-uint32_t zpass_value() {
+void resolve_zpass() {
+    if (g_qpool && g_qused) {
+        std::vector<uint32_t> res(g_qused, 0);
+        VkResult r = vkGetQueryPoolResults(vk().device, g_qpool, 0, g_qused, res.size() * 4, res.data(), 4, 0);
+        if (r == VK_SUCCESS || r == VK_NOT_READY) {
+            for (const PendingReport& p : g_pending_reports) {
+                uint64_t sum = 0;
+                for (uint32_t q : p.queries) if (q < res.size()) sum += res[q];
+                uint32_t v = static_cast<uint32_t>(std::min<uint64_t>(sum, 0xFFFFFFFFull));
+                g_zpass_cache[p.ea] = v;
+                if (vm::is_mapped(p.ea + 8)) vm::write32(p.ea + 8, v);
+            }
+        }
+    }
+    g_pending_reports.clear();
+    g_qreset_needed = true;
+}
+
+uint32_t zpass_value(uint32_t ea) {
     static const uint32_t big = std::getenv("GOWA_ZPASS_VALUE") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_ZPASS_VALUE"), nullptr, 0)) : 0x100000u;
-    return g_zpass_draws.load(std::memory_order_relaxed) ? big : 0u;
+    if (!g_zpass_draws.load(std::memory_order_relaxed)) return 0u;
+    if (!g_qpool) return big;
+    g_pending_reports.push_back({ea, g_counter_queries});
+    auto it = g_zpass_cache.find(ea);
+    return it != g_zpass_cache.end() ? it->second : big;
 }
 
 void frame_complete() {
+    resolve_zpass();
     complete_writebacks();
     complete_dumps();
     if (!std::getenv("GOWA_NO_GC")) collect_garbage();
@@ -2492,7 +2552,10 @@ void method(uint32_t reg, uint32_t arg) {
     default: break;
     }
     g_regs[(reg >> 2) & 0x3FFF] = arg;
-    if (reg == 0x17C8 && arg == 1) g_zpass_draws.store(0, std::memory_order_relaxed);
+    if (reg == 0x17C8 && arg == 1) {
+        g_zpass_draws.store(0, std::memory_order_relaxed);
+        g_counter_queries.clear();
+    }
     if (reg == BEGIN_END && !(arg & 0xFF) && g_in_begin && R(0x17CC)) g_zpass_draws.fetch_add(1, std::memory_order_relaxed);
     if (copy_engine(reg, arg)) return;
     if (immediate_method(reg, arg)) return;

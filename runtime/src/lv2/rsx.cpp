@@ -248,7 +248,7 @@ void execute(uint32_t reg, uint32_t arg) {
             std::memcpy(rep, &t, 8);
             std::memset(rep + 8, 0, 8);
             if ((arg >> 24) == 1) {
-                uint32_t v = __builtin_bswap32(gpu::rsx::zpass_value());
+                uint32_t v = __builtin_bswap32(gpu::rsx::zpass_value(a));
                 std::memcpy(rep + 8, &v, 4);
             }
             rsv::store_locked(a, rep, 16);
