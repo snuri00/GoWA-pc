@@ -232,6 +232,20 @@ private:
         std::string s = "tex" + std::to_string(unit);
         std::string a = src(sl, 0);
         std::string r;
+        if (((key_.shadow >> unit) & 1) && dim(unit) == 1) {
+            std::string c = op == 0x18 ? "(" + a + " / " + a + ".w)" : a;
+            std::string ref = "vec3(" + tex_coord(c, unit) + ", (" + c + ").z)";
+            switch (op) {
+            case 0x17:
+            case 0x18: r = "vec4(texture(" + s + ", " + ref + "))"; break;
+            case 0x19: r = "vec4(textureGrad(" + s + ", " + ref + ", " + tex_coord(src(sl, 1), unit) + ", " + tex_coord(src(sl, 2), unit) + "))"; break;
+            case 0x2F: r = "vec4(textureLod(" + s + ", " + ref + ", " + src(sl, 1) + ".x))"; break;
+            case 0x31: r = "vec4(texture(" + s + ", " + ref + ", " + src(sl, 1) + ".x))"; break;
+            default: r = "vec4(0.0)"; break;
+            }
+            if ((sl.w[0] >> 21) & 1) r = "(" + r + " * 2.0 - 1.0)";
+            return r;
+        }
         switch (op) {
         case 0x17: r = "texture(" + s + ", " + tex_coord(a, unit) + ")"; break;
         case 0x18: r = "texture(" + s + ", " + tex_coord("(" + a + " / " + a + ".w)", unit) + ")"; break;
@@ -403,7 +417,8 @@ private:
         for (uint32_t u = 0; u < 16; u++) {
             if (!(used_tex_ & (1u << u))) continue;
             static const char* types[4] = {"sampler1D", "sampler2D", "samplerCube", "sampler3D"};
-            s << "layout(set = 0, binding = " << (32 + u) << ") uniform " << types[dim(u)] << " tex" << u << ";\n";
+            bool shadow = ((key_.shadow >> u) & 1) && dim(u) == 1;
+            s << "layout(set = 0, binding = " << (32 + u) << ") uniform " << (shadow ? "sampler2DShadow" : types[dim(u)]) << " tex" << u << ";\n";
         }
         uint32_t mrt = key_.mrt_count > 4 ? 4 : key_.mrt_count;
         for (uint32_t m = 0; m < (mrt ? mrt : 1); m++) s << "layout(location = " << m << ") out vec4 out_color" << m << ";\n";

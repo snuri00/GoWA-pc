@@ -421,10 +421,14 @@ FpEntry* fragment_program(uint32_t ea) {
     for (uint32_t u = 0; u < 16; u++) {
         if (!(a.texture_mask & (1u << u))) continue;
         key.texture_dims |= dims & (3u << (u * 2));
-        if (R(TEXTURE_BASE + 4 + u * 0x20) & 0x4000) key.unnormalized |= 1u << u;
+        uint32_t tfmt = R(TEXTURE_BASE + 4 + u * 0x20);
+        if (tfmt & 0x4000) key.unnormalized |= 1u << u;
+        uint32_t tcode = ((tfmt >> 8) & 0xFF) & ~0x60u;
+        uint32_t tzf = (R(TEXTURE_BASE + 8 + u * 0x20) >> 28) & 7;
+        if (tcode >= 0x90 && tcode <= 0x93 && tzf != 0 && tzf != 7) key.shadow |= 1u << u;
     }
     key.mrt_count = mrt_count();
-    uint64_t h = a.hash ^ (uint64_t(key.control) << 1) ^ (uint64_t(key.texture_dims) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(key.mrt_count) << 40) ^ (uint64_t(key.unnormalized) * 0xC2B2AE3D27D4EB4Full);
+    uint64_t h = a.hash ^ (uint64_t(key.control) << 1) ^ (uint64_t(key.texture_dims) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(key.mrt_count) << 40) ^ (uint64_t(key.unnormalized) * 0xC2B2AE3D27D4EB4Full) ^ (uint64_t(key.shadow) << 48);
     auto it = g_fp_cache.find(h);
     if (it != g_fp_cache.end()) return &it->second;
     FpEntry& e = g_fp_cache[h];
@@ -766,7 +770,7 @@ VkSampler sampler(const TextureRegs& t, uint32_t levels, bool shadow) {
     }
     if (shadow) {
         si.compareEnable = VK_TRUE;
-        si.compareOp = reversed_compare(t.address >> 28);
+        si.compareOp = (g_experiment & 256) ? VK_COMPARE_OP_NEVER : reversed_compare(t.address >> 28);
     }
     si.borderColor = t.offset == 0xFFFFFFFF ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     VkSampler s = VK_NULL_HANDLE;
@@ -1156,7 +1160,7 @@ Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& c
         uint32_t tea = lv2::rsx_address(t.offset, (t.format & 3) - 1);
         if (std::getenv("GOWA_TEX_DUMP") && tea && std::string(g_bind_kind) == "memory") dump_texture(t, tea);
         uint32_t w0 = tea && readable(tea, 64) ? vm::read32(tea) : 0, w1 = tea && readable(tea, 64) ? vm::read32(tea + 4) : 0, w8 = tea && readable(tea, 64) ? vm::read32(tea + 32) : 0;
-        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s data %08x %08x %08x", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind, w0, w1, w8);
+        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s data %08x %08x %08x addr 0x%x c1 0x%x", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind, w0, w1, w8, t.address, t.control1);
     }
     return b;
 }
@@ -1761,7 +1765,8 @@ bool draw() {
     fs.window[3] = alpha_ref;
     fs.fog[0] = RF(FOG_PARAMS);
     fs.fog[1] = RF(FOG_PARAMS + 4);
-    fs.flags[0] = (R(ALPHA_TEST_ENABLE) ? 1u : 0u) | (R(SHADER_PACKER) ? 2u : 0u);
+    bool srgb_out = R(SHADER_PACKER) && !(R(SHADER_CONTROL) & 0x40) && cfmt != 0xB && cfmt != 0xC && cfmt != 0xD && !(g_experiment & 128);
+    fs.flags[0] = (R(ALPHA_TEST_ENABLE) ? 1u : 0u) | (srgb_out ? 2u : 0u);
     fs.flags[1] = R(FOG_MODE);
     fs.flags[2] = R(ALPHA_FUNC) & 7;
     static uint32_t fp_debug = std::getenv("GOWA_FP_DEBUG") ? std::atoi(std::getenv("GOWA_FP_DEBUG")) : 0;
@@ -2219,7 +2224,7 @@ void complete_dumps() {
         if (!f) continue;
         std::fprintf(f, "P6\n%u %u\n255\n", d.width, d.height);
         std::vector<uint8_t> row(d.width * 3);
-        float zmin = 2.0f, zmax = -1.0f;
+        float zmin = 1e30f, zmax = -1e30f;
         for (uint32_t y = 0; y < d.height; y++) {
             const uint8_t* p = d.data + uint64_t(y) * d.width * 4;
             for (uint32_t x = 0; x < d.width; x++) {
@@ -2234,6 +2239,8 @@ void complete_dumps() {
                 } else if (d.format == VK_FORMAT_R32_SFLOAT) {
                     float v;
                     std::memcpy(&v, p + x * 4, 4);
+                    zmin = std::min(zmin, v);
+                    zmax = std::max(zmax, v);
                     uint8_t g = uint8_t(std::clamp(v, 0.0f, 1.0f) * 255.0f);
                     row[x * 3] = row[x * 3 + 1] = row[x * 3 + 2] = g;
                 } else if (d.format == VK_FORMAT_R8G8B8A8_UNORM) {
