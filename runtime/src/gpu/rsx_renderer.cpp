@@ -496,6 +496,12 @@ bool allocate_image(const VkImageCreateInfo& ii, VkImage& image, VkDeviceMemory&
 void end_pass();
 void transition(Surface* s, VkImageLayout to);
 
+VkFormat srgb_variant(VkFormat f) {
+    if (f == VK_FORMAT_B8G8R8A8_UNORM) return VK_FORMAT_B8G8R8A8_SRGB;
+    if (f == VK_FORMAT_R8G8B8A8_UNORM) return VK_FORMAT_R8G8B8A8_SRGB;
+    return f;
+}
+
 Surface* surface(uint32_t offset, VkFormat format, uint32_t w, uint32_t h, bool depth, bool main = false, uint32_t pitch = 0) {
     auto key = std::make_tuple(main ? (offset | 0x80000000u) : offset, format, pitch);
     auto it = g_surfaces.find(key);
@@ -520,6 +526,7 @@ Surface* surface(uint32_t offset, VkFormat format, uint32_t w, uint32_t h, bool 
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (!depth && srgb_variant(format) != format) ii.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     if (!allocate_image(ii, s->image, s->memory)) return nullptr;
     s->view = make_view(s->image, format, VK_IMAGE_VIEW_TYPE_2D, s->aspect, {}, 1, 1);
     LOG_INFO("rsx", "new %s surface at %s 0x%x %ux%u format %d pitch 0x%x%s", depth ? "depth" : "color", main ? "main" : "local", offset, nw, nh, int(format), pitch, old ? " (grown)" : "");
@@ -899,6 +906,7 @@ TempImage* temp_image(Surface* src, VkFormat format, uint32_t w, uint32_t h, boo
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                (is_depth_format(format) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (srgb_variant(format) != format) ii.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     if (!allocate_image(ii, t->image, t->memory)) return nullptr;
     t->format = format;
     t->width = w;
@@ -909,11 +917,13 @@ TempImage* temp_image(Surface* src, VkFormat format, uint32_t w, uint32_t h, boo
     return raw;
 }
 
-VkImageView temp_view(TempImage* t, VkComponentMapping m) {
-    uint64_t k = fnv(&m, sizeof m);
+bool texture_srgb(const TextureRegs& t) { return (((t.address >> 20) & 0xF) & 7) == 7; }
+
+VkImageView temp_view(TempImage* t, VkComponentMapping m, bool srgb = false) {
+    uint64_t k = fnv(&m, sizeof m) ^ (srgb ? 0x5A5A5A5A5A5A5A5Aull : 0);
     auto it = t->views.find(k);
     if (it != t->views.end()) return it->second;
-    VkImageView v = make_view(t->image, t->format, VK_IMAGE_VIEW_TYPE_2D, is_depth_format(t->format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 1);
+    VkImageView v = make_view(t->image, srgb ? srgb_variant(t->format) : t->format, VK_IMAGE_VIEW_TYPE_2D, is_depth_format(t->format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 1);
     t->views[k] = v;
     return v;
 }
@@ -1202,7 +1212,7 @@ Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface
             g_bind_kind = src == redirect ? "depth redirect" : target ? "feedback copy" : "surface region";
             bool depth_copy = src != redirect && src->depth();
             if (depth_copy) m = VkComponentMapping{};
-            b.view = temp_view(tmp, m);
+            b.view = temp_view(tmp, m, !depth_copy && src != redirect && texture_srgb(t));
             uint32_t tzf = (t.address >> 28) & 7;
             b.sampler = sampler(t, 1, depth_copy && tzf != 0 && tzf != 7);
             return b;
@@ -1212,13 +1222,14 @@ Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface
             g_bind_kind = best->depth() ? "depth surface" : "color surface";
             transition(best, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             VkComponentMapping m = best->depth() ? VkComponentMapping{} : texture_mapping(0x85, t.control1);
-            uint64_t mk = fnv(&m, sizeof m);
+            bool srgb = !best->depth() && texture_srgb(t) && srgb_variant(best->format) != best->format;
+            uint64_t mk = fnv(&m, sizeof m) ^ (srgb ? 0x5A5A5A5A5A5A5A5Aull : 0);
             auto it = best->sample_views.find(mk);
             VkImageView v;
             if (it != best->sample_views.end()) {
                 v = it->second;
             } else {
-                v = make_view(best->image, best->format, VK_IMAGE_VIEW_TYPE_2D, best->depth() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 1);
+                v = make_view(best->image, srgb ? srgb_variant(best->format) : best->format, VK_IMAGE_VIEW_TYPE_2D, best->depth() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 1);
                 best->sample_views[mk] = v;
             }
             uint32_t zf = (t.address >> 28) & 7;
