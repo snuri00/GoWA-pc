@@ -9,6 +9,7 @@
 #include "runtime/reservation.h"
 
 #include <algorithm>
+#include <mutex>
 #include <map>
 #include <unordered_map>
 #include <string>
@@ -357,6 +358,123 @@ uint8_t* SpuThread::translate(uint32_t ea, uint32_t size, bool write, bool& hand
     return vm::ptr(ea);
 }
 
+
+namespace {
+struct RaceCfg {
+    uint32_t lo = 0, len = 0;
+    double at = 0.0;
+    RaceCfg() {
+        if (const char* e = std::getenv("GOWA_SPU_RACE")) {
+            lo = static_cast<uint32_t>(std::strtoul(e, nullptr, 16));
+            const char* plus = std::strchr(e, '+');
+            len = plus ? static_cast<uint32_t>(std::strtoul(plus + 1, nullptr, 16)) : 0x1000;
+        }
+        if (const char* a = std::getenv("GOWA_SPU_RACE_AT")) at = std::atof(a);
+    }
+};
+const RaceCfg& race_cfg() {
+    static RaceCfg c;
+    return c;
+}
+std::mutex g_race_lock;
+std::map<std::pair<uint32_t, uint32_t>, std::vector<uint8_t>> g_race_snap;
+std::atomic<int> g_race_logged{0};
+}
+
+void race_on_get(uint32_t id, uint32_t ea, uint32_t size, uint32_t pc) {
+    const RaceCfg& c = race_cfg();
+    if (!c.lo || ea >= c.lo + c.len || ea + size <= c.lo || logging::uptime() < c.at) return;
+    std::vector<uint8_t> v(size);
+    std::memcpy(v.data(), vm::ptr(ea), size);
+    std::lock_guard lk(g_race_lock);
+    g_race_snap[{id, ea}] = std::move(v);
+}
+
+void race_on_put(uint32_t id, uint32_t ea, uint32_t size, const uint8_t* src, uint32_t pc) {
+    const RaceCfg& c = race_cfg();
+    if (!c.lo || ea >= c.lo + c.len || ea + size <= c.lo) return;
+    std::lock_guard lk(g_race_lock);
+    auto it = g_race_snap.find({id, ea});
+    if (it == g_race_snap.end() || it->second.size() != size) return;
+    const uint8_t* cur = vm::ptr(ea);
+    int lost = 0;
+    uint32_t first = 0, fold = 0, fcur = 0;
+    for (uint32_t i = 0; i + 4 <= size; i += 4) {
+        if (std::memcmp(cur + i, it->second.data() + i, 4) != 0 && std::memcmp(src + i, it->second.data() + i, 4) == 0) {
+            if (!lost) {
+                first = ea + i;
+                std::memcpy(&fold, it->second.data() + i, 4);
+                std::memcpy(&fcur, cur + i, 4);
+            }
+            lost++;
+        }
+    }
+    if (lost && g_race_logged.fetch_add(1) < 60) {
+        LOG_INFO("spurace", "thread 0x%x pc 0x%05x PUT ea 0x%08x size 0x%x discards %d foreign word updates, first 0x%08x: snapshot 0x%08x current 0x%08x", id, pc, ea, size, lost, first,
+                 __builtin_bswap32(fold), __builtin_bswap32(fcur));
+    }
+    g_race_snap.erase(it);
+}
+
+bool put_merge_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("GOWA_SPU_PUT_MERGE");
+        return !e || std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+void SpuThread::remember_get(uint32_t ea, uint32_t size, uint32_t lsa) {
+    DmaSnap* slot_ptr = nullptr;
+    for (DmaSnap& d : dma_snaps) {
+        if (d.size && d.ea == ea) {
+            slot_ptr = &d;
+            break;
+        }
+    }
+    if (!slot_ptr) {
+        slot_ptr = &dma_snaps[dma_snap_next];
+        dma_snap_next = (dma_snap_next + 1) % dma_snaps.size();
+    }
+    slot_ptr->ea = ea;
+    slot_ptr->size = size;
+    slot_ptr->lsa = lsa;
+    slot_ptr->data.assign(ls + lsa, ls + lsa + size);
+}
+
+bool SpuThread::merge_put(uint32_t ea, uint32_t size, uint32_t lsa) {
+    for (DmaSnap& d : dma_snaps) {
+        if (!d.size || d.ea != ea || d.size != size) continue;
+        d.size = 0;
+        if (std::memcmp(vm::ptr(ea), d.data.data(), size) == 0) return false;
+        const uint8_t* src = ls + lsa;
+        const uint8_t* old = d.data.data();
+        uint32_t i = 0;
+        while (i < size) {
+            uint32_t n = (std::min)(4u, size - i);
+            if (std::memcmp(src + i, old + i, n) == 0) {
+                i += n;
+                continue;
+            }
+            uint32_t start = i;
+            while (i < size) {
+                uint32_t k = (std::min)(4u, size - i);
+                if (std::memcmp(src + i, old + i, k) == 0) break;
+                i += k;
+            }
+            uint32_t done = start;
+            while (done < i) {
+                uint32_t a = ea + done;
+                uint32_t chunk = (std::min)(i - done, 128 - (a & 127));
+                rsv::store_locked(a, src + done, chunk);
+                done += chunk;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
     if (!size) return;
     if (size > 0x4000) {
@@ -414,6 +532,26 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
                 }
             }
         }
+        static const uint32_t clr_lo = std::getenv("GOWA_SPU_PUT_CLEARS") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_SPU_PUT_CLEARS"), nullptr, 16)) : 0;
+        static const uint32_t clr_len = std::getenv("GOWA_SPU_PUT_CLEARS_LEN") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_SPU_PUT_CLEARS_LEN"), nullptr, 16)) : 0x10000;
+        static const uint32_t clr_mask = std::getenv("GOWA_SPU_PUT_CLEARS_MASK") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_SPU_PUT_CLEARS_MASK"), nullptr, 16)) : 0x8000;
+        static const uint32_t clr_stride = std::getenv("GOWA_SPU_PUT_CLEARS_STRIDE") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_SPU_PUT_CLEARS_STRIDE"), nullptr, 16)) : 16;
+        static const double clr_at = std::getenv("GOWA_SPU_PUT_CLEARS_AT") ? std::atof(std::getenv("GOWA_SPU_PUT_CLEARS_AT")) : 0.0;
+        if (clr_lo && ea < clr_lo + clr_len && ea + size > clr_lo && logging::uptime() >= clr_at) {
+            static std::atomic<int> clr_logged{0};
+            for (uint32_t i = 0; i + 4 <= size; i += 4) {
+                uint32_t a = ea + i;
+                if (a < clr_lo || a >= clr_lo + clr_len || (a - clr_lo) % clr_stride) continue;
+                uint32_t oldv = vm::read32(a), newv;
+                std::memcpy(&newv, ls + lsa + i, 4);
+                newv = __builtin_bswap32(newv);
+                if ((oldv & clr_mask) && !(newv & clr_mask) && clr_logged.fetch_add(1) < 40) {
+                    LOG_INFO("spudma", "thread 0x%x pc 0x%05x PUT clears mask 0x%x at 0x%08x: 0x%08x -> 0x%08x", id, ctx.pc, clr_mask, a, oldv, newv);
+                }
+            }
+        }
+        race_on_put(id, ea, size, ls + lsa, ctx.pc);
+        if (ea < 0xF0000000u && put_merge_enabled() && merge_put(ea, size, lsa)) return;
         uint32_t guest = ea;
         if (ea < 0xF0000000u) {
             uint32_t done = 0;
@@ -430,7 +568,9 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
             }
         }
     } else if (ea < 0xF0000000u) {
+        race_on_get(id, ea, size, ctx.pc);
         mark_ls(lsa, size);
+        bool snap = put_merge_enabled() && size >= 16;
         uint32_t done = 0;
         alignas(16) uint8_t line[128];
         while (done < size) {
@@ -440,6 +580,7 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
             std::memcpy(ls + lsa + done, line + (a & 127), chunk);
             done += chunk;
         }
+        if (snap) remember_get(ea, size, lsa);
     } else {
         std::memcpy(ls + lsa, p, size);
         mark_ls(lsa, size);

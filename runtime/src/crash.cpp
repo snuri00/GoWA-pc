@@ -122,7 +122,8 @@ void process_hit(const PendingHit& h) {
     uint64_t now = trace::now_ns();
     std::lock_guard lk(g_trap_lock);
     t.hits++;
-    if (t.burst_n && t.burst_tid == tid && t.burst_write == h.write && now - t.burst_t < 2000000 && h.fault + 64 >= t.burst_lo && h.fault <= t.burst_hi + 64) {
+    static const bool no_burst = std::getenv("GOWA_TRAP_NOBURST") != nullptr;
+    if (!no_burst && t.burst_n && t.burst_tid == tid && t.burst_write == h.write && now - t.burst_t < 2000000 && h.fault + 64 >= t.burst_lo && h.fault <= t.burst_hi + 64) {
         t.burst_lo = (std::min)(t.burst_lo, h.fault);
         t.burst_hi = (std::max)(t.burst_hi, h.fault);
         t.burst_n++;

@@ -25,6 +25,16 @@ struct SpuThread : Host {
     Context ctx{};
     uint8_t* ls = nullptr;
     std::vector<uint32_t> region_valid;
+    struct DmaSnap {
+        uint32_t ea = 0;
+        uint32_t size = 0;
+        uint32_t lsa = 0;
+        std::vector<uint8_t> data;
+    };
+    std::array<DmaSnap, 16> dma_snaps{};
+    uint32_t dma_snap_next = 0;
+    void remember_get(uint32_t ea, uint32_t size, uint32_t lsa);
+    bool merge_put(uint32_t ea, uint32_t size, uint32_t lsa);
     std::atomic<uint32_t> ls_epoch{1};
     std::atomic<uint32_t> ls_all_epoch{1};
     std::unique_ptr<std::atomic<uint32_t>[]> line_epoch{new std::atomic<uint32_t>[0x40000 / 128]()};
