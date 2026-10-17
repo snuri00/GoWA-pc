@@ -190,7 +190,22 @@ struct Dummy {
 };
 
 uint32_t g_regs[0x4000];
-std::map<std::tuple<uint32_t, VkFormat, uint32_t, uint32_t>, std::unique_ptr<Surface>> g_surfaces;
+std::map<std::tuple<uint32_t, VkFormat, uint32_t>, std::unique_ptr<Surface>> g_surfaces;
+std::vector<std::pair<uint64_t, std::unique_ptr<Surface>>> g_retired_surfaces;
+
+struct TempImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    std::map<uint64_t, VkImageView> views;
+    uint64_t generation = ~0ull;
+    uint64_t last_used = 0;
+};
+
+std::map<std::tuple<Surface*, uint32_t, uint32_t, bool>, std::unique_ptr<TempImage>> g_temps;
 std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<Texture>> g_textures;
 std::unordered_map<uint64_t, VkSampler> g_samplers;
 std::unordered_map<uint64_t, VkPipeline> g_pipelines;
@@ -474,25 +489,27 @@ bool allocate_image(const VkImageCreateInfo& ii, VkImage& image, VkDeviceMemory&
     return true;
 }
 
+void end_pass();
+void transition(Surface* s, VkImageLayout to);
+
 Surface* surface(uint32_t offset, VkFormat format, uint32_t w, uint32_t h, bool depth, bool main = false, uint32_t pitch = 0) {
-    auto key = std::make_tuple(main ? (offset | 0x80000000u) : offset, format, w, h);
+    auto key = std::make_tuple(main ? (offset | 0x80000000u) : offset, format, pitch);
     auto it = g_surfaces.find(key);
-    if (it != g_surfaces.end()) {
-        it->second->pitch = pitch;
-        return it->second.get();
-    }
+    Surface* old = it != g_surfaces.end() ? it->second.get() : nullptr;
+    if (old && old->width >= w && old->height >= h) return old;
+    uint32_t nw = old ? std::max(old->width, w) : w, nh = old ? std::max(old->height, h) : h;
     auto s = std::make_unique<Surface>();
     s->offset = offset;
     s->main = main;
     s->pitch = pitch;
-    s->width = w;
-    s->height = h;
+    s->width = nw;
+    s->height = nh;
     s->format = format;
     s->aspect = depth ? (format == VK_FORMAT_D16_UNORM ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = format;
-    ii.extent = {w, h, 1};
+    ii.extent = {nw, nh, 1};
     ii.mipLevels = 1;
     ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -501,10 +518,63 @@ Surface* surface(uint32_t offset, VkFormat format, uint32_t w, uint32_t h, bool 
                (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     if (!allocate_image(ii, s->image, s->memory)) return nullptr;
     s->view = make_view(s->image, format, VK_IMAGE_VIEW_TYPE_2D, s->aspect, {}, 1, 1);
-    LOG_INFO("rsx", "new %s surface at %s 0x%x %ux%u format %d", depth ? "depth" : "color", main ? "main" : "local", offset, w, h, int(format));
+    LOG_INFO("rsx", "new %s surface at %s 0x%x %ux%u format %d pitch 0x%x%s", depth ? "depth" : "color", main ? "main" : "local", offset, nw, nh, int(format), pitch, old ? " (grown)" : "");
     Surface* raw = s.get();
+    if (old) {
+        end_pass();
+        transition(old, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        transition(raw, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy c{};
+        c.srcSubresource = {old->aspect, 0, 0, 1};
+        c.dstSubresource = {raw->aspect, 0, 0, 1};
+        c.extent = {old->width, old->height, 1};
+        vkCmdCopyImage(frame_cmd(), old->image, old->layout, raw->image, raw->layout, 1, &c);
+        raw->generation = old->generation + 1;
+        raw->dirty = old->dirty;
+        for (auto t = g_temps.begin(); t != g_temps.end();) {
+            if (std::get<0>(t->first) == old) t = g_temps.erase(t);
+            else ++t;
+        }
+        g_retired_surfaces.emplace_back(frame_serial(), std::move(it->second));
+        g_surfaces.erase(it);
+    }
     g_surfaces[key] = std::move(s);
     return raw;
+}
+
+void destroy_surface(Surface* s) {
+    const VkCtx& c = vk();
+    for (auto& [k, v] : s->sample_views) vkDestroyImageView(c.device, v, nullptr);
+    vkDestroyImageView(c.device, s->view, nullptr);
+    vkDestroyImage(c.device, s->image, nullptr);
+    vkFreeMemory(c.device, s->memory, nullptr);
+}
+
+void destroy_temp(TempImage* t) {
+    const VkCtx& c = vk();
+    for (auto& [k, v] : t->views) vkDestroyImageView(c.device, v, nullptr);
+    vkDestroyImage(c.device, t->image, nullptr);
+    vkFreeMemory(c.device, t->memory, nullptr);
+}
+
+void collect_garbage() {
+    uint64_t serial = frame_serial();
+    for (auto it = g_retired_surfaces.begin(); it != g_retired_surfaces.end();) {
+        if (serial > it->first + 4) {
+            destroy_surface(it->second.get());
+            it = g_retired_surfaces.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = g_temps.begin(); it != g_temps.end();) {
+        if (serial > it->second->last_used + 120) {
+            destroy_temp(it->second.get());
+            it = g_temps.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 uint32_t clip_w() { return R(SURFACE_CLIP_HORIZONTAL) >> 16; }
@@ -797,23 +867,23 @@ struct Binding {
 
 const char* g_bind_kind = "";
 
-struct TempImage {
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    std::map<uint64_t, VkImageView> views;
-    uint64_t generation = ~0ull;
-};
 
-std::map<std::tuple<Surface*, uint32_t, uint32_t, bool>, std::unique_ptr<TempImage>> g_temps;
+
+bool is_depth_format(VkFormat f) { return f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D16_UNORM || f == VK_FORMAT_D32_SFLOAT || f == VK_FORMAT_D32_SFLOAT_S8_UINT; }
+
+VkImageAspectFlags full_aspect(VkFormat f) {
+    if (f == VK_FORMAT_D16_UNORM || f == VK_FORMAT_D32_SFLOAT) return VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (is_depth_format(f)) return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    return VK_IMAGE_ASPECT_COLOR_BIT;
+}
 
 TempImage* temp_image(Surface* src, VkFormat format, uint32_t w, uint32_t h, bool redirect) {
     auto key = std::make_tuple(src, w, h, redirect);
     auto it = g_temps.find(key);
-    if (it != g_temps.end()) return it->second.get();
+    if (it != g_temps.end()) {
+        it->second->last_used = frame_serial();
+        return it->second.get();
+    }
     auto t = std::make_unique<TempImage>();
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
@@ -823,11 +893,13 @@ TempImage* temp_image(Surface* src, VkFormat format, uint32_t w, uint32_t h, boo
     ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               (is_depth_format(format) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     if (!allocate_image(ii, t->image, t->memory)) return nullptr;
     t->format = format;
     t->width = w;
     t->height = h;
+    t->last_used = frame_serial();
     TempImage* raw = t.get();
     g_temps[key] = std::move(t);
     return raw;
@@ -837,7 +909,7 @@ VkImageView temp_view(TempImage* t, VkComponentMapping m) {
     uint64_t k = fnv(&m, sizeof m);
     auto it = t->views.find(k);
     if (it != t->views.end()) return it->second;
-    VkImageView v = make_view(t->image, t->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 1);
+    VkImageView v = make_view(t->image, t->format, VK_IMAGE_VIEW_TYPE_2D, is_depth_format(t->format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 1);
     t->views[k] = v;
     return v;
 }
@@ -982,7 +1054,8 @@ TempImage* copy_to_temp(Surface* s, uint32_t w, uint32_t h, bool redirect) {
     }
     transition(s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkCommandBuffer cmd = frame_cmd();
-    image_barrier(cmd, t->image, VK_IMAGE_ASPECT_COLOR_BIT, t->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageAspectFlags taspect = full_aspect(t->format);
+    image_barrier(cmd, t->image, taspect, t->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     if (redirect) {
         RingAlloc staging;
         if (!ring_alloc(uint64_t(w) * h * 4, 16, staging)) return nullptr;
@@ -1003,12 +1076,12 @@ TempImage* copy_to_temp(Surface* s, uint32_t w, uint32_t h, bool redirect) {
         vkCmdCopyBufferToImage(cmd, staging.buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     } else {
         VkImageCopy c{};
-        c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        c.extent = {w, h, 1};
+        c.srcSubresource = {s->aspect, 0, 0, 1};
+        c.dstSubresource = {taspect, 0, 0, 1};
+        c.extent = {std::min(w, s->width), std::min(h, s->height), 1};
         vkCmdCopyImage(cmd, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     }
-    image_barrier(cmd, t->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    image_barrier(cmd, t->image, taspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     t->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     return t;
 }
@@ -1123,8 +1196,11 @@ Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface
                 m = texture_mapping(0x85, t.control1);
             }
             g_bind_kind = src == redirect ? "depth redirect" : target ? "feedback copy" : "surface region";
+            bool depth_copy = src != redirect && src->depth();
+            if (depth_copy) m = VkComponentMapping{};
             b.view = temp_view(tmp, m);
-            b.sampler = sampler(t, 1, false);
+            uint32_t tzf = (t.address >> 28) & 7;
+            b.sampler = sampler(t, 1, depth_copy && tzf != 0 && tzf != 7);
             return b;
         }
         Surface* best = exact;
@@ -2330,6 +2406,7 @@ uint32_t zpass_value() { return g_zpass_draws.load(std::memory_order_relaxed) ? 
 void frame_complete() {
     complete_writebacks();
     complete_dumps();
+    if (!std::getenv("GOWA_NO_GC")) collect_garbage();
 }
 
 void method(uint32_t reg, uint32_t arg) {

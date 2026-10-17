@@ -175,7 +175,10 @@ void begin_frame() {
     if (g.recording) return;
     LARGE_INTEGER a, b, f;
     QueryPerformanceCounter(&a);
-    vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
+    if (VkResult wr = vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX); wr != VK_SUCCESS) {
+        static int reported = 0;
+        if (reported++ < 5) LOG_ERROR("gpu", "vkWaitForFences failed %d", int(wr));
+    }
     QueryPerformanceCounter(&b);
     QueryPerformanceFrequency(&f);
     static double total = 0;
@@ -405,7 +408,10 @@ void submit_and_present(uint32_t index) {
     si.pCommandBuffers = &g.cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &g.rendered;
-    vkQueueSubmit(g.queue, 1, &si, g.fence);
+    if (VkResult sr = vkQueueSubmit(g.queue, 1, &si, g.fence); sr != VK_SUCCESS) {
+        static int reported = 0;
+        if (reported++ < 5) LOG_ERROR("gpu", "vkQueueSubmit failed %d", int(sr));
+    }
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &g.rendered;
@@ -424,7 +430,10 @@ void flush_without_present() {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g.cmd;
-    vkQueueSubmit(g.queue, 1, &si, g.fence);
+    if (VkResult sr = vkQueueSubmit(g.queue, 1, &si, g.fence); sr != VK_SUCCESS) {
+        static int reported = 0;
+        if (reported++ < 5) LOG_ERROR("gpu", "vkQueueSubmit failed %d", int(sr));
+    }
 }
 
 bool acquire(uint32_t& index) {
