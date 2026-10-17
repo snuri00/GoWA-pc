@@ -44,6 +44,24 @@ SPU_INLINE void store_ls(Context& c, uint32_t addr, const v128& v) {
     if (c.line_epoch) c.line_epoch[(addr & LS_MASK) >> 7].store(c.epoch->load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
+SPU_INLINE bool region_valid(Context& c, uint32_t id, uint32_t lsa, uint32_t words, const uint32_t* code) {
+    uint32_t v = c.block_valid[id];
+    if (v && c.all_epoch->load(std::memory_order_acquire) <= v) {
+        bool fresh = true;
+        for (uint32_t l = lsa >> 7, last = (lsa + words * 4 - 1) >> 7; l <= last; l++) {
+            if (c.line_epoch[l].load(std::memory_order_acquire) > v) {
+                fresh = false;
+                break;
+            }
+        }
+        if (fresh) return true;
+    }
+    uint32_t e = c.epoch->load(std::memory_order_acquire);
+    if (std::memcmp(c.ls + lsa, code, words * 4) != 0) return false;
+    c.block_valid[id] = e;
+    return true;
+}
+
 SPU_INLINE v128 splat32(uint32_t v) { v128 r; r.vi = _mm_set1_epi32(static_cast<int32_t>(v)); return r; }
 SPU_INLINE v128 splat16(uint16_t v) { v128 r; r.vi = _mm_set1_epi16(static_cast<int16_t>(v)); return r; }
 SPU_INLINE v128 splat8(uint8_t v) { v128 r; r.vi = _mm_set1_epi8(static_cast<int8_t>(v)); return r; }

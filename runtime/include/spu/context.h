@@ -20,6 +20,9 @@ struct Context {
     uint8_t* ls = nullptr;
     std::atomic<uint32_t>* line_epoch = nullptr;
     const std::atomic<uint32_t>* epoch = nullptr;
+    const std::atomic<uint32_t>* all_epoch = nullptr;
+    uint32_t* block_valid = nullptr;
+    uint32_t executed = 0;
     bool interrupts_enabled = false;
     bool irq_check = false;
     bool halted = false;

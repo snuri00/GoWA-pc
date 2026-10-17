@@ -24,6 +24,7 @@ struct SpuThread : Host {
     Group* group = nullptr;
     Context ctx{};
     uint8_t* ls = nullptr;
+    std::vector<uint32_t> region_valid;
     std::atomic<uint32_t> ls_epoch{1};
     std::atomic<uint32_t> ls_all_epoch{1};
     std::unique_ptr<std::atomic<uint32_t>[]> line_epoch{new std::atomic<uint32_t>[0x40000 / 128]()};

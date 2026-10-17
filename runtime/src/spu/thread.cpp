@@ -46,6 +46,11 @@ SpuThread::SpuThread() {
     ctx.ls = ls;
     ctx.line_epoch = line_epoch.get();
     ctx.epoch = &ls_epoch;
+    ctx.all_epoch = &ls_all_epoch;
+    size_t blocks = 0;
+    compiled_blocks(blocks);
+    region_valid.assign(blocks ? blocks : 1, 0);
+    ctx.block_valid = region_valid.data();
 }
 
 SpuThread::~SpuThread() { _aligned_free(ls); }
@@ -630,6 +635,8 @@ void SpuThread::start() {
     ctx.ls = ls;
     ctx.line_epoch = line_epoch.get();
     ctx.epoch = &ls_epoch;
+    ctx.all_epoch = &ls_all_epoch;
+    ctx.block_valid = region_valid.data();
     ctx.gpr[1].u32[3] = 0x3FFF0;
     for (int i = 0; i < 4; i++) ctx.gpr[3 + i].u64[1] = args[i];
     ctx.pc = image_entry & 0x3FFFC;
@@ -818,6 +825,7 @@ void SpuThread::run() {
     std::vector<const CompiledBlock*> block_cache(aot_on ? LS_SIZE / 4 : 0, nullptr);
     std::vector<uint32_t> block_valid(aot_on ? LS_SIZE / 4 : 0, 0);
     static const bool no_fresh = std::getenv("GOWA_SPU_NO_FRESH") != nullptr;
+    const bool use_regions = !verify && !std::getenv("GOWA_SPU_NO_REGIONS");
     uint32_t irq_countdown = 256;
     const bool rec = aot::recording();
     bool block_start = true;
@@ -846,22 +854,31 @@ void SpuThread::run() {
                 }
                 if (b && pure_only && !b->pure) b = nullptr;
                 if (b) {
-                    bool ok = b->fn(ctx, *this);
-                    n += b->words;
+                    bool ok;
+                    uint32_t ran = b->words;
+                    if (b->region && use_regions) {
+                        ctx.executed = 0;
+                        ok = b->region(ctx, *this);
+                        if (ctx.executed) ran = ctx.executed;
+                        else ok = b->fn(ctx, *this);
+                    } else {
+                        ok = b->fn(ctx, *this);
+                    }
+                    n += ran;
                     if (!ok) break;
                     block_start = true;
                     if (ctx.irq_check) {
                         ctx.irq_check = false;
                         check_interrupt();
                     } else if (ctx.interrupts_enabled) {
-                        if (irq_countdown <= b->words) {
+                        if (irq_countdown <= ran) {
                             irq_countdown = 256;
                             check_interrupt();
                         } else {
-                            irq_countdown -= b->words;
+                            irq_countdown -= ran;
                         }
                     }
-                    if ((n & ~1023u) != ((n - b->words) & ~1023u)) {
+                    if ((n & ~1023u) != ((n - ran) & ~1023u)) {
                         insns.fetch_add(1024, std::memory_order_relaxed);
                         pc_samples[pc_sample_pos.fetch_add(1, std::memory_order_relaxed) & 255] = ctx.pc;
                         if (stop_flag.load(std::memory_order_relaxed)) break;

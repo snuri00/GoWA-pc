@@ -1160,7 +1160,7 @@ Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& c
         uint32_t tea = lv2::rsx_address(t.offset, (t.format & 3) - 1);
         if (std::getenv("GOWA_TEX_DUMP") && tea && std::string(g_bind_kind) == "memory") dump_texture(t, tea);
         uint32_t w0 = tea && readable(tea, 64) ? vm::read32(tea) : 0, w1 = tea && readable(tea, 64) ? vm::read32(tea + 4) : 0, w8 = tea && readable(tea, 64) ? vm::read32(tea + 32) : 0;
-        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s data %08x %08x %08x addr 0x%x c1 0x%x", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind, w0, w1, w8, t.address, t.control1);
+        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s data %08x %08x %08x addr 0x%x c1 0x%x c3 0x%x", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind, w0, w1, w8, t.address, t.control1, t.control3);
     }
     return b;
 }
