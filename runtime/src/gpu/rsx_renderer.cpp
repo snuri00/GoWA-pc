@@ -10,6 +10,7 @@
 #include "vp_decompiler.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -2270,6 +2271,10 @@ bool immediate_method(uint32_t reg, uint32_t arg) {
 
 uint32_t reg(uint32_t method) { return R(method); }
 
+std::atomic<uint32_t> g_zpass_draws{0};
+
+uint32_t zpass_value() { return g_zpass_draws.load(std::memory_order_relaxed) ? 0xFFFFu : 0u; }
+
 void frame_complete() {
     complete_writebacks();
     complete_dumps();
@@ -2320,6 +2325,8 @@ void method(uint32_t reg, uint32_t arg) {
     default: break;
     }
     g_regs[(reg >> 2) & 0x3FFF] = arg;
+    if (reg == 0x17C8 && arg == 1) g_zpass_draws.store(0, std::memory_order_relaxed);
+    if (reg == BEGIN_END && !(arg & 0xFF) && g_in_begin && R(0x17CC)) g_zpass_draws.fetch_add(1, std::memory_order_relaxed);
     if (copy_engine(reg, arg)) return;
     if (immediate_method(reg, arg)) return;
     if (!enabled()) return;

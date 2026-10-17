@@ -233,8 +233,12 @@ void execute(uint32_t reg, uint32_t arg) {
             uint64_t t = __builtin_bswap64(ppu::timebase());
             std::memcpy(rep, &t, 8);
             std::memset(rep + 8, 0, 8);
+            if ((arg >> 24) == 1) {
+                uint32_t v = __builtin_bswap32(gpu::rsx::zpass_value());
+                std::memcpy(rep + 8, &v, 4);
+            }
             rsv::store_locked(a, rep, 16);
-            LOG_DEBUG("rsx", "report type %u loc 0x%08x off 0x%x -> ea 0x%08x", arg >> 24, loc, offset, a);
+            if (std::getenv("GOWA_REPORT_LOG")) LOG_INFO("rsx", "report type %u loc 0x%08x off 0x%x -> ea 0x%08x", arg >> 24, loc, offset, a);
         }
         break;
     }
