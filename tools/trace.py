@@ -364,13 +364,17 @@ def cmd_gaps(tr, args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="query a gowa event trace")
-    ap.add_argument("--file", default="run/trace.bin")
-    ap.add_argument("--start", type=float)
-    ap.add_argument("--end", type=float)
-    ap.add_argument("--thread")
-    ap.add_argument("--limit", type=int, default=60)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--file", default=argparse.SUPPRESS)
+    common.add_argument("--start", type=float, default=argparse.SUPPRESS)
+    common.add_argument("--end", type=float, default=argparse.SUPPRESS)
+    common.add_argument("--thread", default=argparse.SUPPRESS)
+    common.add_argument("--limit", type=int, default=argparse.SUPPRESS)
+    ap = argparse.ArgumentParser(description="query a gowa event trace", parents=[common])
+    ap.set_defaults(file="run/trace.bin", start=None, end=None, thread=None, limit=60)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    real_add = sub.add_parser
+    sub.add_parser = lambda name, **kw: real_add(name, parents=[common], **kw)
     sub.add_parser("info")
     p = sub.add_parser("timeline")
     p.add_argument("--types")
