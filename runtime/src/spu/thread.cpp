@@ -4,6 +4,7 @@
 #include "../lv2/sync.h"
 #include "ppu/ops.h"
 #include "runtime/log.h"
+#include "runtime/trace.h"
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
 
@@ -366,6 +367,7 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         if (!put) std::memset(ls + lsa, 0, size);
         return;
     }
+    if (trace::on(trace::DMA)) trace::emit(trace::T_DMA, slot | (uint32_t(put) << 8) | (cmd << 16), ea, lsa, size, ctx.pc, id);
     bool handled;
     uint8_t* p = translate(ea, size, put, handled, lsa);
     if (handled || !p) return;
@@ -479,6 +481,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
         uint32_t line = ea & ~127u;
         std::lock_guard lk(m);
         bool ok = raddr == line && rsv::commit_if(line, rtime, rdata, ls + (lsa & 0x3FF80), 0, 128);
+        if (ok && trace::on(trace::ATOMIC)) trace::emit(trace::T_ATOMIC, slot | (0xB4u << 16), line, lsa & 0x3FF80, 128, ctx.pc, id);
         if (!ok) set_events(EV_LR);
         raddr = 0;
         atomic_stat = ok ? 0 : 1;
@@ -489,6 +492,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
     case 0xB8: {
         uint32_t line = ea & ~127u;
         rsv::store_unconditional(line, ls + (lsa & 0x3FF80));
+        if (trace::on(trace::ATOMIC)) trace::emit(trace::T_ATOMIC, slot | (cmd << 16), line, lsa & 0x3FF80, 128, ctx.pc, id);
         if (cmd == 0xB0) {
             std::lock_guard lk(m);
             atomic_stat = 2;

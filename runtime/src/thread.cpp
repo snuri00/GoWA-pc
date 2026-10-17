@@ -4,13 +4,16 @@
 #include "runtime/memory.h"
 #include "ppu/ops.h"
 
+#include <cstring>
 #include <map>
+#include <string>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 namespace crash {
 std::string sample_stack(void* native, int depth);
+void profile_thread(void* native, const char* name);
 }
 
 namespace lv2 {
@@ -36,6 +39,13 @@ void body(std::shared_ptr<Thread> t) {
     t_current = t.get();
     t->native = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
     set_host_name("PPU " + t->name);
+    if (const char* e = std::getenv("GOWA_PROFILE_PPU")) {
+        if (t->name == e) {
+            HANDLE h = nullptr;
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            crash::profile_thread(h, e);
+        }
+    }
     LOG_INFO("ppu", "thread 0x%x '%s' start entry opd 0x%08x", t->id, t->name.c_str(), t->entry_opd);
     uint64_t status = 0;
     try {
@@ -70,6 +80,18 @@ void status_dump() {
         LOG_INFO("status", "ppu 0x%x '%s' %s%u (r3 0x%llx r31 0x%llx) syscalls +%llu lr 0x%llx", id, t->name.c_str(), sc ? "blocked in " : "running, last ", sc ? sc - 1 : 0,
                  static_cast<unsigned long long>(t->ctx.gpr[3]), static_cast<unsigned long long>(t->ctx.gpr[31]), static_cast<unsigned long long>(n - t->syscalls_seen), static_cast<unsigned long long>(t->ctx.lr));
         t->syscalls_seen = n;
+        {
+            std::string top;
+            for (int k = 0; k < 4; k++) {
+                uint32_t best = 0, bi = 0;
+                for (uint32_t i = 0; i < 1024; i++) if (t->syscall_hist[i] > best) { best = t->syscall_hist[i]; bi = i; }
+                if (best < 100) break;
+                top += " " + std::to_string(bi) + "x" + std::to_string(best);
+                t->syscall_hist[bi] = 0;
+            }
+            std::memset(t->syscall_hist, 0, sizeof t->syscall_hist);
+            if (!top.empty()) LOG_INFO("status", "   top syscalls%s", top.c_str());
+        }
         if (!sc) {
             auto& g = t->ctx.gpr;
             LOG_INFO("status", "   regs r3 %llx r4 %llx r5 %llx r6 %llx r7 %llx r9 %llx r10 %llx r11 %llx", (unsigned long long)g[3], (unsigned long long)g[4], (unsigned long long)g[5],

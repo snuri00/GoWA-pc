@@ -1,3 +1,4 @@
+#include "ppu/ops.h"
 #include "runtime/hostsleep.h"
 #include "common.h"
 
@@ -33,7 +34,7 @@ void audio_thread() {
     auto next = std::chrono::steady_clock::now();
     const auto period = std::chrono::microseconds(5333);
     while (g_init) {
-        next += period;
+        next += std::chrono::microseconds(static_cast<int64_t>(period.count() / ppu::time_scale()));
         host::sleep_until_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
         std::lock_guard lk(g_lock);
         for (uint32_t i = 0; i < 8; i++) {

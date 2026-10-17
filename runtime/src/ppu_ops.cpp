@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -22,7 +23,9 @@ void unimplemented(Context& ctx, uint8_t* base, uint32_t pc, uint32_t word) {
     std::abort();
 }
 
-uint64_t timebase() {
+namespace {
+
+uint64_t host_ticks() {
     static const double scale = [] {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
@@ -31,6 +34,44 @@ uint64_t timebase() {
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
     return static_cast<uint64_t>(static_cast<double>(c.QuadPart) * scale);
+}
+
+struct Turbo {
+    double factor = 1.0;
+    uint64_t start = 0;
+    uint64_t until = 0;
+};
+
+const Turbo& turbo() {
+    static const Turbo t = [] {
+        Turbo t;
+        t.start = host_ticks();
+        if (const char* e = std::getenv("GOWA_TURBO")) {
+            t.factor = std::atof(e);
+            const char* at = std::strchr(e, '@');
+            t.until = static_cast<uint64_t>((at ? std::atof(at + 1) : 1e6) * 80000000.0);
+            if (t.factor < 1.0) t.factor = 1.0;
+        }
+        return t;
+    }();
+    return t;
+}
+
+}
+
+uint64_t timebase() {
+    const Turbo& t = turbo();
+    uint64_t raw = host_ticks();
+    if (t.factor == 1.0) return raw;
+    uint64_t rel = raw - t.start;
+    if (rel < t.until) return t.start + static_cast<uint64_t>(rel * t.factor);
+    return t.start + static_cast<uint64_t>(t.until * t.factor) + (rel - t.until);
+}
+
+double time_scale() {
+    const Turbo& t = turbo();
+    if (t.factor == 1.0) return 1.0;
+    return host_ticks() - t.start < t.until ? t.factor : 1.0;
 }
 
 namespace {

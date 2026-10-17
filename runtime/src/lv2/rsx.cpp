@@ -2,6 +2,7 @@
 #include "event.h"
 #include "gpu/presenter.h"
 #include "gpu/rsx.h"
+#include "runtime/trace.h"
 #include "ppu/ops.h"
 #include "runtime/reservation.h"
 #include "runtime/hostsleep.h"
@@ -104,6 +105,7 @@ void flip_done(uint32_t buffer) {
     vm::write32(h + 0x10, buffer);
     std::memset(vm::ptr(g_rsx.reports + 0x10), 0, 16);
     g_rsx.flips++;
+    if (trace::on(trace::RSX)) trace::emit(trace::T_FLIP, buffer, g_rsx.flips);
     if ((g_rsx.flips % 60) == 1) LOG_INFO("rsx", "flip %llu (buffer %u)", static_cast<unsigned long long>(g_rsx.flips), buffer);
     send_event(1u << 4);
 }
@@ -194,8 +196,12 @@ void execute(uint32_t reg, uint32_t arg) {
     g_rsx.last_method.store(reg, std::memory_order_relaxed);
     g_rsx.last_arg.store(arg, std::memory_order_relaxed);
     if (reg >= 0xE000) LOG_DEBUG("rsx", "driver method 0x%04x arg 0x%08x", reg, arg);
-    static const bool trace = std::getenv("GOWA_RSX_TRACE") != nullptr;
-    if (trace) LOG_INFO("rsxm", "0x%04x 0x%08x", reg, arg);
+    static const double trace_at = std::getenv("GOWA_RSX_TRACE") ? std::atof(std::getenv("GOWA_RSX_TRACE")) : -1.0;
+    static const double trace_end = std::getenv("GOWA_RSX_TRACE_END") ? std::atof(std::getenv("GOWA_RSX_TRACE_END")) : 1e9;
+    if (trace_at >= 0.0) {
+        double now = logging::uptime();
+        if (now >= trace_at && now < trace_end) LOG_INFO("rsxm", "0x%04x 0x%08x", reg, arg);
+    }
     if (reg < 0xE000) gpu::rsx::method(reg, arg);
     switch (reg) {
     case 0x50: vm::write32(g_rsx.dma_control + 0x48, arg); break;
@@ -203,12 +209,16 @@ void execute(uint32_t reg, uint32_t arg) {
     case 0x64: g_rsx.sema_off_406e = arg; break;
     case 0x68:
         LOG_DEBUG("rsx", "acquire ctx 0x%08x off 0x%x == 0x%x", g_rsx.sema_ctx_406e, g_rsx.sema_off_406e, arg);
-        if (uint32_t a = get_address(g_rsx.sema_off_406e, g_rsx.sema_ctx_406e)) semaphore_wait(a, arg);
+        if (uint32_t a = get_address(g_rsx.sema_off_406e, g_rsx.sema_ctx_406e)) {
+            if (trace::on(trace::RSX)) trace::emit(trace::T_SEMA, 0x68, a, arg, vm::read32(a));
+            semaphore_wait(a, arg);
+        }
         break;
     case 0x6C:
         LOG_DEBUG("rsx", "release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_406e, g_rsx.sema_off_406e, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_406e, g_rsx.sema_ctx_406e)) {
             if (a == g_rsx.device_addr + 0x30 && !arg) arg = 1;
+            if (trace::on(trace::RSX)) trace::emit(trace::T_SEMA, 0x6C, a, arg);
             rsx_write32(a, arg);
         }
         break;
@@ -218,12 +228,16 @@ void execute(uint32_t reg, uint32_t arg) {
     case 0x1D70:
         LOG_DEBUG("rsx", "backend release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_4097, g_rsx.sema_off_4097, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) {
+            if (trace::on(trace::RSX)) trace::emit(trace::T_SEMA, 0x1D70, a, (arg & 0xFF00FF00u) | ((arg & 0xFF) << 16) | ((arg >> 16) & 0xFF));
             rsx_write32(a, (arg & 0xFF00FF00u) | ((arg & 0xFF) << 16) | ((arg >> 16) & 0xFF));
         }
         break;
     case 0x1D74:
         LOG_DEBUG("rsx", "texture release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_4097, g_rsx.sema_off_4097, arg);
-        if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) rsx_write32(a, arg);
+        if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) {
+            if (trace::on(trace::RSX)) trace::emit(trace::T_SEMA, 0x1D74, a, arg);
+            rsx_write32(a, arg);
+        }
         break;
     case 0x1800: {
         uint32_t offset = arg & 0xFFFFFF;
@@ -238,6 +252,11 @@ void execute(uint32_t reg, uint32_t arg) {
                 std::memcpy(rep + 8, &v, 4);
             }
             rsv::store_locked(a, rep, 16);
+            if (trace::on(trace::RSX)) {
+                uint32_t v;
+                std::memcpy(&v, rep + 8, 4);
+                trace::emit(trace::T_REPORT, arg >> 24, a, __builtin_bswap32(v));
+            }
             if (std::getenv("GOWA_REPORT_LOG")) LOG_INFO("rsx", "report type %u loc 0x%08x off 0x%x -> ea 0x%08x", arg >> 24, loc, offset, a);
         }
         break;
@@ -390,7 +409,7 @@ void vblank_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX VBlank");
     auto next = std::chrono::steady_clock::now();
     while (g_rsx.running) {
-        next += std::chrono::nanoseconds(16683333);
+        next += std::chrono::nanoseconds(static_cast<int64_t>(16683333 / ppu::time_scale()));
         host::sleep_until_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
         uint32_t h = head_addr(1);
         vm::write64(h + 0x30, vm::read64(h + 0x30) + 1);

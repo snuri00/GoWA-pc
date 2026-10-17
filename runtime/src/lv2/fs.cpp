@@ -1,5 +1,6 @@
 #include "object.h"
 #include "runtime/vfs.h"
+#include "runtime/trace.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -28,6 +29,8 @@ struct DirEntry {
 
 struct Fd {
     std::mutex io;
+    uint32_t path_id = 0;
+    uint32_t number = 0;
     FILE* f = nullptr;
     std::string guest;
     std::string host;
@@ -128,12 +131,15 @@ void fill_dirent(uint32_t d, const DirEntry& e) {
 }
 
 int64_t do_read(Fd& fd, uint32_t buf, uint64_t n, uint64_t& got) {
-    static const bool log_fs = std::getenv("GOWA_FS_LOG") != nullptr;
-    if (log_fs && fd.f) LOG_INFO("fs", "read '%s' pos 0x%llx n 0x%llx -> buf 0x%08x", fd.guest.c_str(), static_cast<unsigned long long>(_ftelli64(fd.f)), static_cast<unsigned long long>(n), buf);
     got = 0;
     if (fd.is_dir || !fd.f) return CELL_EBADF;
     if ((fd.flags & O_ACCMODE) == O_WRONLY) return CELL_EBADF;
+    int64_t pos = trace::on(trace::FS) ? _ftelli64(fd.f) : 0;
     got = std::fread(vm::ptr(buf), 1, n, fd.f);
+    if (trace::on(trace::FS)) {
+        if (!fd.path_id) fd.path_id = trace::intern(fd.guest);
+        trace::emit(trace::T_FS_READ, fd.path_id, static_cast<uint64_t>(pos), n, buf, got, fd.number);
+    }
     return CELL_OK;
 }
 
@@ -141,6 +147,10 @@ int64_t do_write(Fd& fd, uint32_t buf, uint64_t n, uint64_t& put) {
     put = 0;
     if (fd.is_dir || !fd.f) return CELL_EBADF;
     if ((fd.flags & O_ACCMODE) == 0) return CELL_EBADF;
+    if (trace::on(trace::FS)) {
+        if (!fd.path_id) fd.path_id = trace::intern(fd.guest);
+        trace::emit(trace::T_FS_WRITE, fd.path_id, static_cast<uint64_t>(_ftelli64(fd.f)), n, buf, 0, fd.number);
+    }
     if (fd.readonly_mount) return CELL_EROFS;
     if (fd.flags & O_APPEND) _fseeki64(fd.f, 0, SEEK_END);
     put = std::fwrite(vm::ptr(buf), 1, n, fd.f);
@@ -191,6 +201,11 @@ LV2_SYSCALL(801, sys_fs_open) {
         return CELL_EMFILE;
     }
     vm::write32(out, id);
+    fd->number = id;
+    if (trace::on(trace::FS)) {
+        fd->path_id = trace::intern(guest);
+        trace::emit(trace::T_FS_OPEN, fd->path_id, static_cast<uint32_t>(flags), id);
+    }
     LOG_INFO("fs", "open '%s' flags 0%o -> %u", guest.c_str(), flags, id);
     return CELL_OK;
 }
@@ -237,6 +252,7 @@ LV2_SYSCALL(804, sys_fs_close) {
         g_fds.erase(it);
     }
     if (fd->f) std::fclose(fd->f);
+    if (trace::on(trace::FS)) trace::emit(trace::T_FS_CLOSE, fd->path_id, fd->number);
     return CELL_OK;
 }
 

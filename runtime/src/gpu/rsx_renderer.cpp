@@ -1,6 +1,7 @@
 #include "gpu/presenter.h"
 #include "gpu/rsx.h"
 #include "runtime/log.h"
+#include "runtime/trace.h"
 #include "runtime/memory.h"
 #include "fp_decompiler.h"
 #include "ring.h"
@@ -1068,6 +1069,13 @@ void dump_texture(const TextureRegs& t, uint32_t ea) {
 Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth) {
     g_bind_kind = "dummy";
     Binding b = bind_texture_impl(unit, dim, colors, depth);
+    if (trace::on(trace::TEX)) {
+        TextureRegs t = texture_regs(unit);
+        static const char* kinds[] = {"dummy", "memory", "depth redirect", "feedback copy", "surface region", "depth surface", "color surface"};
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < 7; i++) if (std::strcmp(g_bind_kind, kinds[i]) == 0) k = i;
+        trace::emit(trace::T_TEX, unit | (k << 8), lv2::rsx_address(t.offset, (t.format & 3) - 1), t.format, t.rect, t.control0);
+    }
     if (g_trace) {
         TextureRegs t = texture_regs(unit);
         uint32_t tea = lv2::rsx_address(t.offset, (t.format & 3) - 1);
@@ -1934,6 +1942,7 @@ void nv308a_color(uint32_t index, uint32_t arg) {
     uint32_t bpp = fmt == 4 ? 2 : 4;
     uint32_t ea = lv2::rsx_address(R(0x630C) + x * bpp + y * pitch, R(0x6188));
     if (!ea || !readable(ea, bpp)) return;
+    if (trace::on(trace::RSX)) trace::emit(trace::T_COPY, trace::COPY_NV308A, ea, ea, bpp, 0, arg);
     if (bpp == 4) vm::write32(ea, arg);
     else vm::write16(ea, argb_to_565(arg));
 }
@@ -1949,6 +1958,7 @@ void nv0039_transfer() {
     uint32_t src = lv2::rsx_address(R(0x230C), R(0x2184));
     uint32_t dst = lv2::rsx_address(R(0x2310), R(0x2188));
     if (!src || !dst) return;
+    if (trace::on(trace::RSX)) trace::emit(trace::T_COPY, trace::COPY_NV0039 | (in_stride << 8) | (out_stride << 16), src, dst, len, lines, uint64_t(uint32_t(in_pitch)) | (uint64_t(uint32_t(out_pitch)) << 32));
     std::vector<uint8_t> line(len);
     for (uint32_t l = 0; l < lines; l++) {
         uint32_t s = src + static_cast<uint32_t>(int64_t(in_pitch) * l), d = dst + static_cast<uint32_t>(int64_t(out_pitch) * l);
@@ -2013,6 +2023,12 @@ void nv3089_transfer(uint32_t arg) {
     if (!readable(src, uint64_t(in_h - 1 - std::min(in_y, in_h - 1)) * in_pitch + in_w * src_bpp)) {
         if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
         return;
+    }
+    if (trace::on(trace::RSX)) {
+        bool scaled = dsdx_raw != (1 << 20) || dtdy_raw != (1 << 20);
+        trace::emit(trace::T_COPY, trace::COPY_NV3089, src, dst, uint64_t(x0) | (uint64_t(y0) << 16) | (uint64_t(x1) << 32) | (uint64_t(y1) << 48),
+                    uint64_t(in_pitch) | (uint64_t(swizzled ? 0 : dst_pitch) << 32),
+                    uint64_t(out_x) | (uint64_t(out_y) << 16) | (uint64_t(src_bpp) << 32) | (uint64_t(dst_bpp) << 40) | (uint64_t(swizzled) << 48) | (uint64_t(scaled) << 49));
     }
     std::vector<uint32_t> pixels(size_t(x1 - x0) * (y1 - y0));
     size_t k = 0;

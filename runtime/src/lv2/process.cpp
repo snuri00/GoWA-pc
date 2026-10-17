@@ -92,7 +92,7 @@ LV2_SYSCALL(144, sys_time_get_timezone) {
 
 LV2_SYSCALL(141, sys_timer_usleep) {
     uint64_t us = u64arg(ctx, 0);
-    host::sleep_us(us);
+    host::sleep_us(static_cast<uint64_t>(us / ppu::time_scale()));
     return CELL_OK;
 }
 

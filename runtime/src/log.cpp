@@ -58,4 +58,8 @@ void write(Level level, const char* channel, const char* fmt, ...) {
     }
 }
 
+double uptime() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count(); }
+
+unsigned long long uptime_ns() { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - g_start).count()); }
+
 }

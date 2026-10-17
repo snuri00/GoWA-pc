@@ -1,6 +1,7 @@
 #include "runtime/image.h"
 #include "runtime/loader.h"
 #include "runtime/log.h"
+#include "runtime/trace.h"
 #include "runtime/memory.h"
 #include "gpu/presenter.h"
 #include "runtime/thread.h"
@@ -53,6 +54,7 @@ void rearm_watch();
 
 int main(int argc, char** argv) {
     crash::install();
+    trace::init();
     timeBeginPeriod(1);
     gpu::init();
     if (const char* root = std::getenv("GOWA_ROOT")) loader::g_root = root;
@@ -97,13 +99,15 @@ int main(int argc, char** argv) {
     c.gpr[10] = pi.tls_memsz;
     c.gpr[11] = pi.entry_opd;
     c.gpr[12] = pi.malloc_pagesize;
-    int watch_delay = std::getenv("GOWA_WATCH_DELAY") ? std::atoi(std::getenv("GOWA_WATCH_DELAY")) : 0;
+    int watch_delay = std::getenv("GOWA_TRAP_AT") ? std::atoi(std::getenv("GOWA_TRAP_AT")) : std::getenv("GOWA_WATCH_DELAY") ? std::atoi(std::getenv("GOWA_WATCH_DELAY")) : 0;
     if (!watch_delay) crash::arm_watch();
     guest::start(main_thread);
     bool status = std::getenv("GOWA_STATUS") != nullptr;
+    int memdump_at = std::getenv("GOWA_MEMDUMP_AT") ? std::atoi(std::getenv("GOWA_MEMDUMP_AT")) : -1;
     for (int tick = 0;; tick++) {
         if (watch_delay && tick == watch_delay) crash::arm_watch();
         else if (tick > watch_delay) crash::rearm_watch();
+        if (tick == memdump_at) trace::dump_memory("memdump.bin");
         if (status && tick % 3 == 2) {
             spu::status_dump();
             guest::status_dump();
@@ -113,5 +117,6 @@ int main(int argc, char** argv) {
         if (main_thread->cv.wait_for(lk, std::chrono::seconds(1), [&] { return main_thread->exited; })) break;
     }
     LOG_INFO("main", "main thread finished");
+    trace::shutdown();
     return 0;
 }
