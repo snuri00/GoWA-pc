@@ -29,6 +29,11 @@ float vrsqrtefp(float x);
 uint32_t vlogefp(uint32_t x, bool nj);
 uint32_t vexptefp(uint32_t x, bool nj);
 
+using BodyFn = void (*)(Context&, uint8_t*);
+extern uint8_t hook_flags[0x800000];
+extern void (*hook_impl)(Context& ctx, uint8_t* base, uint32_t addr, BodyFn fn);
+void hook_call(Context& ctx, uint8_t* base, uint32_t addr, BodyFn fn);
+
 inline uint8_t ld8(uint8_t* b, uint32_t ea) { return b[ea]; }
 inline uint16_t ld16(uint8_t* b, uint32_t ea) { uint16_t v; std::memcpy(&v, b + ea, 2); return __builtin_bswap16(v); }
 inline uint32_t ld32(uint8_t* b, uint32_t ea) { uint32_t v; std::memcpy(&v, b + ea, 4); return __builtin_bswap32(v); }

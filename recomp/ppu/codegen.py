@@ -723,7 +723,8 @@ class Emitter:
                     labels.add(t)
         for jt in f.jump_tables.values():
             labels.update(t for t in jt["targets"] if t in f.insns)
-        out = [f"void {self.fname(f.entry)}(ppu::Context& ctx, uint8_t* base) {{"]
+        name = self.fname(f.entry)
+        out = [f"static void {name}_body(ppu::Context& ctx, uint8_t* base) {{"]
         if insns and insns[0] != f.entry:
             out.append(f"    goto L_{f.entry:x};")
         for n, pc in enumerate(insns):
@@ -748,6 +749,13 @@ class Emitter:
                     out.append(f"    goto L_{nxt:x};")
                 else:
                     out.append(f"    {self.jump_out(nxt, f)}")
+        out.append("}")
+        out.append(f"void {name}(ppu::Context& ctx, uint8_t* base) {{")
+        out.append(f"    if (ppu::hook_flags[0x{f.entry >> 2:x}]) [[unlikely]] {{")
+        out.append(f"        ppu::hook_call(ctx, base, 0x{f.entry:x}, {name}_body);")
+        out.append("        return;")
+        out.append("    }")
+        out.append(f"    {name}_body(ctx, base);")
         out.append("}")
         return "\n".join(out)
 

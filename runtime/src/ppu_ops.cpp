@@ -143,6 +143,14 @@ bool stdcx(Context& ctx, uint8_t* base, uint32_t ea, uint64_t value) {
 
 void notify_store(uint8_t* base, uint32_t ea, uint32_t size) {}
 
+uint8_t hook_flags[0x800000];
+void (*hook_impl)(Context& ctx, uint8_t* base, uint32_t addr, BodyFn fn) = nullptr;
+
+void hook_call(Context& ctx, uint8_t* base, uint32_t addr, BodyFn fn) {
+    if (hook_impl) hook_impl(ctx, base, addr, fn);
+    else fn(ctx, base);
+}
+
 double fres(double x) {
     if (std::isnan(x)) return u2f(f2u(x) | 0x0008000000000000ull);
     return static_cast<double>(static_cast<float>(1.0 / x));

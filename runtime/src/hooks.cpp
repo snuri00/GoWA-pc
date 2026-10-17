@@ -1,0 +1,197 @@
+#include "ppu/ops.h"
+#include "runtime/hooks.h"
+#include "runtime/log.h"
+#include "runtime/memory.h"
+#include "runtime/trace.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include <windows.h>
+
+namespace hooks {
+
+namespace {
+
+struct Dump {
+    int reg;
+    uint32_t len;
+};
+
+struct Hook {
+    uint32_t addr = 0;
+    std::vector<Dump> dumps;
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint32_t> logged{0};
+};
+
+std::unordered_map<uint32_t, Hook*> g_hooks;
+std::unordered_map<uint32_t, std::string> g_names;
+uint32_t g_max = 40;
+double g_at = 0.0;
+bool g_count_only = false;
+thread_local int t_depth = 0;
+
+std::string thread_name() {
+    PWSTR w = nullptr;
+    std::string out;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &w)) && w) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+        out.resize(n > 0 ? n - 1 : 0);
+        if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
+        LocalFree(w);
+    }
+    return out;
+}
+
+std::string hex_dump(uint32_t ea, uint32_t len) {
+    std::string s;
+    char b[12];
+    for (uint32_t i = 0; i < len; i += 4) {
+        if (!vm::is_mapped(ea + i)) {
+            s += " ??";
+            break;
+        }
+        std::snprintf(b, sizeof b, " %08x", vm::read32(ea + i));
+        s += b;
+    }
+    return s;
+}
+
+void load_names(const char* path) {
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream ss(line);
+        std::string a, n;
+        if (!(ss >> a >> n) || a.empty() || a[0] == '#') continue;
+        g_names[static_cast<uint32_t>(std::strtoul(a.c_str(), nullptr, 16))] = n;
+    }
+}
+
+void impl(ppu::Context& ctx, uint8_t* base, uint32_t addr, ppu::BodyFn fn) {
+    Hook* h = g_hooks.count(addr) ? g_hooks[addr] : nullptr;
+    if (!h) {
+        fn(ctx, base);
+        return;
+    }
+    h->calls.fetch_add(1, std::memory_order_relaxed);
+    bool log = !g_count_only && logging::uptime() >= g_at && h->logged.load(std::memory_order_relaxed) < g_max;
+    if (!log) {
+        fn(ctx, base);
+        return;
+    }
+    uint32_t n = h->logged.fetch_add(1, std::memory_order_relaxed);
+    const std::string& name = name_of(addr);
+    std::string args;
+    char b[64];
+    for (int r = 3; r <= 8; r++) {
+        std::snprintf(b, sizeof b, " r%d=%llx", r, static_cast<unsigned long long>(ctx.gpr[r]));
+        args += b;
+    }
+    std::snprintf(b, sizeof b, " f1=%g f2=%g", ctx.fpr[1], ctx.fpr[2]);
+    args += b;
+    LOG_INFO("hook", "%*s-> %s #%u lr %08x [%s]%s", t_depth * 2, "", name.c_str(), n, static_cast<uint32_t>(ctx.lr), thread_name().c_str(), args.c_str());
+    for (const Dump& d : h->dumps) {
+        uint32_t ea = static_cast<uint32_t>(ctx.gpr[d.reg]);
+        LOG_INFO("hook", "%*s   r%d@%08x:%s", t_depth * 2, "", d.reg, ea, hex_dump(ea, d.len).c_str());
+    }
+    uint64_t r1 = ctx.gpr[1];
+    t_depth++;
+    fn(ctx, base);
+    t_depth--;
+    LOG_INFO("hook", "%*s<- %s #%u r3=%llx f1=%g%s", t_depth * 2, "", name.c_str(), n, static_cast<unsigned long long>(ctx.gpr[3]), ctx.fpr[1], ctx.gpr[1] != r1 ? " (stack mismatch)" : "");
+}
+
+void summary_thread() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::string s;
+        for (auto& [a, h] : g_hooks) {
+            char b[96];
+            std::snprintf(b, sizeof b, " %s=%llu", name_of(a).c_str(), static_cast<unsigned long long>(h->calls.load()));
+            s += b;
+        }
+        LOG_INFO("hook", "calls:%s", s.c_str());
+    }
+}
+
+}
+
+const std::string& name_of(uint32_t addr) {
+    static std::mutex m;
+    static std::unordered_map<uint32_t, std::string> cache;
+    std::lock_guard lk(m);
+    auto it = g_names.find(addr);
+    if (it != g_names.end()) return it->second;
+    auto& c = cache[addr];
+    if (c.empty()) {
+        char b[16];
+        std::snprintf(b, sizeof b, "f_%08x", addr);
+        c = b;
+    }
+    return c;
+}
+
+void init() {
+    if (const char* n = std::getenv("GOWA_SYMBOLS")) load_names(n);
+    else load_names("../docs/re/symbols.txt");
+    const char* spec = std::getenv("GOWA_HOOK");
+    if (!spec || !*spec) return;
+    if (const char* m = std::getenv("GOWA_HOOK_MAX")) g_max = static_cast<uint32_t>(std::atoi(m));
+    if (const char* a = std::getenv("GOWA_HOOK_AT")) g_at = std::atof(a);
+    g_count_only = std::getenv("GOWA_HOOK_COUNT") != nullptr;
+    std::string all(spec);
+    size_t pos = 0;
+    while (pos <= all.size()) {
+        size_t comma = all.find(',', pos);
+        std::string item = all.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        pos = comma == std::string::npos ? all.size() + 1 : comma + 1;
+        if (item.empty()) continue;
+        std::vector<std::string> parts;
+        size_t p = 0;
+        while (true) {
+            size_t c = item.find(':', p);
+            parts.push_back(item.substr(p, c == std::string::npos ? std::string::npos : c - p));
+            if (c == std::string::npos) break;
+            p = c + 1;
+        }
+        uint32_t addr = 0;
+        for (auto& [a, nm] : g_names) {
+            if (nm == parts[0]) addr = a;
+        }
+        if (!addr) addr = static_cast<uint32_t>(std::strtoul(parts[0].c_str() + (parts[0].rfind("f_", 0) == 0 ? 2 : 0), nullptr, 16));
+        if (!addr || (addr >> 2) >= sizeof(ppu::hook_flags)) {
+            LOG_WARN("hook", "bad hook '%s'", item.c_str());
+            continue;
+        }
+        Hook* h = new Hook;
+        h->addr = addr;
+        for (size_t i = 1; i < parts.size(); i++) {
+            if (parts[i].size() > 2 && parts[i][0] == 'd') {
+                size_t eq = parts[i].find('=');
+                int reg = std::atoi(parts[i].substr(1, eq - 1).c_str());
+                uint32_t len = eq == std::string::npos ? 0x40 : static_cast<uint32_t>(std::strtoul(parts[i].c_str() + eq + 1, nullptr, 0));
+                if (reg >= 0 && reg < 32) h->dumps.push_back({reg, len});
+            }
+        }
+        g_hooks[addr] = h;
+        ppu::hook_flags[addr >> 2] = 1;
+        LOG_INFO("hook", "hooked %s at 0x%08x", name_of(addr).c_str(), addr);
+    }
+    if (g_hooks.empty()) return;
+    ppu::hook_impl = impl;
+    if (g_count_only) std::thread(summary_thread).detach();
+}
+
+}

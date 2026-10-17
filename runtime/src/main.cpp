@@ -2,6 +2,7 @@
 #include "runtime/loader.h"
 #include "runtime/log.h"
 #include "runtime/trace.h"
+#include "runtime/hooks.h"
 #include "runtime/memory.h"
 #include "gpu/presenter.h"
 #include "runtime/thread.h"
@@ -56,6 +57,7 @@ void rearm_watch();
 int main(int argc, char** argv) {
     crash::install();
     trace::init();
+    hooks::init();
     timeBeginPeriod(1);
     gpu::init();
     if (const char* root = std::getenv("GOWA_ROOT")) loader::g_root = root;
