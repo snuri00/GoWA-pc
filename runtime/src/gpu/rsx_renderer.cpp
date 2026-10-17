@@ -1961,7 +1961,10 @@ void nv3089_transfer(uint32_t arg) {
     if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x clip 0x%x/0x%x dst 0x%x dma 0x%x pitch 0x%x surf 0x%x cfmt 0x%x/0x%x dsdx 0x%x/0x%x arg 0x%x", R(0xC408), R(0xC184),
                                                  R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC308), R(0xC30C), R(0x630C), R(0x6188), R(0x6304), R(0xC198), R(0xC300), R(0x6300), R(0xC318), R(0xC31C), arg);
     if (g_trace) LOG_INFO("rsx", "trace nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x size 0x%x dst 0x%x dma 0x%x surf 0x%x dsdx 0x%x", R(0xC408), R(0xC184), R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC30C), R(0x630C), R(0x6188), R(0xC198), R(0xC318));
-    if (R(0xC304) != 3) return;
+    if (R(0xC304) != 3) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     uint32_t in_size = R(0xC400), in_fmt = R(0xC404);
     uint32_t in_w = in_size & 0xFFFF, in_h = in_size >> 16;
     uint32_t src_bpp = R(0xC300) == 7 ? 2 : 4;
@@ -1975,23 +1978,41 @@ void nv3089_transfer(uint32_t arg) {
     uint32_t out_x = out_point & 0xFFFF, out_y = out_point >> 16, out_w = out_size & 0xFFFF, out_h = out_size >> 16;
     uint32_t clip_x = clip_point & 0xFFFF, clip_y = clip_point >> 16;
     uint32_t clip_w = std::min(clip_size & 0xFFFF, out_w), clip_h = std::min(clip_size >> 16, out_h);
-    if (!clip_w || !clip_h || !in_w || !in_h) return;
+    if (!clip_w || !clip_h || !in_w || !in_h) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     int32_t dsdx_raw = static_cast<int32_t>(R(0xC318)), dtdy_raw = static_cast<int32_t>(R(0xC31C));
-    if (!dsdx_raw || !dtdy_raw) return;
+    if (!dsdx_raw || !dtdy_raw) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     double dsdx = dsdx_raw / 1048576.0, dtdy = dtdy_raw / 1048576.0;
     uint32_t src = lv2::rsx_address(R(0xC408) + in_y * in_pitch + in_x * src_bpp, R(0xC184));
-    if (!src) return;
+    if (!src) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     bool swizzled = R(0xC198) == 0x31337A73;
     uint32_t dst_fmt = swizzled ? (R(0x8300) & 0xFFFF) : R(0x6300);
     uint32_t dst_bpp = dst_fmt == 4 ? 2 : 4;
     uint32_t dst_pitch = R(0x6304) >> 16;
     uint32_t log_w = (R(0x8300) >> 16) & 0xFF, log_h = (R(0x8300) >> 24) & 0xFF;
     uint32_t dst = swizzled ? lv2::rsx_address(R(0x8304), R(0x8184)) : lv2::rsx_address(R(0x630C), R(0x6188));
-    if (!dst) return;
+    if (!dst) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     uint32_t x0 = std::max(clip_x, out_x), y0 = std::max(clip_y, out_y);
     uint32_t x1 = std::min(clip_x + clip_w, out_x + out_w), y1 = std::min(clip_y + clip_h, out_y + out_h);
-    if (x1 <= x0 || y1 <= y0) return;
-    if (!readable(src, uint64_t(in_h - 1 - std::min(in_y, in_h - 1)) * in_pitch + in_w * src_bpp)) return;
+    if (x1 <= x0 || y1 <= y0) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
+    if (!readable(src, uint64_t(in_h - 1 - std::min(in_y, in_h - 1)) * in_pitch + in_w * src_bpp)) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     std::vector<uint32_t> pixels(size_t(x1 - x0) * (y1 - y0));
     size_t k = 0;
     for (uint32_t y = y0; y < y1; y++) {
