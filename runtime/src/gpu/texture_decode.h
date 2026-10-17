@@ -24,6 +24,7 @@ struct TextureRegion {
     uint32_t layer = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t depth = 1;
 };
 
 struct TextureLayout {
@@ -33,6 +34,7 @@ struct TextureLayout {
     uint32_t base = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t depth = 1;
     uint32_t levels = 1;
     uint32_t layers = 1;
     uint32_t source_size = 0;

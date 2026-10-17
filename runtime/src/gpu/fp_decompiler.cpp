@@ -217,10 +217,12 @@ private:
     }
 
     std::string tex_coord(const std::string& a, uint32_t unit) {
+        bool un = (key_.unnormalized >> unit) & 1;
+        std::string size = "textureSize(tex" + std::to_string(unit) + ", 0)";
         switch (dim(unit)) {
-        case 0: return a + ".x";
-        case 1: return a + ".xy";
-        default: return a + ".xyz";
+        case 0: return un ? "(" + a + ".x / float(" + size + "))" : a + ".x";
+        case 1: return un ? "(" + a + ".xy / vec2(" + size + "))" : a + ".xy";
+        default: return un && dim(unit) == 3 ? "(" + a + ".xyz / vec3(" + size + "))" : a + ".xyz";
         }
     }
 

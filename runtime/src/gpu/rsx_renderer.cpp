@@ -404,10 +404,12 @@ FpEntry* fragment_program(uint32_t ea) {
     key.control = R(SHADER_CONTROL) & 0xCE;
     uint32_t dims = texture_dims();
     for (uint32_t u = 0; u < 16; u++) {
-        if (a.texture_mask & (1u << u)) key.texture_dims |= dims & (3u << (u * 2));
+        if (!(a.texture_mask & (1u << u))) continue;
+        key.texture_dims |= dims & (3u << (u * 2));
+        if (R(TEXTURE_BASE + 4 + u * 0x20) & 0x4000) key.unnormalized |= 1u << u;
     }
     key.mrt_count = mrt_count();
-    uint64_t h = a.hash ^ (uint64_t(key.control) << 1) ^ (uint64_t(key.texture_dims) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(key.mrt_count) << 40);
+    uint64_t h = a.hash ^ (uint64_t(key.control) << 1) ^ (uint64_t(key.texture_dims) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(key.mrt_count) << 40) ^ (uint64_t(key.unnormalized) * 0xC2B2AE3D27D4EB4Full);
     auto it = g_fp_cache.find(h);
     if (it != g_fp_cache.end()) return &it->second;
     FpEntry& e = g_fp_cache[h];
@@ -726,10 +728,10 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
         if (!describe_texture(t, n->layout)) return nullptr;
         TextureLayout& l = n->layout;
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ii.imageType = l.view_type == VK_IMAGE_VIEW_TYPE_1D ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
+        ii.imageType = l.view_type == VK_IMAGE_VIEW_TYPE_1D ? VK_IMAGE_TYPE_1D : l.view_type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
         ii.flags = l.layers == 6 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
         ii.format = l.format;
-        ii.extent = {l.width, l.height, 1};
+        ii.extent = {l.width, l.height, l.depth};
         ii.mipLevels = l.levels;
         ii.arrayLayers = l.layers;
         ii.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -766,7 +768,7 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
         VkBufferImageCopy c{};
         c.bufferOffset = staging.offset + r.offset;
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, r.level, r.layer, 1};
-        c.imageExtent = {r.width, r.height, 1};
+        c.imageExtent = {r.width, r.height, r.depth};
         copies.push_back(c);
     }
     vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(copies.size()), copies.data());
@@ -1907,13 +1909,19 @@ bool draw() {
     vkCmdSetPrimitiveRestartEnable(cmd, restart ? VK_TRUE : VK_FALSE);
     if (!(g_experiment & 1)) vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
     g_stats.phase[6] += ticks() - ph;
+    for (uint32_t i = 0; i < g_pass.color_count; i++) g_pass.colors[i]->generation++;
+    if (g_pass.depth) g_pass.depth->generation++;
     g_stats.draws++;
     g_stats.vertices += vcount;
     if (g_trace) {
         static const uint32_t dump_at = std::getenv("GOWA_TRACE_DUMP_DRAW") ? std::atoi(std::getenv("GOWA_TRACE_DUMP_DRAW")) : 0;
-        if (++g_trace_draws == dump_at) {
+        static const uint32_t dump_target = std::getenv("GOWA_TRACE_DUMP_TARGET") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_TRACE_DUMP_TARGET"), nullptr, 16)) : ~0u;
+        static bool dumped_target = false;
+        bool hit_target = !dumped_target && !colors.empty() && colors[0] && colors[0]->offset == dump_target;
+        if (hit_target) dumped_target = true;
+        if (++g_trace_draws == dump_at || hit_target) {
             end_pass();
-            LOG_INFO("rsx", "dumping surfaces after traced draw %u", dump_at);
+            LOG_INFO("rsx", "dumping surfaces after traced draw %u", g_trace_draws);
             schedule_dumps();
         }
     }
@@ -2095,7 +2103,13 @@ struct Dump {
 std::vector<Dump> g_dumps;
 
 void schedule_dumps() {
+    static const std::string only = std::getenv("GOWA_DUMP_ONLY") ? std::string(",") + std::getenv("GOWA_DUMP_ONLY") + "," : std::string();
     for (auto& [k, s] : g_surfaces) {
+        if (!only.empty()) {
+            char key[16];
+            std::snprintf(key, sizeof key, ",%x,", s->offset);
+            if (only.find(key) == std::string::npos) continue;
+        }
         if (s->depth() && s->format != VK_FORMAT_D24_UNORM_S8_UINT) continue;
         uint32_t bpp = s->depth() ? 4 : format_bytes(s->format);
         if (bpp != 4) continue;
