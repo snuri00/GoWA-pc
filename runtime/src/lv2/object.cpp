@@ -1,3 +1,4 @@
+#include "ppu/ops.h"
 #include "object.h"
 
 namespace lv2 {
@@ -37,8 +38,8 @@ bool remove_object(uint32_t id) {
 }
 
 uint64_t system_time_us() {
-    static const auto start = std::chrono::steady_clock::now();
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()) + 1000000;
+    static const uint64_t start = ppu::timebase();
+    return (ppu::timebase() - start) / 80 + 1000000;
 }
 
 }

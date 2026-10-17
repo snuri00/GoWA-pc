@@ -2,8 +2,10 @@
 #include "event.h"
 #include "gpu/presenter.h"
 #include "gpu/rsx.h"
+#include "runtime/trace.h"
 #include "ppu/ops.h"
 #include "runtime/reservation.h"
+#include "runtime/hostsleep.h"
 
 #include <atomic>
 #include <chrono>
@@ -43,6 +45,7 @@ struct RsxState {
     uint32_t sema_ctx_4097 = 0;
     uint32_t sema_off_4097 = 0;
     uint32_t report_ctx = 0;
+    bool call_active = false;
     uint32_t call_return = 0;
     uint64_t flips = 0;
     std::atomic<uint32_t> last_method{0};
@@ -102,6 +105,7 @@ void flip_done(uint32_t buffer) {
     vm::write32(h + 0x10, buffer);
     std::memset(vm::ptr(g_rsx.reports + 0x10), 0, 16);
     g_rsx.flips++;
+    if (trace::on(trace::RSX)) trace::emit(trace::T_FLIP, buffer, g_rsx.flips);
     if ((g_rsx.flips % 60) == 1) LOG_INFO("rsx", "flip %llu (buffer %u)", static_cast<unsigned long long>(g_rsx.flips), buffer);
     send_event(1u << 4);
 }
@@ -150,6 +154,8 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
         return CELL_OK;
     case 0x100: case 0x101: case 0x105: case 0x106: case 0x108: case 0x10B: case 0x10C: case 0x10D:
     case 0x300: case 0x301: case 0x302: case 0x600: case 0x601: case 0x602: case 0x603:
+        LOG_INFO("rsx", "context attribute 0x%x a3 0x%llx a4 0x%llx a5 0x%llx a6 0x%llx", package, static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                 static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6));
         return CELL_OK;
     default:
         LOG_WARN("rsx", "unknown context attribute package 0x%x", package);
@@ -190,8 +196,12 @@ void execute(uint32_t reg, uint32_t arg) {
     g_rsx.last_method.store(reg, std::memory_order_relaxed);
     g_rsx.last_arg.store(arg, std::memory_order_relaxed);
     if (reg >= 0xE000) LOG_DEBUG("rsx", "driver method 0x%04x arg 0x%08x", reg, arg);
-    static const bool trace = std::getenv("GOWA_RSX_TRACE") != nullptr;
-    if (trace) LOG_INFO("rsxm", "0x%04x 0x%08x", reg, arg);
+    static const double trace_at = std::getenv("GOWA_RSX_TRACE") ? std::atof(std::getenv("GOWA_RSX_TRACE")) : -1.0;
+    static const double trace_end = std::getenv("GOWA_RSX_TRACE_END") ? std::atof(std::getenv("GOWA_RSX_TRACE_END")) : 1e9;
+    if (trace_at >= 0.0) {
+        double now = logging::uptime();
+        if (now >= trace_at && now < trace_end) LOG_INFO("rsxm", "0x%04x 0x%08x", reg, arg);
+    }
     if (reg < 0xE000) gpu::rsx::method(reg, arg);
     switch (reg) {
     case 0x50: vm::write32(g_rsx.dma_control + 0x48, arg); break;
@@ -199,12 +209,16 @@ void execute(uint32_t reg, uint32_t arg) {
     case 0x64: g_rsx.sema_off_406e = arg; break;
     case 0x68:
         LOG_DEBUG("rsx", "acquire ctx 0x%08x off 0x%x == 0x%x", g_rsx.sema_ctx_406e, g_rsx.sema_off_406e, arg);
-        if (uint32_t a = get_address(g_rsx.sema_off_406e, g_rsx.sema_ctx_406e)) semaphore_wait(a, arg);
+        if (uint32_t a = get_address(g_rsx.sema_off_406e, g_rsx.sema_ctx_406e)) {
+            if (trace::on(trace::RSX)) trace::emit(trace::T_SEMA, 0x68, a, arg, vm::read32(a));
+            semaphore_wait(a, arg);
+        }
         break;
     case 0x6C:
         LOG_DEBUG("rsx", "release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_406e, g_rsx.sema_off_406e, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_406e, g_rsx.sema_ctx_406e)) {
             if (a == g_rsx.device_addr + 0x30 && !arg) arg = 1;
+            if (trace::on(trace::RSX)) trace::emit(trace::T_SEMA, 0x6C, a, arg);
             rsx_write32(a, arg);
         }
         break;
@@ -214,12 +228,16 @@ void execute(uint32_t reg, uint32_t arg) {
     case 0x1D70:
         LOG_DEBUG("rsx", "backend release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_4097, g_rsx.sema_off_4097, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) {
+            if (trace::on(trace::RSX)) trace::emit(trace::T_SEMA, 0x1D70, a, (arg & 0xFF00FF00u) | ((arg & 0xFF) << 16) | ((arg >> 16) & 0xFF));
             rsx_write32(a, (arg & 0xFF00FF00u) | ((arg & 0xFF) << 16) | ((arg >> 16) & 0xFF));
         }
         break;
     case 0x1D74:
         LOG_DEBUG("rsx", "texture release ctx 0x%08x off 0x%x = 0x%x", g_rsx.sema_ctx_4097, g_rsx.sema_off_4097, arg);
-        if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) rsx_write32(a, arg);
+        if (uint32_t a = get_address(g_rsx.sema_off_4097, g_rsx.sema_ctx_4097)) {
+            if (trace::on(trace::RSX)) trace::emit(trace::T_SEMA, 0x1D74, a, arg);
+            rsx_write32(a, arg);
+        }
         break;
     case 0x1800: {
         uint32_t offset = arg & 0xFFFFFF;
@@ -229,8 +247,17 @@ void execute(uint32_t reg, uint32_t arg) {
             uint64_t t = __builtin_bswap64(ppu::timebase());
             std::memcpy(rep, &t, 8);
             std::memset(rep + 8, 0, 8);
+            if ((arg >> 24) == 1) {
+                uint32_t v = __builtin_bswap32(gpu::rsx::zpass_value());
+                std::memcpy(rep + 8, &v, 4);
+            }
             rsv::store_locked(a, rep, 16);
-            LOG_DEBUG("rsx", "report type %u loc 0x%08x off 0x%x -> ea 0x%08x", arg >> 24, loc, offset, a);
+            if (trace::on(trace::RSX)) {
+                uint32_t v;
+                std::memcpy(&v, rep + 8, 4);
+                trace::emit(trace::T_REPORT, arg >> 24, a, __builtin_bswap32(v));
+            }
+            if (std::getenv("GOWA_REPORT_LOG")) LOG_INFO("rsx", "report type %u loc 0x%08x off 0x%x -> ea 0x%08x", arg >> 24, loc, offset, a);
         }
         break;
     }
@@ -244,6 +271,21 @@ void execute(uint32_t reg, uint32_t arg) {
 }
 
 HANDLE g_fifo_handle = nullptr;
+
+struct LineReader {
+    uint32_t line = ~0u;
+    alignas(16) uint8_t buf[128];
+    uint32_t read(uint32_t ea) {
+        uint32_t l = ea & ~127u;
+        if (l != line) {
+            rsv::snapshot(l, buf);
+            line = l;
+        }
+        uint32_t v;
+        std::memcpy(&v, buf + (ea & 127u), 4);
+        return __builtin_bswap32(v);
+    }
+};
 
 void fifo_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX FIFO");
@@ -261,39 +303,103 @@ void fifo_thread() {
             continue;
         }
         idle = 0;
+        static uint32_t hist_get[64], hist_cmd[64], hist_put[64];
+        static uint32_t hist_n = 0;
         uint32_t ea = io_to_ea(get);
         if (!ea) {
+            static uint32_t dumped = 0xFFFFFFFF;
+            if (dumped != get) {
+                dumped = get;
+                for (uint32_t i = 0; i < 64; i++) {
+                    uint32_t k = (hist_n + i) & 63;
+                    LOG_ERROR("rsx", "  hist get 0x%08x cmd 0x%08x put 0x%08x", hist_get[k], hist_cmd[k], hist_put[k]);
+                }
+                for (uint32_t h = 1; h <= 4; h++) {
+                uint32_t lastget = hist_get[(hist_n - h) & 63];
+                uint32_t lea = io_to_ea(lastget & ~0x3Fu);
+                if (lea) {
+                    for (int r = -4; r < 4; r++) {
+                        uint32_t a = lea + r * 32;
+                        LOG_ERROR("rsx", "  mem io 0x%08x: %08x %08x %08x %08x %08x %08x %08x %08x", (lastget & ~0x3Fu) + r * 32, vm::read32(a), vm::read32(a + 4), vm::read32(a + 8), vm::read32(a + 12),
+                                  vm::read32(a + 16), vm::read32(a + 20), vm::read32(a + 24), vm::read32(a + 28));
+                    }
+                }
+                }
+            }
             LOG_ERROR("rsx", "FIFO get 0x%08x not IO-mapped (put 0x%08x)", get, put);
             Sleep(10);
             continue;
         }
-        uint32_t cmd = vm::read32(ea);
+        LineReader reader;
+        uint32_t cmd = reader.read(ea);
+        if (cmd) {
+            hist_get[hist_n & 63] = get;
+            hist_cmd[hist_n & 63] = cmd;
+            hist_put[hist_n & 63] = put;
+            hist_n++;
+        }
         static const bool trace = std::getenv("GOWA_RSX_TRACE") != nullptr;
         if (trace) LOG_INFO("rsxc", "get 0x%08x cmd 0x%08x", get, cmd);
         if ((cmd & 0xE0000003) == 0x20000000 || (cmd & 0xE0000003) == 0x00000001) {
             uint32_t target = (cmd & 3) == 1 ? cmd & 0xFFFFFFFC : cmd & 0x1FFFFFFC;
             if (target == get) {
-                if (++idle < 256) std::this_thread::yield();
+                if (++idle < 20000) std::this_thread::yield();
                 else Sleep(1);
                 continue;
             }
+            static const uint32_t delay_us = std::getenv("GOWA_FIFO_DELAY_US") ? std::atoi(std::getenv("GOWA_FIFO_DELAY_US")) : 0;
+            if (delay_us) host::sleep_us(delay_us);
             vm::write32(ctrl + 0x44, target);
             continue;
         }
         if ((cmd & 3) == 2) {
+            if (g_rsx.call_active) LOG_WARN("rsx", "nested FIFO call at 0x%08x (return 0x%08x)", get, g_rsx.call_return);
+            g_rsx.call_active = true;
             g_rsx.call_return = get + 4;
             vm::write32(ctrl + 0x44, cmd & 0x1FFFFFFC);
             continue;
         }
         if ((cmd & 0xFFFF0003) == 0x00020000) {
+            if (!g_rsx.call_active) {
+                LOG_ERROR("rsx", "FIFO return without call at 0x%08x", get);
+                for (uint32_t i = 0; i < 64; i++) {
+                    uint32_t k = (hist_n + i) & 63;
+                    LOG_ERROR("rsx", "  hist get 0x%08x cmd 0x%08x put 0x%08x", hist_get[k], hist_cmd[k], hist_put[k]);
+                }
+                vm::write32(ctrl + 0x44, get + 4);
+                continue;
+            }
+            g_rsx.call_active = false;
             vm::write32(ctrl + 0x44, g_rsx.call_return);
             continue;
         }
         uint32_t count = (cmd >> 18) & 0x7FF;
         uint32_t method = cmd & 0xFFFC;
         bool noninc = (cmd & 0xE0030003) == 0x40000000;
+        static const uint32_t log_method = std::getenv("GOWA_FIFO_LOG_METHOD") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_FIFO_LOG_METHOD"), nullptr, 0)) : 0;
+        static uint32_t logged_packets = 0;
+        if (log_method && method <= log_method && log_method < method + count * 4 && logged_packets < 400 && (method != 0x1EFC || reader.read(ea + 4) < 8)) {
+            logged_packets++;
+            std::string args;
+            for (uint32_t i = 0; i < count && i < 20; i++) {
+                char b[12];
+                std::snprintf(b, sizeof b, " %08x", reader.read(ea + 4 + i * 4));
+                args += b;
+            }
+            LOG_INFO("rsxpkt", "get 0x%08x cmd 0x%08x method 0x%04x count %u%s:%s", get, cmd, method, count, noninc ? " noninc" : "", args.c_str());
+            if (std::getenv("GOWA_FIFO_RECHECK")) {
+                host::sleep_us(2000);
+                std::string later;
+                for (uint32_t i = 0; i < count + 1 && i < 21; i++) {
+                    char b[12];
+                    std::snprintf(b, sizeof b, " %08x", vm::read32(ea + i * 4));
+                    later += b;
+                }
+                LOG_INFO("rsxpkt", "  2ms later:%s", later.c_str());
+            }
+        }
         for (uint32_t i = 0; i < count; i++) {
-            execute(noninc ? method : method + i * 4, vm::read32(ea + 4 + i * 4));
+            execute(noninc ? method : method + i * 4, reader.read(ea + 4 + i * 4));
         }
         vm::write32(ctrl + 0x44, get + 4 + count * 4);
     }
@@ -303,7 +409,7 @@ void vblank_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX VBlank");
     auto next = std::chrono::steady_clock::now();
     while (g_rsx.running) {
-        next += std::chrono::nanoseconds(16683333);
+        next += std::chrono::nanoseconds(static_cast<int64_t>(16683333 / ppu::time_scale()));
         host::sleep_until_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
         uint32_t h = head_addr(1);
         vm::write64(h + 0x30, vm::read64(h + 0x30) + 1);

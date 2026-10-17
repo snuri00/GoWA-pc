@@ -3,5 +3,7 @@
  {"file": "libsysmodule.prx", "base": "0x01100000"},
  {"file": "libsre.prx", "base": "0x01200000"},
  {"file": "libgcm_sys.prx", "base": "0x01300000"},
- {"file": "libfs.prx", "base": "0x01400000"}
+ {"file": "libfs.prx", "base": "0x01400000"},
+ {"file": "libvdec.prx", "base": "0x01500000"},
+ {"file": "libsmvd2.prx", "base": "0x01600000"}
 ]

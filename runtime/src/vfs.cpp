@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <vector>
 
@@ -38,16 +39,25 @@ std::string lower(std::string s) {
 void init() {
     std::call_once(g_once, [] {
         std::string rpcs3 = env_or("GOWA_RPCS3_DIR", "D:/Games/rpcs3");
+        std::string local = env_or("GOWA_VFS_DIR", "vfs");
         g_disc = env_or("GOWA_DISC_DIR", (rpcs3 + "/games/BCES01741").c_str());
-        std::string hdd0 = env_or("GOWA_HDD0_DIR", (rpcs3 + "/dev_hdd0").c_str());
+        std::string rpcs3_hdd0 = rpcs3 + "/dev_hdd0";
+        std::string hdd0 = env_or("GOWA_HDD0_DIR", (local + "/dev_hdd0").c_str());
+        std::string hdd1 = env_or("GOWA_HDD1_DIR", (local + "/dev_hdd1").c_str());
+        std::string usb = local + "/dev_usb000";
         std::string flash = env_or("GOWA_FLASH_DIR", (rpcs3 + "/dev_flash").c_str());
-        g_patch = hdd0 + "/game/BCES01741";
+        for (const std::string& d : {hdd0 + "/game", hdd0 + "/home/00000001/savedata", hdd0 + "/home/00000001/trophy", hdd1, usb}) {
+            std::error_code ec;
+            std::filesystem::create_directories(d, ec);
+        }
+        g_patch = env_or("GOWA_PATCH_DIR", (rpcs3_hdd0 + "/game/BCES01741").c_str());
         g_mounts = {
             {"/dev_bdvd", g_disc},
+            {"/dev_hdd0/game/bces01741", g_patch},
             {"/dev_hdd0", hdd0},
-            {"/dev_hdd1", env_or("GOWA_HDD1_DIR", (rpcs3 + "/dev_hdd1").c_str())},
+            {"/dev_hdd1", hdd1},
             {"/dev_flash", flash},
-            {"/dev_usb000", rpcs3 + "/dev_usb000"},
+            {"/dev_usb000", usb},
             {"/app_home", g_disc + "/PS3_GAME/USRDIR"},
             {"/host_root", "."},
         };

@@ -9,6 +9,8 @@ enum class Level { Trace, Debug, Info, Warning, Error, Fatal };
 void write(Level level, const char* channel, const char* fmt, ...);
 void set_level(Level level);
 bool enabled(Level level);
+double uptime();
+unsigned long long uptime_ns();
 
 }
 

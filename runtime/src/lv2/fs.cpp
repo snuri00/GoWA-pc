@@ -1,5 +1,6 @@
 #include "object.h"
 #include "runtime/vfs.h"
+#include "runtime/trace.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -27,6 +28,9 @@ struct DirEntry {
 };
 
 struct Fd {
+    std::mutex io;
+    uint32_t path_id = 0;
+    uint32_t number = 0;
     FILE* f = nullptr;
     std::string guest;
     std::string host;
@@ -47,7 +51,10 @@ constexpr int64_t CELL_ENAMETOOLONG = static_cast<int32_t>(0x80010032);
 constexpr uint32_t CELL_ENOTSUP_CODE = 0x80010037;
 
 bool is_ro(const std::string& guest) {
-    return guest.rfind("/dev_bdvd", 0) == 0 || guest.rfind("/dev_ps2disc", 0) == 0;
+    std::string g = guest;
+    for (auto& ch : g) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (g == "/dev_hdd0/game/bces01741" || g.rfind("/dev_hdd0/game/bces01741/", 0) == 0) return true;
+    return g.rfind("/dev_bdvd", 0) == 0 || g.rfind("/dev_ps2disc", 0) == 0;
 }
 
 uint32_t block_size(const std::string& guest) {
@@ -127,7 +134,12 @@ int64_t do_read(Fd& fd, uint32_t buf, uint64_t n, uint64_t& got) {
     got = 0;
     if (fd.is_dir || !fd.f) return CELL_EBADF;
     if ((fd.flags & O_ACCMODE) == O_WRONLY) return CELL_EBADF;
+    int64_t pos = trace::on(trace::FS) ? _ftelli64(fd.f) : 0;
     got = std::fread(vm::ptr(buf), 1, n, fd.f);
+    if (trace::on(trace::FS)) {
+        if (!fd.path_id) fd.path_id = trace::intern(fd.guest);
+        trace::emit(trace::T_FS_READ, fd.path_id, static_cast<uint64_t>(pos), n, buf, got, fd.number);
+    }
     return CELL_OK;
 }
 
@@ -135,6 +147,10 @@ int64_t do_write(Fd& fd, uint32_t buf, uint64_t n, uint64_t& put) {
     put = 0;
     if (fd.is_dir || !fd.f) return CELL_EBADF;
     if ((fd.flags & O_ACCMODE) == 0) return CELL_EBADF;
+    if (trace::on(trace::FS)) {
+        if (!fd.path_id) fd.path_id = trace::intern(fd.guest);
+        trace::emit(trace::T_FS_WRITE, fd.path_id, static_cast<uint64_t>(_ftelli64(fd.f)), n, buf, 0, fd.number);
+    }
     if (fd.readonly_mount) return CELL_EROFS;
     if (fd.flags & O_APPEND) _fseeki64(fd.f, 0, SEEK_END);
     put = std::fwrite(vm::ptr(buf), 1, n, fd.f);
@@ -185,6 +201,11 @@ LV2_SYSCALL(801, sys_fs_open) {
         return CELL_EMFILE;
     }
     vm::write32(out, id);
+    fd->number = id;
+    if (trace::on(trace::FS)) {
+        fd->path_id = trace::intern(guest);
+        trace::emit(trace::T_FS_OPEN, fd->path_id, static_cast<uint32_t>(flags), id);
+    }
     LOG_INFO("fs", "open '%s' flags 0%o -> %u", guest.c_str(), flags, id);
     return CELL_OK;
 }
@@ -197,7 +218,11 @@ LV2_SYSCALL(802, sys_fs_read) {
     if (!nread) return CELL_EFAULT;
     if (!fd) return CELL_EBADF;
     uint64_t got = 0;
-    int64_t r = n ? do_read(*fd, buf, n, got) : CELL_OK;
+    int64_t r;
+    {
+        std::lock_guard io(fd->io);
+        r = n ? do_read(*fd, buf, n, got) : CELL_OK;
+    }
     vm::write64(nread, got);
     return r;
 }
@@ -208,7 +233,11 @@ LV2_SYSCALL(803, sys_fs_write) {
     if (!nwrite) return CELL_EFAULT;
     if (!fd) return CELL_EBADF;
     uint64_t put = 0;
-    int64_t r = do_write(*fd, u32arg(ctx, 1), u64arg(ctx, 2), put);
+    int64_t r;
+    {
+        std::lock_guard io(fd->io);
+        r = do_write(*fd, u32arg(ctx, 1), u64arg(ctx, 2), put);
+    }
     vm::write64(nwrite, put);
     return r;
 }
@@ -223,6 +252,7 @@ LV2_SYSCALL(804, sys_fs_close) {
         g_fds.erase(it);
     }
     if (fd->f) std::fclose(fd->f);
+    if (trace::on(trace::FS)) trace::emit(trace::T_FS_CLOSE, fd->path_id, fd->number);
     return CELL_OK;
 }
 
@@ -362,6 +392,7 @@ LV2_SYSCALL(818, sys_fs_lseek) {
     int64_t off = static_cast<int64_t>(u64arg(ctx, 1));
     int32_t whence = s32arg(ctx, 2);
     if (whence < 0 || whence > 2) return CELL_EINVAL;
+    std::lock_guard io(fd->io);
     int64_t base_pos = whence == 0 ? 0 : whence == 1 ? _ftelli64(fd->f) : (_fseeki64(fd->f, 0, SEEK_END), _ftelli64(fd->f));
     int64_t np = base_pos + off;
     if (np < 0) return CELL_EINVAL;
@@ -428,6 +459,7 @@ LV2_SYSCALL(817, sys_fs_fcntl) {
         if (size < 0x38) return CELL_EINVAL;
         auto fd = get_fd(vm::read32(arg + 0x10));
         if (!fd || !fd->f) return CELL_EBADF;
+        std::lock_guard io(fd->io);
         int64_t old = _ftelli64(fd->f);
         _fseeki64(fd->f, static_cast<int64_t>(vm::read64(arg + 0x18)), SEEK_SET);
         uint64_t done = 0;

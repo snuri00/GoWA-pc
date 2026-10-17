@@ -31,6 +31,7 @@ struct Thread {
     std::atomic<uint32_t> in_syscall{0};
     std::atomic<uint64_t> syscalls{0};
     uint64_t syscalls_seen = 0;
+    uint32_t syscall_hist[1024] = {};
     void* native = nullptr;
 };
 

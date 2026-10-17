@@ -1,3 +1,4 @@
+#include <immintrin.h>
 #include "ppu/ops.h"
 #include "ppu/estimate_tables.h"
 #include "runtime/reservation.h"
@@ -5,6 +6,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -21,7 +23,9 @@ void unimplemented(Context& ctx, uint8_t* base, uint32_t pc, uint32_t word) {
     std::abort();
 }
 
-uint64_t timebase() {
+namespace {
+
+uint64_t host_ticks() {
     static const double scale = [] {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
@@ -32,20 +36,81 @@ uint64_t timebase() {
     return static_cast<uint64_t>(static_cast<double>(c.QuadPart) * scale);
 }
 
+struct Turbo {
+    double factor = 1.0;
+    uint64_t start = 0;
+    uint64_t until = 0;
+};
+
+const Turbo& turbo() {
+    static const Turbo t = [] {
+        Turbo t;
+        t.start = host_ticks();
+        if (const char* e = std::getenv("GOWA_TURBO")) {
+            t.factor = std::atof(e);
+            const char* at = std::strchr(e, '@');
+            t.until = static_cast<uint64_t>((at ? std::atof(at + 1) : 1e6) * 80000000.0);
+            if (t.factor < 1.0) t.factor = 1.0;
+        }
+        return t;
+    }();
+    return t;
+}
+
+}
+
+uint64_t timebase() {
+    const Turbo& t = turbo();
+    uint64_t raw = host_ticks();
+    if (t.factor == 1.0) return raw;
+    uint64_t rel = raw - t.start;
+    if (rel < t.until) return t.start + static_cast<uint64_t>(rel * t.factor);
+    return t.start + static_cast<uint64_t>(t.until * t.factor) + (rel - t.until);
+}
+
+double time_scale() {
+    const Turbo& t = turbo();
+    if (t.factor == 1.0) return 1.0;
+    return host_ticks() - t.start < t.until ? t.factor : 1.0;
+}
+
+namespace {
+
+void reserve(Context& ctx, uint8_t* base, uint32_t blk) {
+    auto& ver = rsv::version(blk);
+    for (;;) {
+        uint64_t v1 = ver.load(std::memory_order_acquire);
+        if (v1 & 64) {
+            _mm_pause();
+            continue;
+        }
+        std::memcpy(ctx.rdata, base + blk, 8);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (ver.load(std::memory_order_acquire) == v1) {
+            ctx.rtime = v1;
+            return;
+        }
+    }
+}
+
+}
+
 uint32_t lwarx(Context& ctx, uint8_t* base, uint32_t ea) {
     uint32_t blk = ea & ~7u;
-    ctx.rtime = rsv::version(blk).load(std::memory_order_acquire);
-    std::memcpy(ctx.rdata, base + blk, 8);
+    reserve(ctx, base, blk);
     ctx.raddr = ea | 1;
-    return ld32(base, ea);
+    uint32_t v;
+    std::memcpy(&v, ctx.rdata + (ea & 7u), 4);
+    return __builtin_bswap32(v);
 }
 
 uint64_t ldarx(Context& ctx, uint8_t* base, uint32_t ea) {
     uint32_t blk = ea & ~7u;
-    ctx.rtime = rsv::version(blk).load(std::memory_order_acquire);
-    std::memcpy(ctx.rdata, base + blk, 8);
+    reserve(ctx, base, blk);
     ctx.raddr = ea | 1;
-    return ld64(base, ea);
+    uint64_t v;
+    std::memcpy(&v, ctx.rdata, 8);
+    return __builtin_bswap64(v);
 }
 
 namespace {

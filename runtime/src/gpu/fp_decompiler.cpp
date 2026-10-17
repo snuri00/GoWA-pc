@@ -85,6 +85,7 @@ public:
     Decompiler(const FpWordReader& read, const FragmentProgramKey& key, const Layout& l) : read_(read), key_(key), l_(l) {}
 
     std::string run() {
+        scan_registers();
         std::map<uint32_t, uint32_t> literal_index;
         for (uint32_t i = 0; i < l_.literal_slots.size(); i++) literal_index[l_.literal_slots[i]] = i;
         std::ostringstream body;
@@ -132,11 +133,47 @@ private:
     bool uses_kil_ = false;
 
     std::set<std::string> regs_;
+    std::set<uint32_t> conflict_;
+
+    bool aliased(bool half, uint32_t idx) const { return half && conflict_.count(idx >> 1); }
 
     std::string reg_name(bool half, uint32_t idx) {
+        if (aliased(half, idx)) {
+            std::string base = "r" + std::to_string(idx >> 1);
+            regs_.insert(base);
+            return "hget(" + base + ", " + std::to_string(idx & 1) + ")";
+        }
         std::string n = (half ? "h" : "r") + std::to_string(idx);
         regs_.insert(n);
         return n;
+    }
+
+    void scan_registers() {
+        std::set<uint32_t> r_used, h_used;
+        uint32_t p = 0;
+        while (p < l_.length) {
+            Slot sl = read_slot(read_, l_.start + p);
+            uint32_t op = sl.opcode();
+            bool lit = sl.uses_literal() && (!is_flow(op) || op == 0);
+            if (!is_flow(op) && op != 0) {
+                uint32_t d = sl.w[0];
+                if (!((d >> 30) & 1)) ((d >> 7) & 1 ? h_used : r_used).insert((d >> 1) & 0x3F);
+                for (uint32_t n = 0; n < 3; n++) {
+                    uint32_t w = sl.w[1 + n];
+                    if ((w & 3) == 0) ((w >> 8) & 1 ? h_used : r_used).insert((w >> 2) & 0x3F);
+                }
+            }
+            p += lit ? 2 : 1;
+            if (sl.end()) break;
+        }
+        bool full = key_.control & 0x40;
+        const uint32_t outs_r[4] = {0, 2, 3, 4};
+        const uint32_t outs_h[4] = {0, 4, 6, 8};
+        for (uint32_t m = 0; m < 4; m++) (full ? r_used : h_used).insert(full ? outs_r[m] : outs_h[m]);
+        if (key_.control & 0xE) r_used.insert(1);
+        for (uint32_t r : r_used) {
+            if (h_used.count(r * 2) || h_used.count(r * 2 + 1)) conflict_.insert(r);
+        }
     }
 
     uint32_t dim(uint32_t unit) const { return (key_.texture_dims >> (unit * 2)) & 3; }
@@ -301,7 +338,10 @@ private:
         if (cond) o << in << "bvec4 ct = " << cc_test(sl) << ";\n";
         uint32_t mask = (d >> 9) & 0xF;
         bool no_dest = (d >> 30) & 1;
-        std::string dst = reg_name(fp16, (d >> 1) & 0x3F);
+        uint32_t dst_idx = (d >> 1) & 0x3F;
+        bool alias_dst = !no_dest && aliased(fp16, dst_idx);
+        std::string dst = alias_dst ? "hv" : reg_name(fp16, dst_idx);
+        if (alias_dst) o << in << "vec4 hv = " << reg_name(true, dst_idx) << ";\n";
         bool set_cc = (d >> 8) & 1;
         std::string cc = "CC[" + std::to_string((sl.w[1] >> 30) & 1) + "]";
         for (uint32_t l = 0; l < 4; l++) {
@@ -309,6 +349,10 @@ private:
             std::string guard = cond ? std::string("if (ct.") + lane(l) + ") " : "";
             if (!no_dest) o << in << guard << dst << "." << lane(l) << " = t." << lane(l) << ";\n";
             if (set_cc) o << in << guard << cc << "." << lane(l) << " = t." << lane(l) << ";\n";
+        }
+        if (alias_dst) {
+            std::string base = "r" + std::to_string(dst_idx >> 1);
+            o << in << base << " = hset(" << base << ", " << (dst_idx & 1) << ", hv);\n";
         }
         o << ind << "}\n";
     }
@@ -362,11 +406,14 @@ private:
         uint32_t mrt = key_.mrt_count > 4 ? 4 : key_.mrt_count;
         for (uint32_t m = 0; m < (mrt ? mrt : 1); m++) s << "layout(location = " << m << ") out vec4 out_color" << m << ";\n";
         bool full = key_.control & 0x40;
-        const char* r_out[4] = {"r0", "r2", "r3", "r4"};
-        const char* h_out[4] = {"h0", "h4", "h6", "h8"};
-        for (uint32_t m = 0; m < 4; m++) regs_.insert(full ? r_out[m] : h_out[m]);
+        const uint32_t out_idx_r[4] = {0, 2, 3, 4};
+        const uint32_t out_idx_h[4] = {0, 4, 6, 8};
+        std::string outs[4];
+        for (uint32_t m = 0; m < 4; m++) outs[m] = reg_name(!full, full ? out_idx_r[m] : out_idx_h[m]);
         regs_.insert("r1");
         for (const std::string& r : regs_) s << "vec4 " << r << " = vec4(0.0);\n";
+        s << "vec4 hget(vec4 r, int hi) { vec2 a = hi == 0 ? r.xy : r.zw; return vec4(unpackHalf2x16(floatBitsToUint(a.x)), unpackHalf2x16(floatBitsToUint(a.y))); }\n";
+        s << "vec4 hset(vec4 r, int hi, vec4 h) { vec2 p = vec2(uintBitsToFloat(packHalf2x16(h.xy)), uintBitsToFloat(packHalf2x16(h.zw))); if (hi == 0) r.xy = p; else r.zw = p; return r; }\n";
         s << "vec4 CC[2];\n";
         s << "vec4 sat(vec4 v) { return clamp(mix(v, vec4(0.0), isnan(v)), 0.0, 1.0); }\n";
         s << "bvec4 cctest(vec4 v, uint b) {\n"
@@ -398,14 +445,14 @@ private:
         s << "void main() {\n";
         s << "    CC[0] = vec4(0.0); CC[1] = vec4(0.0);\n";
         s << "    program();\n";
-        s << "    vec4 c0 = " << (full ? r_out[0] : h_out[0]) << ";\n";
+        s << "    vec4 c0 = " << outs[0] << ";\n";
         s << "    if ((fflags.x & 1u) != 0u) {\n"
              "        uint f = fflags.z & 7u; float a = c0.a; float r = window.w; bool pass = true;\n"
              "        if (f == 0u) pass = false; else if (f == 1u) pass = a < r; else if (f == 2u) pass = a == r; else if (f == 3u) pass = a <= r;\n"
              "        else if (f == 4u) pass = a > r; else if (f == 5u) pass = a != r; else if (f == 6u) pass = a >= r;\n"
              "        if (!pass) discard;\n    }\n";
         for (uint32_t m = 0; m < (mrt ? mrt : 1); m++) {
-            std::string v = m == 0 ? "c0" : (full ? r_out[m] : h_out[m]);
+            std::string v = m == 0 ? "c0" : outs[m];
             s << "    out_color" << m << " = ((fflags.x & 2u) != 0u && " << (full ? "false" : "true") << ") ? lin2srgb(" << v << ") : " << v << ";\n";
         }
         s << "    if ((fflags.w & 1u) != 0u) out_color0 = vec4(1.0, 0.0, 1.0, 1.0);\n";

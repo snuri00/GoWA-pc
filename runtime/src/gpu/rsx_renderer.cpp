@@ -1,6 +1,7 @@
 #include "gpu/presenter.h"
 #include "gpu/rsx.h"
 #include "runtime/log.h"
+#include "runtime/trace.h"
 #include "runtime/memory.h"
 #include "fp_decompiler.h"
 #include "ring.h"
@@ -10,11 +11,15 @@
 #include "vp_decompiler.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <memory>
 #include <tuple>
 #include <unordered_map>
@@ -154,12 +159,14 @@ struct Texture {
 
 struct VpEntry {
     bool ok = false;
+    uint64_t hash = 0;
     VkShaderModule module = VK_NULL_HANDLE;
     uint32_t inputs = 0;
 };
 
 struct FpEntry {
     bool ok = false;
+    uint64_t hash = 0;
     VkShaderModule module = VK_NULL_HANDLE;
     std::vector<uint32_t> literal_slots;
     uint32_t start_slot = 0;
@@ -205,6 +212,9 @@ VkDescriptorSetLayout g_set_layout = VK_NULL_HANDLE;
 VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
 bool g_ready = false;
 bool g_trace = false;
+int g_trace_serial = 0;
+uint32_t g_trace_draws = 0;
+void schedule_dumps();
 uint32_t g_experiment = std::getenv("GOWA_GPU_EXPERIMENT") ? std::atoi(std::getenv("GOWA_GPU_EXPERIMENT")) : 0;
 
 uint32_t g_prim = 0;
@@ -323,6 +333,7 @@ VpEntry* vertex_program() {
     auto it = g_vp_cache.find(h);
     if (it != g_vp_cache.end()) return &it->second;
     VpEntry& e = g_vp_cache[h];
+    e.hash = h;
     VertexProgramInfo vp = decompile_vertex_program(g_vp_ucode, start);
     std::vector<uint32_t> spirv;
     std::string log;
@@ -333,7 +344,16 @@ VpEntry* vertex_program() {
     } else if (g_vp_failures++ < 20) {
         dump_failure("vp_fail", h, vp.glsl, log);
     }
-    if (std::getenv("GOWA_SHADER_DUMP")) dump_failure("vp", h, vp.glsl, log);
+    if (std::getenv("GOWA_SHADER_DUMP")) {
+        std::string words;
+        for (uint32_t k = start; k < 544; k++) {
+            char b[64];
+            std::snprintf(b, sizeof b, "%u: %08x %08x %08x %08x\n", k, g_vp_ucode[k * 4], g_vp_ucode[k * 4 + 1], g_vp_ucode[k * 4 + 2], g_vp_ucode[k * 4 + 3]);
+            words += b;
+            if (g_vp_ucode[k * 4 + 3] & 1) break;
+        }
+        dump_failure("vp", h, vp.glsl, words);
+    }
     LOG_INFO("rsx", "vertex program %016llx start %u: %s (%zu seen, %u failures)", static_cast<unsigned long long>(h), start, e.ok ? "ok" : "FAILED", g_vp_cache.size(), g_vp_failures);
     return &e;
 }
@@ -391,6 +411,7 @@ FpEntry* fragment_program(uint32_t ea) {
     auto it = g_fp_cache.find(h);
     if (it != g_fp_cache.end()) return &it->second;
     FpEntry& e = g_fp_cache[h];
+    e.hash = h;
     FragmentProgramInfo fp = decompile_fragment_program(read, key);
     std::vector<uint32_t> spirv;
     std::string log;
@@ -992,12 +1013,75 @@ TempImage* copy_to_temp(Surface* s, uint32_t w, uint32_t h, bool redirect) {
 
 Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth);
 
+void dump_texture(const TextureRegs& t, uint32_t ea) {
+    static std::set<uint64_t> done;
+    static int pass_id = 0;
+    static uint64_t last_presents = 0;
+    pass_id = g_trace_serial;
+    uint64_t key = (uint64_t(ea) << 32) ^ t.format ^ (uint64_t(t.rect) << 8) ^ (uint64_t(pass_id) << 60);
+    if (!done.insert(key).second) return;
+    (void)last_presents;
+    TextureLayout l;
+    if (!describe_texture(t, l) || !readable(ea, l.source_size)) return;
+    std::vector<uint8_t> buf(l.decoded_size);
+    decode_texture(vm::ptr(ea), t, l, buf.data());
+    const TextureRegion& r = l.regions[0];
+    char fn[96];
+    bool bc = l.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || l.format == VK_FORMAT_BC1_RGBA_SRGB_BLOCK || l.format == VK_FORMAT_BC2_UNORM_BLOCK || l.format == VK_FORMAT_BC2_SRGB_BLOCK ||
+              l.format == VK_FORMAT_BC3_UNORM_BLOCK || l.format == VK_FORMAT_BC3_SRGB_BLOCK;
+    if (bc) {
+        uint32_t fourcc = (l.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || l.format == VK_FORMAT_BC1_RGBA_SRGB_BLOCK) ? 0x31545844u
+                          : (l.format == VK_FORMAT_BC2_UNORM_BLOCK || l.format == VK_FORMAT_BC2_SRGB_BLOCK)     ? 0x33545844u
+                                                                                                                 : 0x35545844u;
+        uint32_t bsize = fourcc == 0x31545844u ? 8 : 16;
+        uint32_t bytes = ((r.width + 3) / 4) * ((r.height + 3) / 4) * bsize;
+        std::snprintf(fn, sizeof fn, "tex_%08x_%ux%u_%02x_t%d.dds", ea, r.width, r.height, (t.format >> 8) & 0xFF, int(std::time(nullptr) % 100000));
+        if (FILE* f = std::fopen(fn, "wb")) {
+            uint32_t h[32] = {};
+            h[0] = 0x20534444u;
+            h[1] = 124;
+            h[2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000;
+            h[3] = r.height;
+            h[4] = r.width;
+            h[5] = bytes;
+            h[19] = 32;
+            h[20] = 0x4;
+            h[21] = fourcc;
+            h[27] = 0x1000;
+            std::fwrite(h, 4, 32, f);
+            std::fwrite(buf.data() + r.offset, 1, bytes, f);
+            std::fclose(f);
+        }
+    } else if (l.format == VK_FORMAT_B8G8R8A8_UNORM || l.format == VK_FORMAT_B8G8R8A8_SRGB) {
+        std::snprintf(fn, sizeof fn, "tex_%08x_%ux%u_%02x.ppm", ea, r.width, r.height, (t.format >> 8) & 0xFF);
+        if (FILE* f = std::fopen(fn, "wb")) {
+            std::fprintf(f, "P6\n%u %u\n255\n", r.width, r.height);
+            for (uint32_t i = 0; i < r.width * r.height; i++) {
+                const uint8_t* px = buf.data() + r.offset + i * 4;
+                uint8_t rgb[3] = {px[2], px[1], px[0]};
+                std::fwrite(rgb, 1, 3, f);
+            }
+            std::fclose(f);
+        }
+    }
+}
+
 Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth) {
     g_bind_kind = "dummy";
     Binding b = bind_texture_impl(unit, dim, colors, depth);
+    if (trace::on(trace::TEX)) {
+        TextureRegs t = texture_regs(unit);
+        static const char* kinds[] = {"dummy", "memory", "depth redirect", "feedback copy", "surface region", "depth surface", "color surface"};
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < 7; i++) if (std::strcmp(g_bind_kind, kinds[i]) == 0) k = i;
+        trace::emit(trace::T_TEX, unit | (k << 8), lv2::rsx_address(t.offset, (t.format & 3) - 1), t.format, t.rect, t.control0);
+    }
     if (g_trace) {
         TextureRegs t = texture_regs(unit);
-        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind);
+        uint32_t tea = lv2::rsx_address(t.offset, (t.format & 3) - 1);
+        if (std::getenv("GOWA_TEX_DUMP") && tea && std::string(g_bind_kind) == "memory") dump_texture(t, tea);
+        uint32_t w0 = tea && readable(tea, 64) ? vm::read32(tea) : 0, w1 = tea && readable(tea, 64) ? vm::read32(tea + 4) : 0, w8 = tea && readable(tea, 64) ? vm::read32(tea + 32) : 0;
+        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s data %08x %08x %08x", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind, w0, w1, w8);
     }
     return b;
 }
@@ -1615,6 +1699,7 @@ bool draw() {
     VkBuffer vbufs[16];
     VkDeviceSize voffs[16];
     VkDeviceSize vstrides[16];
+    const float* vdata[16] = {};
     uint32_t div_ops = R(FREQUENCY_DIVIDER);
     uint32_t inline_offset = 0;
     std::vector<uint8_t> stream;
@@ -1647,6 +1732,7 @@ bool draw() {
             vbufs[i] = a.buffer;
             voffs[i] = a.offset;
             vstrides[i] = 0;
+            vdata[i] = reinterpret_cast<const float*>(a.ptr);
             continue;
         }
         if (!ring_alloc(uint64_t(vcount) * 16, 16, a)) return skip(__LINE__);
@@ -1670,6 +1756,7 @@ bool draw() {
         vbufs[i] = a.buffer;
         voffs[i] = a.offset;
         vstrides[i] = 16;
+        vdata[i] = out;
     }
     g_stats.phase[3] += ticks() - ph;
     ph = ticks();
@@ -1714,15 +1801,39 @@ bool draw() {
                  vs.scale[1], vs.scale[2], vs.offset[0], vs.offset[1], vs.offset[2], fp->textures, inline_draw, k.blend_mask, k.write_masks, vs.flags[0]);
         (void)p0;
         TextureRegs t0 = texture_regs(0);
+        LOG_INFO("rsx", "  stencil func 0x%x ref 0x%x fmask 0x%x wmask 0x%x ops 0x%x/0x%x/0x%x two %u back func 0x%x ref 0x%x | zclear 0x%x alpha %u/0x%x/0x%x", R(STENCIL_FUNC), R(STENCIL_REF), R(STENCIL_FUNC_MASK), R(STENCIL_MASK),
+                 R(STENCIL_OP_FAIL), R(STENCIL_OP_FAIL + 4), R(STENCIL_OP_FAIL + 8), R(TWO_SIDED_STENCIL), R(BACK_STENCIL_FUNC), R(BACK_STENCIL_REF), R(ZSTENCIL_CLEAR_VALUE), R(ALPHA_TEST_ENABLE), R(ALPHA_FUNC), R(ALPHA_REF));
+        LOG_INFO("rsx", "  vp hash %016llx c264 %g %g %g %g c265 %g %g %g %g c266 %g %g %g %g c267 %g %g %g %g", static_cast<unsigned long long>(vp->hash), g_vp_constants[1056], g_vp_constants[1057], g_vp_constants[1058],
+                 g_vp_constants[1059], g_vp_constants[1060], g_vp_constants[1061], g_vp_constants[1062], g_vp_constants[1063], g_vp_constants[1064], g_vp_constants[1065], g_vp_constants[1066],
+                 g_vp_constants[1067], g_vp_constants[1068], g_vp_constants[1069], g_vp_constants[1070], g_vp_constants[1071]);
+        LOG_INFO("rsx", "  fp hash %016llx depth test %u func 0x%x mask %u cull %u/0x%x front 0x%x stencil %u", static_cast<unsigned long long>(fp->hash), R(DEPTH_TEST_ENABLE), R(DEPTH_FUNC), R(DEPTH_MASK),
+                 R(CULL_FACE_ENABLE), R(CULL_FACE), R(FRONT_FACE), R(STENCIL_TEST_ENABLE));
         LOG_INFO("rsx", "  tex0 off 0x%x fmt 0x%x addr 0x%x c0 0x%x c1 0x%x filt 0x%x rect 0x%x c3 0x%x | sf 0x%x df 0x%x eq 0x%x | shctl 0x%x fp 0x%x", t0.offset, t0.format, t0.address, t0.control0,
                  t0.control1, t0.filter, t0.rect, t0.control3, k.sfactor, k.dfactor, k.equation, R(SHADER_CONTROL), R(SHADER_PROGRAM));
         for (uint32_t i = 0; i < 16; i++) {
-            if (!(vp->inputs & (1u << i)) || vstrides[i] == 0) continue;
-            RingAlloc probe{};
-            (void)probe;
+            if (!(vp->inputs & (1u << i))) continue;
             uint32_t f = R(VERTEX_ARRAY_FORMAT + i * 4);
-            LOG_INFO("rsx", "  input %u fmt 0x%x", i, f);
+            const float* d = vdata[i];
+            LOG_INFO("rsx", "  input %u fmt 0x%x off 0x%x stride %u v0 %g %g %g %g", i, f, R(VERTEX_ARRAY_OFFSET + i * 4), unsigned(vstrides[i]), d ? d[0] : 0, d ? d[1] : 0, d ? d[2] : 0, d ? d[3] : 0);
         }
+        if (vdata[0] && vstrides[0] == 16 && indices.size() >= 3) {
+            const float* m = &g_vp_constants[264 * 4];
+            float wx[3], wy[3], ww[3];
+            for (int k = 0; k < 3; k++) {
+                const float* v = vdata[0] + (indices[k] - vmin) * 4;
+                float cx = v[0] * m[0] + v[1] * m[4] + v[2] * m[8] + v[3] * m[12];
+                float cy = v[0] * m[1] + v[1] * m[5] + v[2] * m[9] + v[3] * m[13];
+                float cw = v[0] * m[3] + v[1] * m[7] + v[2] * m[11] + v[3] * m[15];
+                ww[k] = cw;
+                wx[k] = cx / cw * vs.scale[0] + vs.offset[0];
+                wy[k] = cy / cw * vs.scale[1] + vs.offset[1];
+            }
+            float area = (wx[1] - wx[0]) * (wy[2] - wy[0]) - (wx[2] - wx[0]) * (wy[1] - wy[0]);
+            LOG_INFO("rsx", "  tri0 win (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) w %.2f %.2f %.2f area %.0f", wx[0], wy[0], wx[1], wy[1], wx[2], wy[2], ww[0], ww[1], ww[2], area);
+        }
+        LOG_INFO("rsx", "  vp start %u c0 %g %g %g %g c1 %g %g %g %g c2 %g %g %g %g c3 %g %g %g %g", R(TRANSFORM_PROGRAM_START), g_vp_constants[0], g_vp_constants[1], g_vp_constants[2], g_vp_constants[3], g_vp_constants[4],
+                 g_vp_constants[5], g_vp_constants[6], g_vp_constants[7], g_vp_constants[8], g_vp_constants[9], g_vp_constants[10], g_vp_constants[11], g_vp_constants[12], g_vp_constants[13], g_vp_constants[14],
+                 g_vp_constants[15]);
         if (inline_draw) {
             std::string words;
             for (size_t i = 0; i < std::min<size_t>(g_inline.size(), 24); i++) {
@@ -1775,7 +1886,9 @@ bool draw() {
     bool dtest = depth && R(DEPTH_TEST_ENABLE);
     vkCmdSetDepthTestEnable(cmd, dtest ? VK_TRUE : VK_FALSE);
     vkCmdSetDepthWriteEnable(cmd, dtest && R(DEPTH_MASK) ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthCompareOp(cmd, compare_op(R(DEPTH_FUNC)));
+    VkCompareOp depth_op = compare_op(R(DEPTH_FUNC));
+    if (depth_op == VK_COMPARE_OP_EQUAL && !R(DEPTH_MASK)) depth_op = (g_experiment & 64) ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_LESS_OR_EQUAL;
+    vkCmdSetDepthCompareOp(cmd, depth_op);
     if (vk().features.depthBounds) {
         vkCmdSetDepthBoundsTestEnable(cmd, depth && R(DEPTH_BOUNDS_ENABLE) ? VK_TRUE : VK_FALSE);
         vkCmdSetDepthBounds(cmd, std::clamp(RF(DEPTH_BOUNDS_MIN), 0.0f, 1.0f), std::clamp(RF(DEPTH_BOUNDS_MAX), 0.0f, 1.0f));
@@ -1785,14 +1898,25 @@ bool draw() {
         uint32_t cf = R(CULL_FACE);
         cull = cf == 0x404 ? VK_CULL_MODE_FRONT_BIT : cf == 0x408 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_BACK_BIT;
     }
+    if (g_experiment & 16) cull = VK_CULL_MODE_NONE;
     vkCmdSetCullMode(cmd, cull);
-    vkCmdSetFrontFace(cmd, R(FRONT_FACE) == 0x900 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    bool cw = R(FRONT_FACE) == 0x900;
+    if (g_experiment & 32) cw = !cw;
+    vkCmdSetFrontFace(cmd, cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
     vkCmdSetPrimitiveTopology(cmd, topo);
     vkCmdSetPrimitiveRestartEnable(cmd, restart ? VK_TRUE : VK_FALSE);
     if (!(g_experiment & 1)) vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
     g_stats.phase[6] += ticks() - ph;
     g_stats.draws++;
     g_stats.vertices += vcount;
+    if (g_trace) {
+        static const uint32_t dump_at = std::getenv("GOWA_TRACE_DUMP_DRAW") ? std::atoi(std::getenv("GOWA_TRACE_DUMP_DRAW")) : 0;
+        if (++g_trace_draws == dump_at) {
+            end_pass();
+            LOG_INFO("rsx", "dumping surfaces after traced draw %u", dump_at);
+            schedule_dumps();
+        }
+    }
     return true;
 }
 
@@ -1818,11 +1942,14 @@ void nv308a_color(uint32_t index, uint32_t arg) {
     uint32_t bpp = fmt == 4 ? 2 : 4;
     uint32_t ea = lv2::rsx_address(R(0x630C) + x * bpp + y * pitch, R(0x6188));
     if (!ea || !readable(ea, bpp)) return;
+    if (trace::on(trace::RSX)) trace::emit(trace::T_COPY, trace::COPY_NV308A, ea, ea, bpp, 0, arg);
     if (bpp == 4) vm::write32(ea, arg);
     else vm::write16(ea, argb_to_565(arg));
 }
 
 void nv0039_transfer() {
+    if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv0039 in 0x%x dma 0x%x out 0x%x dma 0x%x pitch %d/%d len %u lines %u fmt 0x%x", R(0x230C), R(0x2184), R(0x2310), R(0x2188), int32_t(R(0x2314)),
+                                                 int32_t(R(0x2318)), R(0x231C), R(0x2320), R(0x2324));
     if (g_trace) LOG_INFO("rsx", "trace nv0039 in 0x%x dma 0x%x out 0x%x dma 0x%x pitch %d/%d len %u lines %u fmt 0x%x", R(0x230C), R(0x2184), R(0x2310), R(0x2188), int32_t(R(0x2314)), int32_t(R(0x2318)), R(0x231C), R(0x2320), R(0x2324));
     uint32_t len = R(0x231C), lines = R(0x2320), fmt = R(0x2324);
     uint32_t in_stride = fmt & 0xFF, out_stride = (fmt >> 8) & 0xFF;
@@ -1831,6 +1958,7 @@ void nv0039_transfer() {
     uint32_t src = lv2::rsx_address(R(0x230C), R(0x2184));
     uint32_t dst = lv2::rsx_address(R(0x2310), R(0x2188));
     if (!src || !dst) return;
+    if (trace::on(trace::RSX)) trace::emit(trace::T_COPY, trace::COPY_NV0039 | (in_stride << 8) | (out_stride << 16), src, dst, len, lines, uint64_t(uint32_t(in_pitch)) | (uint64_t(uint32_t(out_pitch)) << 32));
     std::vector<uint8_t> line(len);
     for (uint32_t l = 0; l < lines; l++) {
         uint32_t s = src + static_cast<uint32_t>(int64_t(in_pitch) * l), d = dst + static_cast<uint32_t>(int64_t(out_pitch) * l);
@@ -1841,8 +1969,13 @@ void nv0039_transfer() {
 }
 
 void nv3089_transfer(uint32_t arg) {
+    if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x clip 0x%x/0x%x dst 0x%x dma 0x%x pitch 0x%x surf 0x%x cfmt 0x%x/0x%x dsdx 0x%x/0x%x arg 0x%x", R(0xC408), R(0xC184),
+                                                 R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC308), R(0xC30C), R(0x630C), R(0x6188), R(0x6304), R(0xC198), R(0xC300), R(0x6300), R(0xC318), R(0xC31C), arg);
     if (g_trace) LOG_INFO("rsx", "trace nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x size 0x%x dst 0x%x dma 0x%x surf 0x%x dsdx 0x%x", R(0xC408), R(0xC184), R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC30C), R(0x630C), R(0x6188), R(0xC198), R(0xC318));
-    if (R(0xC304) != 3) return;
+    if (R(0xC304) != 3) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     uint32_t in_size = R(0xC400), in_fmt = R(0xC404);
     uint32_t in_w = in_size & 0xFFFF, in_h = in_size >> 16;
     uint32_t src_bpp = R(0xC300) == 7 ? 2 : 4;
@@ -1856,23 +1989,49 @@ void nv3089_transfer(uint32_t arg) {
     uint32_t out_x = out_point & 0xFFFF, out_y = out_point >> 16, out_w = out_size & 0xFFFF, out_h = out_size >> 16;
     uint32_t clip_x = clip_point & 0xFFFF, clip_y = clip_point >> 16;
     uint32_t clip_w = std::min(clip_size & 0xFFFF, out_w), clip_h = std::min(clip_size >> 16, out_h);
-    if (!clip_w || !clip_h || !in_w || !in_h) return;
+    if (!clip_w || !clip_h || !in_w || !in_h) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     int32_t dsdx_raw = static_cast<int32_t>(R(0xC318)), dtdy_raw = static_cast<int32_t>(R(0xC31C));
-    if (!dsdx_raw || !dtdy_raw) return;
+    if (!dsdx_raw || !dtdy_raw) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     double dsdx = dsdx_raw / 1048576.0, dtdy = dtdy_raw / 1048576.0;
     uint32_t src = lv2::rsx_address(R(0xC408) + in_y * in_pitch + in_x * src_bpp, R(0xC184));
-    if (!src) return;
+    if (!src) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     bool swizzled = R(0xC198) == 0x31337A73;
     uint32_t dst_fmt = swizzled ? (R(0x8300) & 0xFFFF) : R(0x6300);
     uint32_t dst_bpp = dst_fmt == 4 ? 2 : 4;
     uint32_t dst_pitch = R(0x6304) >> 16;
     uint32_t log_w = (R(0x8300) >> 16) & 0xFF, log_h = (R(0x8300) >> 24) & 0xFF;
     uint32_t dst = swizzled ? lv2::rsx_address(R(0x8304), R(0x8184)) : lv2::rsx_address(R(0x630C), R(0x6188));
-    if (!dst) return;
+    if (!dst) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
     uint32_t x0 = std::max(clip_x, out_x), y0 = std::max(clip_y, out_y);
     uint32_t x1 = std::min(clip_x + clip_w, out_x + out_w), y1 = std::min(clip_y + clip_h, out_y + out_h);
-    if (x1 <= x0 || y1 <= y0) return;
-    if (!readable(src, uint64_t(in_h - 1 - std::min(in_y, in_h - 1)) * in_pitch + in_w * src_bpp)) return;
+    if (x1 <= x0 || y1 <= y0) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
+    if (!readable(src, uint64_t(in_h - 1 - std::min(in_y, in_h - 1)) * in_pitch + in_w * src_bpp)) {
+        if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+        return;
+    }
+    if (trace::on(trace::RSX)) {
+        bool scaled = dsdx_raw != (1 << 20) || dtdy_raw != (1 << 20);
+        trace::emit(trace::T_COPY, trace::COPY_NV3089, src, dst, uint64_t(x0) | (uint64_t(y0) << 16) | (uint64_t(x1) << 32) | (uint64_t(y1) << 48),
+                    uint64_t(in_pitch) | (uint64_t(swizzled ? 0 : dst_pitch) << 32),
+                    uint64_t(out_x) | (uint64_t(out_y) << 16) | (uint64_t(src_bpp) << 32) | (uint64_t(dst_bpp) << 40) | (uint64_t(swizzled) << 48) | (uint64_t(scaled) << 49));
+    }
+    std::vector<uint32_t> pixels(size_t(x1 - x0) * (y1 - y0));
+    size_t k = 0;
     for (uint32_t y = y0; y < y1; y++) {
         double sv = (y - out_y + 0.5) * dtdy;
         int32_t sy = std::clamp(int32_t(sv < 0 ? in_h + std::floor(sv) : std::floor(sv)), 0, int32_t(in_h - 1));
@@ -1880,9 +2039,15 @@ void nv3089_transfer(uint32_t arg) {
             double su = (x - out_x + 0.5) * dsdx;
             int32_t sx = std::clamp(int32_t(su < 0 ? in_w + std::floor(su) : std::floor(su)), 0, int32_t(in_w - 1));
             uint32_t s = src + sy * in_pitch + sx * src_bpp;
+            pixels[k++] = src_bpp == 4 ? vm::read32(s) : vm::read16(s);
+        }
+    }
+    k = 0;
+    for (uint32_t y = y0; y < y1; y++) {
+        for (uint32_t x = x0; x < x1; x++) {
+            uint32_t pixel = pixels[k++];
             uint32_t d = swizzled ? dst + morton(x, y, log_w, log_h) * dst_bpp : dst + y * dst_pitch + x * dst_bpp;
             if (!vm::is_mapped(d)) return;
-            uint32_t pixel = src_bpp == 4 ? vm::read32(s) : vm::read16(s);
             if (dst_bpp == 4) vm::write32(d, src_bpp == 4 ? pixel : 0xFF000000u | (((pixel >> 11) & 0x1F) * 255 / 31) << 16 | (((pixel >> 5) & 0x3F) * 255 / 63) << 8 | ((pixel & 0x1F) * 255 / 31));
             else vm::write16(d, src_bpp == 2 ? uint16_t(pixel) : argb_to_565(pixel));
         }
@@ -1931,15 +2096,15 @@ std::vector<Dump> g_dumps;
 
 void schedule_dumps() {
     for (auto& [k, s] : g_surfaces) {
-        if (s->depth()) continue;
-        uint32_t bpp = format_bytes(s->format);
+        if (s->depth() && s->format != VK_FORMAT_D24_UNORM_S8_UINT) continue;
+        uint32_t bpp = s->depth() ? 4 : format_bytes(s->format);
         if (bpp != 4) continue;
         RingAlloc a;
         if (!ring_alloc(uint64_t(s->width) * s->height * 4, 16, a)) continue;
         transition(s.get(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy c{};
         c.bufferOffset = a.offset;
-        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.imageSubresource = {VkImageAspectFlags(s->depth() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
         c.imageExtent = {s->width, s->height, 1};
         vkCmdCopyImageToBuffer(frame_cmd(), s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, a.buffer, 1, &c);
         g_dumps.push_back({a.ptr, s->offset, s->width, s->height, s->format, s->main});
@@ -1949,15 +2114,24 @@ void schedule_dumps() {
 void complete_dumps() {
     for (const Dump& d : g_dumps) {
         char fn[96];
-        std::snprintf(fn, sizeof fn, "surface_%s_%08x_%ux%u_f%d.ppm", d.main ? "main" : "local", d.offset, d.width, d.height, int(d.format));
+        std::snprintf(fn, sizeof fn, "surface_%s_%08x_%ux%u_f%d.ppm", d.main ? "main" : (d.format == VK_FORMAT_D24_UNORM_S8_UINT ? "depth" : "local"), d.offset, d.width, d.height, int(d.format));
         FILE* f = std::fopen(fn, "wb");
         if (!f) continue;
         std::fprintf(f, "P6\n%u %u\n255\n", d.width, d.height);
         std::vector<uint8_t> row(d.width * 3);
+        float zmin = 2.0f, zmax = -1.0f;
         for (uint32_t y = 0; y < d.height; y++) {
             const uint8_t* p = d.data + uint64_t(y) * d.width * 4;
             for (uint32_t x = 0; x < d.width; x++) {
-                if (d.format == VK_FORMAT_R32_SFLOAT) {
+                if (d.format == VK_FORMAT_D24_UNORM_S8_UINT) {
+                    uint32_t v;
+                    std::memcpy(&v, p + x * 4, 4);
+                    float z = (v & 0xFFFFFF) / 16777215.0f;
+                    zmin = std::min(zmin, z);
+                    zmax = std::max(zmax, z);
+                    uint8_t g = uint8_t(std::clamp((1.0f - z) * 20.0f, 0.0f, 1.0f) * 255.0f);
+                    row[x * 3] = row[x * 3 + 1] = row[x * 3 + 2] = g;
+                } else if (d.format == VK_FORMAT_R32_SFLOAT) {
                     float v;
                     std::memcpy(&v, p + x * 4, 4);
                     uint8_t g = uint8_t(std::clamp(v, 0.0f, 1.0f) * 255.0f);
@@ -1975,7 +2149,7 @@ void complete_dumps() {
             std::fwrite(row.data(), 1, row.size(), f);
         }
         std::fclose(f);
-        LOG_INFO("rsx", "dumped %s", fn);
+        LOG_INFO("rsx", "dumped %s z %f..%f", fn, zmin, zmax);
     }
     g_dumps.clear();
 }
@@ -2113,6 +2287,10 @@ bool immediate_method(uint32_t reg, uint32_t arg) {
 
 uint32_t reg(uint32_t method) { return R(method); }
 
+std::atomic<uint32_t> g_zpass_draws{0};
+
+uint32_t zpass_value() { return g_zpass_draws.load(std::memory_order_relaxed) ? 0xFFFFu : 0u; }
+
 void frame_complete() {
     complete_writebacks();
     complete_dumps();
@@ -2128,8 +2306,10 @@ void method(uint32_t reg, uint32_t arg) {
         return;
     }
     if (reg == TRANSFORM_PROGRAM_LOAD) g_vp_load_word = arg * 4;
+    if (g_trace && reg == TRANSFORM_CONSTANT_LOAD) LOG_INFO("rsx", "  const load %u", arg);
     if (reg >= TRANSFORM_CONSTANT && reg < TRANSFORM_CONSTANT + 128) {
         uint32_t idx = R(TRANSFORM_CONSTANT_LOAD) * 4 + ((reg - TRANSFORM_CONSTANT) >> 2);
+        if (g_trace && idx < 8) LOG_INFO("rsx", "  const write idx %u reg 0x%x load %u arg 0x%08x", idx, reg, R(TRANSFORM_CONSTANT_LOAD), arg);
         if (idx < 468 * 4) {
             std::memcpy(&g_vp_constants[idx], &arg, 4);
             g_vp_constants_dirty = true;
@@ -2161,6 +2341,8 @@ void method(uint32_t reg, uint32_t arg) {
     default: break;
     }
     g_regs[(reg >> 2) & 0x3FFF] = arg;
+    if (reg == 0x17C8 && arg == 1) g_zpass_draws.store(0, std::memory_order_relaxed);
+    if (reg == BEGIN_END && !(arg & 0xFF) && g_in_begin && R(0x17CC)) g_zpass_draws.fetch_add(1, std::memory_order_relaxed);
     if (copy_engine(reg, arg)) return;
     if (immediate_method(reg, arg)) return;
     if (!enabled()) return;
@@ -2194,9 +2376,23 @@ bool present(uint32_t buffer_id) {
     ++presents;
     if (g_trace) {
         LOG_INFO("rsx", "trace present buffer %u", buffer_id);
-        schedule_dumps();
+        if (!std::getenv("GOWA_TRACE_DUMP_DRAW")) schedule_dumps();
     }
     g_trace = trace_frame && presents == trace_frame;
+    static const double trace_at = std::getenv("GOWA_TRACE_AT") ? std::atof(std::getenv("GOWA_TRACE_AT")) : 0.0;
+    static const auto run_start = std::chrono::steady_clock::now();
+    static const double trace_at2 = std::getenv("GOWA_TRACE_AT2") ? std::atof(std::getenv("GOWA_TRACE_AT2")) : 0.0;
+    static bool traced_at = false, traced_at2 = false;
+    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count();
+    if (trace_at > 0.0 && !traced_at && elapsed >= trace_at) {
+        traced_at = true;
+        g_trace = true;
+    } else if (trace_at2 > 0.0 && !traced_at2 && elapsed >= trace_at2) {
+        traced_at2 = true;
+        g_trace = true;
+    }
+    if (g_trace) g_trace_serial++;
+    if (g_trace) g_trace_draws = 0;
     if (presents % 60 == 0) {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);

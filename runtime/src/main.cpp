@@ -1,6 +1,7 @@
 #include "runtime/image.h"
 #include "runtime/loader.h"
 #include "runtime/log.h"
+#include "runtime/trace.h"
 #include "runtime/memory.h"
 #include "gpu/presenter.h"
 #include "runtime/thread.h"
@@ -24,6 +25,7 @@ void rsx_status();
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -53,6 +55,7 @@ void rearm_watch();
 
 int main(int argc, char** argv) {
     crash::install();
+    trace::init();
     timeBeginPeriod(1);
     gpu::init();
     if (const char* root = std::getenv("GOWA_ROOT")) loader::g_root = root;
@@ -82,12 +85,25 @@ int main(int argc, char** argv) {
     if (!main_thread) return 1;
     uint32_t sp = main_thread->stack_addr + main_thread->stack_size;
     std::string self_path = vfs::patch_sfo().strings.empty() ? "/dev_bdvd/PS3_GAME/USRDIR/GOWA.SELF" : "/dev_hdd0/game/BCES01741/USRDIR/GOWA.SELF";
-    const char* args[] = {self_path.c_str()};
-    uint32_t argv_addr = push_strings(sp, args, 1);
+    std::vector<std::string> arg_list = {self_path};
+    if (const char* extra = std::getenv("GOWA_ARGS")) {
+        std::string e = extra;
+        size_t pos = 0;
+        while (pos < e.size()) {
+            size_t end = e.find(' ', pos);
+            if (end == std::string::npos) end = e.size();
+            if (end > pos) arg_list.push_back(e.substr(pos, end - pos));
+            pos = end + 1;
+        }
+    }
+    std::vector<const char*> args;
+    for (const std::string& a : arg_list) args.push_back(a.c_str());
+    LOG_INFO("main", "argc %zu%s%s", args.size(), args.size() > 1 ? " extra: " : "", std::getenv("GOWA_ARGS") ? std::getenv("GOWA_ARGS") : "");
+    uint32_t argv_addr = push_strings(sp, args.data(), static_cast<int>(args.size()));
     uint32_t envp_addr = push_strings(sp, nullptr, 0);
     ppu::Context& c = main_thread->ctx;
     c.gpr[1] = (sp - 0x70) & ~15u;
-    c.gpr[3] = 1;
+    c.gpr[3] = args.size();
     c.gpr[4] = argv_addr;
     c.gpr[5] = envp_addr;
     c.gpr[6] = 0;
@@ -97,13 +113,15 @@ int main(int argc, char** argv) {
     c.gpr[10] = pi.tls_memsz;
     c.gpr[11] = pi.entry_opd;
     c.gpr[12] = pi.malloc_pagesize;
-    int watch_delay = std::getenv("GOWA_WATCH_DELAY") ? std::atoi(std::getenv("GOWA_WATCH_DELAY")) : 0;
+    int watch_delay = std::getenv("GOWA_TRAP_AT") ? std::atoi(std::getenv("GOWA_TRAP_AT")) : std::getenv("GOWA_WATCH_DELAY") ? std::atoi(std::getenv("GOWA_WATCH_DELAY")) : 0;
     if (!watch_delay) crash::arm_watch();
     guest::start(main_thread);
     bool status = std::getenv("GOWA_STATUS") != nullptr;
+    int memdump_at = std::getenv("GOWA_MEMDUMP_AT") ? std::atoi(std::getenv("GOWA_MEMDUMP_AT")) : -1;
     for (int tick = 0;; tick++) {
         if (watch_delay && tick == watch_delay) crash::arm_watch();
         else if (tick > watch_delay) crash::rearm_watch();
+        if (tick == memdump_at) trace::dump_memory("memdump.bin");
         if (status && tick % 3 == 2) {
             spu::status_dump();
             guest::status_dump();
@@ -113,5 +131,6 @@ int main(int argc, char** argv) {
         if (main_thread->cv.wait_for(lk, std::chrono::seconds(1), [&] { return main_thread->exited; })) break;
     }
     LOG_INFO("main", "main thread finished");
+    trace::shutdown();
     return 0;
 }

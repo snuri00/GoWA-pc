@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ppu/ops.h"
 #include "runtime/kernel.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
@@ -56,7 +57,7 @@ bool wait_for(std::unique_lock<std::mutex>& lk, std::condition_variable& cv, uin
         cv.wait(lk, pred);
         return true;
     }
-    return cv.wait_for(lk, std::chrono::microseconds(timeout_us), pred);
+    return cv.wait_for(lk, std::chrono::microseconds(static_cast<uint64_t>(timeout_us / ppu::time_scale()) + 1), pred);
 }
 
 uint64_t system_time_us();

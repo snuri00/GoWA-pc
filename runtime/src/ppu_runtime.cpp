@@ -4,10 +4,13 @@
 #include "runtime/kernel.h"
 #include "runtime/loader.h"
 #include "runtime/log.h"
+#include "runtime/trace.h"
+#include <atomic>
 #include "runtime/thread.h"
 #include "runtime/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -147,6 +150,8 @@ void call_indirect(Context& ctx, uint8_t* base, uint32_t addr) {
     fn(ctx, base);
 }
 
+void call_import_body(Context& ctx, uint8_t* base, uint32_t index, ImportSlot& slot, int32_t st, const image::ImportEntry& imp);
+
 void call_import(Context& ctx, uint8_t* base, uint32_t index) {
     ImportSlot& slot = import_slots()[index];
     int32_t st = slot.state.load(std::memory_order_acquire);
@@ -155,6 +160,25 @@ void call_import(Context& ctx, uint8_t* base, uint32_t index) {
         slot.state.store(st, std::memory_order_release);
     }
     const image::ImportEntry& imp = image::imports[index];
+    if (trace::on(trace::IMPORT)) {
+        static std::atomic<uint32_t> names[16384];
+        uint32_t id = names[index & 16383].load(std::memory_order_relaxed);
+        if (!id) {
+            id = trace::intern(std::string(imp.module) + "::" + (*imp.name ? imp.name : "?"));
+            names[index & 16383].store(id, std::memory_order_relaxed);
+        }
+        uint64_t a0 = ctx.gpr[3], a1 = ctx.gpr[4], a2 = ctx.gpr[5];
+        uint32_t lr = static_cast<uint32_t>(ctx.lr);
+        uint64_t t0 = trace::now_ns();
+        call_import_body(ctx, base, index, slot, st, imp);
+        uint64_t us = (trace::now_ns() - t0) / 1000;
+        trace::emit(trace::T_IMPORT, id, a0, a1, a2, ctx.gpr[3], (uint64_t(lr) << 32) | (us > 0xFFFFFFFFull ? 0xFFFFFFFFull : us));
+        return;
+    }
+    call_import_body(ctx, base, index, slot, st, imp);
+}
+
+void call_import_body(Context& ctx, uint8_t* base, uint32_t index, ImportSlot& slot, int32_t st, const image::ImportEntry& imp) {
     if (slot.log_args) {
         LOG_INFO("import", "%s::%s(0x%llx, 0x%llx, 0x%llx, 0x%llx) lr 0x%llx", imp.module, imp.name, static_cast<unsigned long long>(ctx.gpr[3]),
                  static_cast<unsigned long long>(ctx.gpr[4]), static_cast<unsigned long long>(ctx.gpr[5]), static_cast<unsigned long long>(ctx.gpr[6]),
@@ -194,8 +218,18 @@ void syscall(Context& ctx, uint8_t* base) {
         if (t) {
             t->in_syscall.store(n + 1, std::memory_order_relaxed);
             t->syscalls.fetch_add(1, std::memory_order_relaxed);
+            t->syscall_hist[n]++;
         }
-        ctx.gpr[3] = static_cast<uint64_t>(slot.fn(ctx, base));
+        if (trace::on(trace::SYSCALL)) {
+            uint64_t a0 = ctx.gpr[3], a1 = ctx.gpr[4], a2 = ctx.gpr[5];
+            uint32_t lr = static_cast<uint32_t>(ctx.lr);
+            uint64_t t0 = trace::now_ns();
+            ctx.gpr[3] = static_cast<uint64_t>(slot.fn(ctx, base));
+            uint64_t us = (trace::now_ns() - t0) / 1000;
+            trace::emit(trace::T_SYSCALL, n, a0, a1, a2, ctx.gpr[3], (uint64_t(lr) << 32) | (us > 0xFFFFFFFFull ? 0xFFFFFFFFull : us));
+        } else {
+            ctx.gpr[3] = static_cast<uint64_t>(slot.fn(ctx, base));
+        }
         if (t) t->in_syscall.store(0, std::memory_order_relaxed);
         return;
     }

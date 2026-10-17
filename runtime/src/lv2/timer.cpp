@@ -45,7 +45,7 @@ void timer_thread() {
             soonest = std::min(soonest, t->next);
         }
         if (soonest == ~0ull) g_cv.wait_for(lk, std::chrono::milliseconds(100));
-        else g_cv.wait_for(lk, std::chrono::microseconds(soonest > now ? soonest - now : 0));
+        else g_cv.wait_for(lk, std::chrono::microseconds(static_cast<uint64_t>((soonest > now ? soonest - now : 0) / ppu::time_scale())));
     }
 }
 

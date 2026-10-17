@@ -1,6 +1,7 @@
 #include "runtime/log.h"
 #include "runtime/memory.h"
 #include "runtime/thread.h"
+#include "runtime/trace.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +10,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <thread>
 #include <map>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <algorithm>
 #include <chrono>
@@ -33,19 +36,40 @@ std::string symbol_of(DWORD64 addr) {
     return "?";
 }
 
-struct Watch {
-    uint32_t addr;
-    uint8_t* page;
-    bool reads;
-    int hits;
+struct Trap {
+    uint32_t addr = 0;
+    uint32_t len = 4;
+    bool reads = false;
+    bool has_val = false;
+    bool dump = false;
+    bool dumped = false;
+    uint32_t val = 0;
+    uint64_t hits = 0;
+    uint32_t logged = 0;
+    uint32_t burst_tid = 0;
+    bool burst_write = false;
+    uint32_t burst_lo = 0;
+    uint32_t burst_hi = 0;
+    uint32_t burst_n = 0;
+    uint64_t burst_t = 0;
 };
 
-Watch g_watches[4];
-int g_watch_count = 0;
-thread_local int t_stepping = -1;
-thread_local bool t_hit = false;
+struct PendingHit {
+    int trap;
+    uint32_t fault;
+    bool write;
+    CONTEXT ctx;
+};
 
-void log_stack(CONTEXT ctx, int depth) {
+std::vector<Trap> g_traps;
+std::unordered_map<uint32_t, DWORD> g_trap_pages;
+int g_watch_count = 0;
+uint32_t g_trap_max = 50;
+std::mutex g_trap_lock;
+thread_local uint32_t t_step_page = 0;
+thread_local std::vector<PendingHit> t_hits;
+
+std::string stack_string(CONTEXT ctx, int depth) {
     STACKFRAME64 frame{};
     frame.AddrPC.Offset = ctx.Rip;
     frame.AddrPC.Mode = AddrModeFlat;
@@ -58,53 +82,105 @@ void log_stack(CONTEXT ctx, int depth) {
         if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), GetCurrentThread(), &frame, &ctx, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) break;
         line += " <- " + symbol_of(frame.AddrPC.Offset);
     }
-    LOG_INFO("watch", "  %s", line.c_str());
+    return line;
+}
+
+void log_stack(CONTEXT ctx, int depth) { LOG_INFO("watch", "  %s", stack_string(ctx, depth).c_str()); }
+
+std::string current_thread_name() {
+    if (guest::Thread* t = guest::current()) return t->name;
+    PWSTR w = nullptr;
+    std::string name = "host";
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &w)) && w) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+        if (n > 1) {
+            name.resize(n - 1);
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, name.data(), n, nullptr, nullptr);
+        }
+        LocalFree(w);
+    }
+    return name;
+}
+
+void close_burst(int i) {
+    Trap& t = g_traps[i];
+    if (t.burst_n > 1) {
+        LOG_INFO("trap", "trap %d %s burst 0x%08x-0x%08x %u accesses", i, t.burst_write ? "write" : "read", t.burst_lo, t.burst_hi, t.burst_n);
+        if (trace::on(trace::TRAP)) trace::emit(trace::T_TRAP, uint32_t(i) | (uint32_t(t.burst_write) << 8) | 0x10000u, t.burst_lo, t.burst_hi, 0, t.burst_n);
+    }
+    t.burst_n = 0;
+}
+
+void process_hit(const PendingHit& h) {
+    Trap& t = g_traps[h.trap];
+    uint32_t word = t.len <= 4 ? t.addr : (h.fault & ~3u);
+    uint32_t value = vm::read32(word);
+    if (t.has_val && vm::read32(t.addr) != t.val) return;
+    uint32_t tid = GetCurrentThreadId();
+    uint64_t now = trace::now_ns();
+    std::lock_guard lk(g_trap_lock);
+    t.hits++;
+    if (t.burst_n && t.burst_tid == tid && t.burst_write == h.write && now - t.burst_t < 2000000 && h.fault + 64 >= t.burst_lo && h.fault <= t.burst_hi + 64) {
+        t.burst_lo = (std::min)(t.burst_lo, h.fault);
+        t.burst_hi = (std::max)(t.burst_hi, h.fault);
+        t.burst_n++;
+        t.burst_t = now;
+        return;
+    }
+    close_burst(h.trap);
+    t.burst_tid = tid;
+    t.burst_write = h.write;
+    t.burst_lo = t.burst_hi = h.fault;
+    t.burst_n = 1;
+    t.burst_t = now;
+    uint32_t stack_id = 0;
+    if (t.logged < g_trap_max) {
+        t.logged++;
+        std::string stack = stack_string(h.ctx, 10);
+        std::string who = current_thread_name();
+        LOG_INFO("trap", "trap %d %s 0x%08x = 0x%08x by %s%s", h.trap, h.write ? "write" : "read", h.fault, value, who.c_str(), t.logged == g_trap_max ? " (further hits not logged)" : "");
+        LOG_INFO("trap", "  %s", stack.c_str());
+        if (trace::on(trace::TRAP)) stack_id = trace::intern(stack);
+    }
+    if (trace::on(trace::TRAP)) trace::emit(trace::T_TRAP, uint32_t(h.trap) | (uint32_t(h.write) << 8), h.fault, value, stack_id, t.len <= 4 ? 0 : vm::read32(t.addr));
+    if (t.dump && !t.dumped) {
+        t.dumped = true;
+        char fn[64];
+        std::snprintf(fn, sizeof fn, "trap_%08x.bin", t.addr);
+        trace::dump_memory(fn);
+    }
 }
 
 LONG watch_handler(EXCEPTION_POINTERS* ep) {
     auto* rec = ep->ExceptionRecord;
-    if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP && t_stepping >= 0) {
-        Watch& w = g_watches[t_stepping];
-        t_stepping = -1;
+    if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP && t_step_page) {
+        uint32_t page = t_step_page - 1;
+        t_step_page = 0;
+        std::vector<PendingHit> hits;
+        hits.swap(t_hits);
+        for (const PendingHit& h : hits) process_hit(h);
         DWORD old;
-        VirtualProtect(w.page, 4096, w.reads ? PAGE_NOACCESS : PAGE_READONLY, &old);
-        if (t_hit) {
-            t_hit = false;
-            guest::Thread* t = guest::current();
-            char str[33] = {};
-            std::memcpy(str, vm::ptr(w.addr), 32);
-            for (char& ch : str) if (ch && (ch < 32 || ch > 126)) ch = '.';
-            LOG_INFO("watch", "0x%08x = 0x%08x '%s' (thread %s)", w.addr, vm::read32(w.addr), str, t ? t->name.c_str() : "host");
-        }
+        VirtualProtect(vm::g_base + (uint64_t(page) << 12), 4096, g_trap_pages[page], &old);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     bool is_write = rec->ExceptionInformation[0] == 1;
     auto* fault = reinterpret_cast<uint8_t*>(rec->ExceptionInformation[1]);
-    for (int i = 0; i < g_watch_count; i++) {
-        Watch& w = g_watches[i];
-        if (fault < w.page || fault >= w.page + 4096) continue;
-        if (!is_write && !w.reads) continue;
-        uint8_t* p = vm::g_base + w.addr;
-        bool in_range = w.reads ? (fault + 8 > p && fault < p + 0x200) : (fault + 8 > p && fault < p + 4);
-        if (in_range) {
-            if (is_write) {
-                t_hit = true;
-                log_stack(*ep->ContextRecord, 6);
-            } else if (w.hits < 40) {
-                guest::Thread* t = guest::current();
-                w.hits++;
-                LOG_INFO("watch", "read 0x%08x by %s", static_cast<uint32_t>(fault - vm::g_base), t ? t->name.c_str() : "host");
-                log_stack(*ep->ContextRecord, 8);
-            }
-        }
-        DWORD old;
-        VirtualProtect(w.page, 4096, PAGE_READWRITE, &old);
-        t_stepping = i;
-        ep->ContextRecord->EFlags |= 0x100;
-        return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault < vm::g_base || fault >= vm::g_base + 0x100000000ull) return EXCEPTION_CONTINUE_SEARCH;
+    uint32_t g = static_cast<uint32_t>(fault - vm::g_base);
+    auto it = g_trap_pages.find(g >> 12);
+    if (it == g_trap_pages.end()) return EXCEPTION_CONTINUE_SEARCH;
+    for (int i = 0; i < static_cast<int>(g_traps.size()); i++) {
+        const Trap& t = g_traps[i];
+        if (uint64_t(g) + 16 <= t.addr || uint64_t(g) >= uint64_t(t.addr) + t.len) continue;
+        if (!is_write && !t.reads) continue;
+        t_hits.push_back({i, g, is_write, *ep->ContextRecord});
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    DWORD old;
+    VirtualProtect(vm::g_base + (uint64_t(g >> 12) << 12), 4096, PAGE_READWRITE, &old);
+    t_step_page = (g >> 12) + 1;
+    ep->ContextRecord->EFlags |= 0x100;
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 LONG WINAPI handler(EXCEPTION_POINTERS* ep) {
@@ -188,10 +264,11 @@ void profile_thread(void* native, const char* name) {
             if (SuspendThread(h) == static_cast<DWORD>(-1)) return;
             CONTEXT c{};
             c.ContextFlags = CONTEXT_FULL;
-            DWORD64 pcs[3] = {};
+            static const int depth = std::getenv("GOWA_PROFILE_DEPTH") ? (std::min)(16, std::atoi(std::getenv("GOWA_PROFILE_DEPTH"))) : 3;
+            DWORD64 pcs[16] = {};
             int n = 0;
             if (GetThreadContext(h, &c)) {
-                for (; n < 3; n++) {
+                for (; n < depth; n++) {
                     pcs[n] = c.Rip;
                     DWORD64 image = 0;
                     PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
@@ -241,38 +318,65 @@ void log_here(const char* tag) {
 }
 
 void rearm_watch() {
-    for (int i = 0; i < g_watch_count; i++) {
+    for (auto& [page, prot] : g_trap_pages) {
         DWORD old;
-        VirtualProtect(g_watches[i].page, 4096, g_watches[i].reads ? PAGE_NOACCESS : PAGE_READONLY, &old);
+        VirtualProtect(vm::g_base + (uint64_t(page) << 12), 4096, prot, &old);
+    }
+    uint64_t now = trace::now_ns();
+    std::lock_guard lk(g_trap_lock);
+    for (int i = 0; i < static_cast<int>(g_traps.size()); i++) {
+        if (g_traps[i].burst_n && now - g_traps[i].burst_t > 50000000) close_burst(i);
     }
 }
 
 void arm_watch() {
-    const char* env = std::getenv("GOWA_WATCH");
-    if (!env) return;
+    const char* env = std::getenv("GOWA_TRAP");
+    if (!env) env = std::getenv("GOWA_WATCH");
+    if (!env || g_watch_count) return;
+    if (const char* m = std::getenv("GOWA_TRAP_MAX")) g_trap_max = static_cast<uint32_t>(std::atoi(m));
     std::string list = env;
+    for (char& ch : list) if (ch == ';') ch = ',';
     size_t pos = 0;
-    while (pos < list.size() && g_watch_count < 4) {
+    while (pos < list.size()) {
         size_t end = list.find(',', pos);
         if (end == std::string::npos) end = list.size();
         std::string item = list.substr(pos, end - pos);
-        bool reads = !item.empty() && item[0] == 'r';
-        if (reads) item = item.substr(1);
-        uint32_t addr = static_cast<uint32_t>(std::strtoul(item.c_str(), nullptr, 16));
-        Watch& w = g_watches[g_watch_count];
-        w.addr = addr;
-        w.page = vm::g_base + (addr & ~0xFFFu);
-        w.reads = reads;
-        w.hits = 0;
-        DWORD old;
-        if (VirtualProtect(w.page, 4096, reads ? PAGE_NOACCESS : PAGE_READONLY, &old)) {
-            g_watch_count++;
-            LOG_INFO("watch", "watching 0x%08x", addr);
-        } else {
-            LOG_WARN("watch", "cannot watch 0x%08x (page not committed)", addr);
-        }
         pos = end + 1;
+        if (item.empty()) continue;
+        Trap t;
+        if (item[0] == 'r') {
+            t.reads = true;
+            item = item.substr(1);
+        }
+        size_t bang = item.find('!');
+        if (bang != std::string::npos) {
+            t.dump = item.substr(bang + 1) == "dump";
+            item = item.substr(0, bang);
+        }
+        size_t eq = item.find('=');
+        if (eq != std::string::npos) {
+            t.has_val = true;
+            t.val = static_cast<uint32_t>(std::strtoul(item.c_str() + eq + 1, nullptr, 16));
+            item = item.substr(0, eq);
+        }
+        size_t plus = item.find('+');
+        size_t dash = item.find('-');
+        t.addr = static_cast<uint32_t>(std::strtoul(item.c_str(), nullptr, 16));
+        if (plus != std::string::npos) t.len = static_cast<uint32_t>(std::strtoul(item.c_str() + plus + 1, nullptr, 16));
+        else if (dash != std::string::npos) t.len = static_cast<uint32_t>(std::strtoul(item.c_str() + dash + 1, nullptr, 16)) - t.addr;
+        if (!t.len) t.len = 4;
+        g_traps.push_back(t);
     }
+    for (size_t i = 0; i < g_traps.size(); i++) {
+        const Trap& t = g_traps[i];
+        for (uint64_t p = t.addr >> 12; p <= (uint64_t(t.addr) + t.len - 1) >> 12; p++) {
+            DWORD& prot = g_trap_pages[static_cast<uint32_t>(p)];
+            prot = (t.reads || prot == PAGE_NOACCESS) ? PAGE_NOACCESS : PAGE_READONLY;
+        }
+        LOG_INFO("trap", "trap %zu: %s 0x%08x+0x%x%s%s", i, t.reads ? "read/write" : "write", t.addr, t.len, t.has_val ? " value-match" : "", t.dump ? " dump" : "");
+    }
+    g_watch_count = static_cast<int>(g_traps.size());
+    rearm_watch();
 }
 
 }
