@@ -44,6 +44,8 @@ SpuThread::SpuThread() {
     ls = static_cast<uint8_t*>(_aligned_malloc(LS_SIZE + 16, 128));
     std::memset(ls, 0, LS_SIZE + 16);
     ctx.ls = ls;
+    ctx.line_epoch = line_epoch.get();
+    ctx.epoch = &ls_epoch;
 }
 
 SpuThread::~SpuThread() { _aligned_free(ls); }
@@ -364,7 +366,10 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         if (reported.fetch_add(1) < 20) {
             LOG_ERROR("spu", "thread 0x%x '%s' DMA %s cmd 0x%02x unmapped ea 0x%08x size 0x%x lsa 0x%05x pc 0x%05x", id, name.c_str(), put ? "PUT" : "GET", cmd, ea, size, lsa, ctx.pc);
         }
-        if (!put) std::memset(ls + lsa, 0, size);
+        if (!put) {
+            std::memset(ls + lsa, 0, size);
+            mark_ls(lsa, size);
+        }
         return;
     }
     if (trace::on(trace::DMA)) trace::emit(trace::T_DMA, slot | (uint32_t(put) << 8) | (cmd << 16), ea, lsa, size, ctx.pc, id);
@@ -387,8 +392,12 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
             }
         } else {
             std::memcpy(p, ls + lsa, size);
+            if (group) {
+                if (SpuThread* t = group->by_slot((ea - 0xF0000000u) / 0x100000)) t->mark_ls((ea - 0xF0000000u) % 0x100000, size);
+            }
         }
     } else if (ea < 0xF0000000u) {
+        mark_ls(lsa, size);
         uint32_t done = 0;
         alignas(16) uint8_t line[128];
         while (done < size) {
@@ -400,6 +409,7 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         }
     } else {
         std::memcpy(ls + lsa, p, size);
+        mark_ls(lsa, size);
     }
 }
 
@@ -473,6 +483,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
         rtime = ver;
         std::memcpy(rdata, snap, 128);
         std::memcpy(ls + (lsa & 0x3FF80), snap, 128);
+        mark_ls(lsa & 0x3FF80, 128);
         atomic_stat = 4;
         atomic_stat_count = true;
         return;
@@ -601,12 +612,15 @@ void SpuThread::deploy() {
             for (uint32_t i = 0; i + 4 <= size; i += 4) std::memcpy(ls + lsa + i, &be, 4);
         }
     }
+    mark_all_ls();
 }
 
 void SpuThread::start() {
     deploy();
     ctx = Context{};
     ctx.ls = ls;
+    ctx.line_epoch = line_epoch.get();
+    ctx.epoch = &ls_epoch;
     ctx.gpr[1].u32[3] = 0x3FFF0;
     for (int i = 0; i < 4; i++) ctx.gpr[3 + i].u64[1] = args[i];
     ctx.pc = image_entry & 0x3FFFC;
@@ -791,6 +805,8 @@ void SpuThread::run() {
         return true;
     };
     std::vector<const CompiledBlock*> block_cache(aot_on ? LS_SIZE / 4 : 0, nullptr);
+    std::vector<uint32_t> block_valid(aot_on ? LS_SIZE / 4 : 0, 0);
+    static const bool no_fresh = std::getenv("GOWA_SPU_NO_FRESH") != nullptr;
     uint32_t irq_countdown = 64;
     const bool rec = aot::recording();
     bool block_start = true;
@@ -802,9 +818,14 @@ void SpuThread::run() {
             if (aot_on) {
                 const CompiledBlock*& slot = block_cache[ctx.pc >> 2];
                 const CompiledBlock* b = slot;
-                if (!b || std::memcmp(ls + ctx.pc, b->code, b->words * 4) != 0) {
-                    b = aot::find(ls, ctx.pc);
-                    slot = b;
+                uint32_t& valid = block_valid[ctx.pc >> 2];
+                if (!b || no_fresh || !ls_fresh(ctx.pc, b->words, valid)) {
+                    uint32_t e = ls_epoch.load(std::memory_order_acquire);
+                    if (!b || std::memcmp(ls + ctx.pc, b->code, b->words * 4) != 0) {
+                        b = aot::find(ls, ctx.pc);
+                        slot = b;
+                    }
+                    valid = b ? e : 0;
                 }
                 if (b && verify && verify_block(b)) {
                     n += b->words;

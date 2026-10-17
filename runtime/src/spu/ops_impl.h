@@ -41,6 +41,7 @@ SPU_INLINE v128 load_ls(const Context& c, uint32_t addr) {
 
 SPU_INLINE void store_ls(Context& c, uint32_t addr, const v128& v) {
     _mm_storeu_si128(reinterpret_cast<__m128i*>(c.ls + (addr & LS_MASK)), ppu::bswap128(v.vi));
+    if (c.line_epoch) c.line_epoch[(addr & LS_MASK) >> 7].store(c.epoch->load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 SPU_INLINE v128 splat32(uint32_t v) { v128 r; r.vi = _mm_set1_epi32(static_cast<int32_t>(v)); return r; }

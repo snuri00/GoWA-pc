@@ -24,6 +24,27 @@ struct SpuThread : Host {
     Group* group = nullptr;
     Context ctx{};
     uint8_t* ls = nullptr;
+    std::atomic<uint32_t> ls_epoch{1};
+    std::atomic<uint32_t> ls_all_epoch{1};
+    std::unique_ptr<std::atomic<uint32_t>[]> line_epoch{new std::atomic<uint32_t>[0x40000 / 128]()};
+    void mark_ls(uint32_t lsa, uint32_t size) {
+        if (!size) return;
+        uint32_t e = ls_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+        uint32_t first = (lsa & 0x3FFFF) >> 7, last = ((lsa & 0x3FFFF) + size - 1) >> 7;
+        for (uint32_t l = first; l <= last && l < 0x40000 / 128; l++) line_epoch[l].store(e, std::memory_order_release);
+    }
+    void mark_all_ls() {
+        uint32_t e = ls_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+        ls_all_epoch.store(e, std::memory_order_release);
+    }
+    bool ls_fresh(uint32_t pc, uint32_t words, uint32_t validated) const {
+        if (!validated || ls_all_epoch.load(std::memory_order_acquire) > validated) return false;
+        uint32_t first = pc >> 7, last = (pc + words * 4 - 1) >> 7;
+        for (uint32_t l = first; l <= last && l < 0x40000 / 128; l++) {
+            if (line_epoch[l].load(std::memory_order_acquire) > validated) return false;
+        }
+        return true;
+    }
     uint32_t image_entry = 0;
     std::vector<std::array<uint32_t, 4>> segments;
     uint64_t args[4] = {};

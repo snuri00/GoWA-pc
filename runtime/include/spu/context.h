@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include "ppu/context.h"
 
 #include <cstdint>
@@ -17,6 +18,8 @@ struct Context {
     uint32_t pc = 0;
     uint32_t srr0 = 0;
     uint8_t* ls = nullptr;
+    std::atomic<uint32_t>* line_epoch = nullptr;
+    const std::atomic<uint32_t>* epoch = nullptr;
     bool interrupts_enabled = false;
     bool irq_check = false;
     bool halted = false;
