@@ -156,11 +156,11 @@ LONG watch_handler(EXCEPTION_POINTERS* ep) {
     if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP && t_step_page) {
         uint32_t page = t_step_page - 1;
         t_step_page = 0;
-        DWORD old;
-        VirtualProtect(vm::g_base + (uint64_t(page) << 12), 4096, g_trap_pages[page], &old);
         std::vector<PendingHit> hits;
         hits.swap(t_hits);
         for (const PendingHit& h : hits) process_hit(h);
+        DWORD old;
+        VirtualProtect(vm::g_base + (uint64_t(page) << 12), 4096, g_trap_pages[page], &old);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;

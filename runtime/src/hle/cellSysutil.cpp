@@ -165,22 +165,12 @@ HLE_FUNC(cellSysutil, cellMsgDialogOpen2) {
     ret(ctx, 0);
 }
 
-HLE_FUNC(cellSysutil, cellSaveDataAutoLoad2) {
-    LOG_WARN("cellSysutil", "cellSaveDataAutoLoad2('%s') -> NODATA", gstr(a32(ctx, 1)).c_str());
-    ret(ctx, static_cast<int32_t>(0x8002b40b));
-}
-
 HLE_FUNC(cellSysutil, cellSaveDataListAutoLoad) {
     ret(ctx, static_cast<int32_t>(0x8002b40b));
 }
 
 HLE_FUNC(cellSysutil, cellSaveDataListLoad2) {
     ret(ctx, static_cast<int32_t>(0x8002b40b));
-}
-
-HLE_FUNC(cellSysutil, cellSaveDataAutoSave2) {
-    LOG_WARN("cellSysutil", "cellSaveDataAutoSave2('%s') not implemented", gstr(a32(ctx, 1)).c_str());
-    ret(ctx, 0);
 }
 
 HLE_FUNC(cellSysutil, cellSaveDataDelete2) {

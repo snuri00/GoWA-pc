@@ -25,6 +25,7 @@ void rsx_status();
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -84,12 +85,25 @@ int main(int argc, char** argv) {
     if (!main_thread) return 1;
     uint32_t sp = main_thread->stack_addr + main_thread->stack_size;
     std::string self_path = vfs::patch_sfo().strings.empty() ? "/dev_bdvd/PS3_GAME/USRDIR/GOWA.SELF" : "/dev_hdd0/game/BCES01741/USRDIR/GOWA.SELF";
-    const char* args[] = {self_path.c_str()};
-    uint32_t argv_addr = push_strings(sp, args, 1);
+    std::vector<std::string> arg_list = {self_path};
+    if (const char* extra = std::getenv("GOWA_ARGS")) {
+        std::string e = extra;
+        size_t pos = 0;
+        while (pos < e.size()) {
+            size_t end = e.find(' ', pos);
+            if (end == std::string::npos) end = e.size();
+            if (end > pos) arg_list.push_back(e.substr(pos, end - pos));
+            pos = end + 1;
+        }
+    }
+    std::vector<const char*> args;
+    for (const std::string& a : arg_list) args.push_back(a.c_str());
+    LOG_INFO("main", "argc %zu%s%s", args.size(), args.size() > 1 ? " extra: " : "", std::getenv("GOWA_ARGS") ? std::getenv("GOWA_ARGS") : "");
+    uint32_t argv_addr = push_strings(sp, args.data(), static_cast<int>(args.size()));
     uint32_t envp_addr = push_strings(sp, nullptr, 0);
     ppu::Context& c = main_thread->ctx;
     c.gpr[1] = (sp - 0x70) & ~15u;
-    c.gpr[3] = 1;
+    c.gpr[3] = args.size();
     c.gpr[4] = argv_addr;
     c.gpr[5] = envp_addr;
     c.gpr[6] = 0;
