@@ -4,6 +4,7 @@
 #include "gpu/rsx.h"
 #include "ppu/ops.h"
 #include "runtime/reservation.h"
+#include "runtime/hostsleep.h"
 
 #include <atomic>
 #include <chrono>
@@ -321,6 +322,8 @@ void fifo_thread() {
                 else Sleep(1);
                 continue;
             }
+            static const uint32_t delay_us = std::getenv("GOWA_FIFO_DELAY_US") ? std::atoi(std::getenv("GOWA_FIFO_DELAY_US")) : 0;
+            if (delay_us) host::sleep_us(delay_us);
             vm::write32(ctrl + 0x44, target);
             continue;
         }
@@ -348,6 +351,28 @@ void fifo_thread() {
         uint32_t count = (cmd >> 18) & 0x7FF;
         uint32_t method = cmd & 0xFFFC;
         bool noninc = (cmd & 0xE0030003) == 0x40000000;
+        static const uint32_t log_method = std::getenv("GOWA_FIFO_LOG_METHOD") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_FIFO_LOG_METHOD"), nullptr, 0)) : 0;
+        static uint32_t logged_packets = 0;
+        if (log_method && method <= log_method && log_method < method + count * 4 && logged_packets < 400 && (method != 0x1EFC || reader.read(ea + 4) < 8)) {
+            logged_packets++;
+            std::string args;
+            for (uint32_t i = 0; i < count && i < 20; i++) {
+                char b[12];
+                std::snprintf(b, sizeof b, " %08x", reader.read(ea + 4 + i * 4));
+                args += b;
+            }
+            LOG_INFO("rsxpkt", "get 0x%08x cmd 0x%08x method 0x%04x count %u%s:%s", get, cmd, method, count, noninc ? " noninc" : "", args.c_str());
+            if (std::getenv("GOWA_FIFO_RECHECK")) {
+                host::sleep_us(2000);
+                std::string later;
+                for (uint32_t i = 0; i < count + 1 && i < 21; i++) {
+                    char b[12];
+                    std::snprintf(b, sizeof b, " %08x", vm::read32(ea + i * 4));
+                    later += b;
+                }
+                LOG_INFO("rsxpkt", "  2ms later:%s", later.c_str());
+            }
+        }
         for (uint32_t i = 0; i < count; i++) {
             execute(noninc ? method : method + i * 4, reader.read(ea + 4 + i * 4));
         }
