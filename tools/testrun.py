@@ -42,6 +42,13 @@ def pad_ingame(duration):
     return ev
 
 
+def pad_idle(duration):
+    ev = [("cross", t) for t in range(10, 27, 4)]
+    for t in range(30, 66, 5):
+        ev += [("start", t), ("cross", t + 2)]
+    return ev
+
+
 def pad_boot(duration):
     return []
 
@@ -51,6 +58,7 @@ SCENARIOS = {
     "menu": (95, pad_menu, 5.0, 30.0),
     "ingame": (480, pad_ingame, 20.0, 150.0),
     "continue": (240, pad_continue, 10.0, 80.0),
+    "idle": (600, pad_idle, 30.0, 80.0),
 }
 
 

@@ -395,6 +395,25 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         return;
     }
     if (put) {
+        static const uint32_t put_find = std::getenv("GOWA_SPU_PUT_FIND") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_SPU_PUT_FIND"), nullptr, 16)) : 0;
+        static std::atomic<int> put_found{0};
+        static const double put_find_at = std::getenv("GOWA_SPU_PUT_FIND_AT") ? std::atof(std::getenv("GOWA_SPU_PUT_FIND_AT")) : 0.0;
+        if (put_find && put_found.load(std::memory_order_relaxed) < 12 && logging::uptime() >= put_find_at) {
+            uint32_t be = __builtin_bswap32(put_find);
+            for (uint32_t i = 0; i + 4 <= size; i += 4) {
+                if (std::memcmp(ls + lsa + i, &be, 4) == 0) {
+                    int n = put_found.fetch_add(1);
+                    LOG_INFO("spudma", "thread 0x%x '%s' pc 0x%05x PUT ea 0x%08x lsa 0x%05x size 0x%x contains 0x%08x at +0x%x", id, name.c_str(), ctx.pc, ea, lsa, size, put_find, i);
+                    char fn[64];
+                    std::snprintf(fn, sizeof fn, "spu_put_%d_%08x.ls", n, ea);
+                    if (FILE* f = std::fopen(fn, "wb")) {
+                        std::fwrite(ls, 1, LS_SIZE, f);
+                        std::fclose(f);
+                    }
+                    break;
+                }
+            }
+        }
         uint32_t guest = ea;
         if (ea < 0xF0000000u) {
             uint32_t done = 0;

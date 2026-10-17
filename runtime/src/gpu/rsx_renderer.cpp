@@ -1181,7 +1181,7 @@ Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& c
         uint32_t tea = lv2::rsx_address(t.offset, (t.format & 3) - 1);
         if (std::getenv("GOWA_TEX_DUMP") && tea && std::string(g_bind_kind) == "memory") dump_texture(t, tea);
         uint32_t w0 = tea && readable(tea, 64) ? vm::read32(tea) : 0, w1 = tea && readable(tea, 64) ? vm::read32(tea + 4) : 0, w8 = tea && readable(tea, 64) ? vm::read32(tea + 32) : 0;
-        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s data %08x %08x %08x addr 0x%x c1 0x%x c3 0x%x", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind, w0, w1, w8, t.address, t.control1, t.control3);
+        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s data %08x %08x %08x addr 0x%x c1 0x%x c3 0x%x filter 0x%x", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind, w0, w1, w8, t.address, t.control1, t.control3, t.filter);
     }
     return b;
 }
@@ -2477,6 +2477,20 @@ void resolve_zpass() {
     if (g_qpool && g_qused) {
         std::vector<uint32_t> res(g_qused, 0);
         VkResult r = vkGetQueryPoolResults(vk().device, g_qpool, 0, g_qused, res.size() * 4, res.data(), 4, 0);
+        static uint32_t frames = 0, reports = 0, zeros = 0, notready = 0, empty = 0;
+        frames++;
+        if (r == VK_NOT_READY) notready++;
+        for (const PendingReport& p : g_pending_reports) {
+            reports++;
+            if (p.queries.empty()) empty++;
+            uint64_t sum = 0;
+            for (uint32_t q : p.queries) if (q < res.size()) sum += res[q];
+            if (!sum) zeros++;
+        }
+        if (frames % 120 == 0) {
+            LOG_INFO("rsx", "zpass: %u reports, %u zero, %u without queries, %u not-ready frames, %u queries last frame", reports, zeros, empty, notready, g_qused);
+            reports = zeros = notready = empty = 0;
+        }
         if (r == VK_SUCCESS || r == VK_NOT_READY) {
             for (const PendingReport& p : g_pending_reports) {
                 uint64_t sum = 0;
