@@ -2200,6 +2200,7 @@ struct Dump {
     uint32_t height;
     VkFormat format;
     bool main;
+    std::string name;
 };
 
 std::vector<Dump> g_dumps;
@@ -2227,10 +2228,26 @@ void schedule_dumps() {
     }
 }
 
+void schedule_snapshot(Surface* s, uint32_t w, uint32_t h, const std::string& name) {
+    if (s->depth() || format_bytes(s->format) != 4) return;
+    w = std::min(w, s->width);
+    h = std::min(h, s->height);
+    RingAlloc a;
+    if (!ring_alloc(uint64_t(w) * h * 4, 16, a)) return;
+    transition(s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy c{};
+    c.bufferOffset = a.offset;
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(frame_cmd(), s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, a.buffer, 1, &c);
+    g_dumps.push_back({a.ptr, s->offset, w, h, s->format, s->main, name});
+}
+
 void complete_dumps() {
     for (const Dump& d : g_dumps) {
-        char fn[96];
-        std::snprintf(fn, sizeof fn, "surface_%s_%08x_%ux%u_f%d.ppm", d.main ? "main" : (d.format == VK_FORMAT_D24_UNORM_S8_UINT ? "depth" : "local"), d.offset, d.width, d.height, int(d.format));
+        char fn[512];
+        if (!d.name.empty()) std::snprintf(fn, sizeof fn, "%s", d.name.c_str());
+        else std::snprintf(fn, sizeof fn, "surface_%s_%08x_%ux%u_f%d.ppm", d.main ? "main" : (d.format == VK_FORMAT_D24_UNORM_S8_UINT ? "depth" : "local"), d.offset, d.width, d.height, int(d.format));
         FILE* f = std::fopen(fn, "wb");
         if (!f) continue;
         std::fprintf(f, "P6\n%u %u\n255\n", d.width, d.height);
@@ -2279,7 +2296,7 @@ void complete_dumps() {
                 std::fclose(af);
             }
         }
-        LOG_INFO("rsx", "dumped %s z %f..%f", fn, zmin, zmax);
+        if (d.name.empty()) LOG_INFO("rsx", "dumped %s z %f..%f", fn, zmin, zmax);
     }
     g_dumps.clear();
 }
@@ -2559,8 +2576,18 @@ bool present(uint32_t buffer_id) {
             }
         }
     }
+    static const double snap_every = std::getenv("GOWA_SNAP_EVERY") ? std::atof(std::getenv("GOWA_SNAP_EVERY")) : 0.0;
+    static const double snap_from = std::getenv("GOWA_SNAP_FROM") ? std::atof(std::getenv("GOWA_SNAP_FROM")) : 0.0;
+    static const std::string snap_dir = std::getenv("GOWA_SNAP_DIR") ? std::getenv("GOWA_SNAP_DIR") : ".";
+    static double next_snap = snap_from;
     for (auto& [key, s] : g_surfaces) {
         if (s->offset == offset && !s->depth() && s->width >= width && s->height >= height) {
+            if (snap_every > 0.0 && elapsed >= next_snap) {
+                char name[64];
+                std::snprintf(name, sizeof name, "/snap_%07.1f.ppm", elapsed);
+                schedule_snapshot(s.get(), width, height, snap_dir + name);
+                while (next_snap <= elapsed) next_snap += snap_every;
+            }
             uint64_t pt = ticks();
             present_image(s->image, s->layout, width, height);
             g_stats.present_ticks += ticks() - pt;
