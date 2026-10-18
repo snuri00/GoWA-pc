@@ -32,6 +32,8 @@ struct SpuThread : Host {
         std::vector<uint8_t> data;
     };
     std::array<DmaSnap, 16> dma_snaps{};
+    std::unique_ptr<uint32_t[]> line_src{new uint32_t[0x40000 / 128]()};
+    uint32_t cur_src = 0;
     uint32_t dma_snap_next = 0;
     void remember_get(uint32_t ea, uint32_t size, uint32_t lsa);
     bool merge_put(uint32_t ea, uint32_t size, uint32_t lsa);

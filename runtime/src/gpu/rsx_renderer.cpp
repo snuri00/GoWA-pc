@@ -239,6 +239,28 @@ VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
 bool g_ready = false;
 bool g_trace = false;
 int g_trace_serial = 0;
+uint32_t g_frame_draw = 0;
+struct VbCheck {
+    uint32_t draw, attr, ea, size;
+    uint64_t hash;
+};
+std::vector<VbCheck> g_vb_checks;
+uint64_t vb_hash(uint32_t ea, uint32_t size) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t* p = vm::ptr(ea);
+    for (uint32_t i = 0; i < size; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+uint32_t g_skip_lo = 0, g_skip_hi = 0;
+bool g_skip_init = [] {
+    if (const char* e = std::getenv("GOWA_SKIP_DRAWS")) {
+        g_skip_lo = static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+        const char* d = std::strchr(e, '-');
+        g_skip_hi = d ? static_cast<uint32_t>(std::strtoul(d + 1, nullptr, 0)) : g_skip_lo;
+        return true;
+    }
+    return false;
+}();
 uint32_t g_trace_draws = 0;
 void schedule_dumps();
 uint32_t g_experiment = std::getenv("GOWA_GPU_EXPERIMENT") ? std::atoi(std::getenv("GOWA_GPU_EXPERIMENT")) : 0;
@@ -1857,6 +1879,10 @@ bool draw() {
                 else if (freq > 1) element = (div_ops >> i) & 1 ? idx % freq : idx / freq;
                 decode_attribute(type, size, vm::ptr(base + element * stride), out + v * 4);
             }
+            if (g_trace && stride && freq <= 1) {
+                uint32_t bytes = (vmax + 1) * stride;
+                g_vb_checks.push_back({g_frame_draw, i, base, bytes, vb_hash(base, bytes)});
+            }
         }
         vbufs[i] = a.buffer;
         voffs[i] = a.offset;
@@ -1869,6 +1895,19 @@ bool draw() {
     if (!ring_alloc(indices.size() * 4, 16, ib)) return skip(__LINE__);
     uint32_t* idx_out = reinterpret_cast<uint32_t*>(ib.ptr);
     for (size_t i = 0; i < indices.size(); i++) idx_out[i] = indices[i] == RESTART ? RESTART : indices[i] - vmin;
+    static const char* geom_dir = std::getenv("GOWA_DUMP_GEOM");
+    if (g_trace && geom_dir && vdata[0]) {
+        char fn[512];
+        std::snprintf(fn, sizeof fn, "%s/geom_%04u.bin", geom_dir, g_frame_draw);
+        if (FILE* f = std::fopen(fn, "wb")) {
+            uint32_t hdr[8] = {0x4D4F4547u, g_frame_draw, g_prim, vcount, static_cast<uint32_t>(indices.size()), static_cast<uint32_t>(vstrides[0]), colors.empty() ? 0u : colors[0]->offset, R(COLOR_MASK)};
+            std::fwrite(hdr, 4, 8, f);
+            std::fwrite(&g_vp_constants[264 * 4], 4, 16, f);
+            std::fwrite(vdata[0], 4, size_t(vstrides[0] ? vcount : 1) * 4, f);
+            std::fwrite(idx_out, 4, indices.size(), f);
+            std::fclose(f);
+        }
+    }
 
     PipelineKey k{};
     k.vp = reinterpret_cast<uint64_t>(vp->module);
@@ -1901,7 +1940,7 @@ bool draw() {
             RingAlloc dummy;
             (void)dummy;
         }
-        LOG_INFO("rsx", "draw prim %u idx %zu verts %u [%u..%u] targets %zu c0 0x%x fmt %u depth 0x%x %ux%u scissor %u,%u-%u,%u vs %.3f %.3f %.3f off %.3f %.3f %.3f fptex 0x%x inline %d blend 0x%x mask 0x%x omask 0x%x", g_prim,
+        LOG_INFO("rsx", "draw #%u prim %u idx %zu verts %u [%u..%u] targets %zu c0 0x%x fmt %u depth 0x%x %ux%u scissor %u,%u-%u,%u vs %.3f %.3f %.3f off %.3f %.3f %.3f fptex 0x%x inline %d blend 0x%x mask 0x%x omask 0x%x", g_frame_draw, g_prim,
                  indices.size(), vcount, vmin, vmax, colors.size(), colors.empty() ? 0 : colors[0]->offset, R(SURFACE_FORMAT) & 0x1F, depth ? depth->offset : 0, w, h, x0, y0, x1, y1, vs.scale[0],
                  vs.scale[1], vs.scale[2], vs.offset[0], vs.offset[1], vs.offset[2], fp->textures, inline_draw, k.blend_mask, k.write_masks, vs.flags[0]);
         (void)p0;
@@ -1919,7 +1958,7 @@ bool draw() {
             if (!(vp->inputs & (1u << i))) continue;
             uint32_t f = R(VERTEX_ARRAY_FORMAT + i * 4);
             const float* d = vdata[i];
-            LOG_INFO("rsx", "  input %u fmt 0x%x off 0x%x stride %u v0 %g %g %g %g", i, f, R(VERTEX_ARRAY_OFFSET + i * 4), unsigned(vstrides[i]), d ? d[0] : 0, d ? d[1] : 0, d ? d[2] : 0, d ? d[3] : 0);
+            LOG_INFO("rsx", "  input %u fmt 0x%x off 0x%x stride %u idxbuf 0x%x v0 %g %g %g %g", i, f, R(VERTEX_ARRAY_OFFSET + i * 4), unsigned(vstrides[i]), lv2::rsx_address(R(INDEX_ARRAY_ADDRESS), R(INDEX_ARRAY_DMA) & 0xF), d ? d[0] : 0, d ? d[1] : 0, d ? d[2] : 0, d ? d[3] : 0);
         }
         if (vdata[0] && vstrides[0] == 16 && indices.size() >= 3) {
             const float* m = &g_vp_constants[264 * 4];
@@ -2032,7 +2071,10 @@ bool draw() {
         qidx = g_qused++;
         vkCmdBeginQuery(cmd, g_qpool, qidx, vk().features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     }
-    if (!(g_experiment & 1)) vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    uint32_t draw_index = g_frame_draw++;
+    static const bool skip_color_only = std::getenv("GOWA_SKIP_COLOR_ONLY") != nullptr;
+    bool skip_draw = g_skip_init && draw_index >= g_skip_lo && draw_index <= g_skip_hi && (!skip_color_only || k.write_masks != 0);
+    if (!(g_experiment & 1) && !skip_draw) vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
     if (query) {
         vkCmdEndQuery(cmd, g_qpool, qidx);
         g_counter_queries.push_back(qidx);
@@ -2515,6 +2557,17 @@ uint32_t zpass_value(uint32_t ea) {
 }
 
 void frame_complete() {
+    g_frame_draw = 0;
+    if (!g_vb_checks.empty()) {
+        uint32_t changed = 0;
+        for (const VbCheck& c : g_vb_checks) {
+            if (vm::is_mapped(c.ea) && vb_hash(c.ea, c.size) != c.hash) {
+                if (changed++ < 40) LOG_WARN("rsx", "vertex data of draw #%u attr %u at 0x%08x+0x%x changed after the draw", c.draw, c.attr, c.ea, c.size);
+            }
+        }
+        LOG_INFO("rsx", "vertex recheck: %u of %zu arrays changed after their draw", changed, g_vb_checks.size());
+        g_vb_checks.clear();
+    }
     resolve_zpass();
     complete_writebacks();
     complete_dumps();

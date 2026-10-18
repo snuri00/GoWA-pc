@@ -9,6 +9,7 @@
 #include "runtime/reservation.h"
 
 #include <algorithm>
+#include <thread>
 #include <mutex>
 #include <map>
 #include <unordered_map>
@@ -424,6 +425,48 @@ bool put_merge_enabled() {
     return on;
 }
 
+namespace {
+struct JobStat {
+    uint64_t entries = 0;
+    uint32_t wid = 0;
+    uint32_t pc = 0;
+};
+std::mutex g_job_lock;
+std::map<uint32_t, JobStat> g_jobs;
+}
+
+void note_job(uint32_t id, uint32_t wid, uint32_t src, uint32_t pc, int mode) {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                std::vector<std::pair<uint32_t, JobStat>> v;
+                {
+                    std::lock_guard lk(g_job_lock);
+                    v.assign(g_jobs.begin(), g_jobs.end());
+                }
+                std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.entries > b.second.entries; });
+                std::string line;
+                for (size_t i = 0; i < v.size() && i < 16; i++) {
+                    char b[80];
+                    std::snprintf(b, sizeof b, " [code %08x wid %u pc %05x n %llu]", v[i].first, v[i].second.wid, v[i].second.pc, static_cast<unsigned long long>(v[i].second.entries));
+                    line += b;
+                }
+                LOG_INFO("spujob", "top:%s", line.c_str());
+            }
+        }).detach();
+    });
+    {
+        std::lock_guard lk(g_job_lock);
+        JobStat& j = g_jobs[src];
+        j.entries++;
+        j.wid = wid;
+        j.pc = pc;
+    }
+    if (mode >= 2) LOG_INFO("spujob", "thread 0x%x enters code %08x wid %u pc 0x%05x", id, src, wid, pc);
+}
+
 void SpuThread::remember_get(uint32_t ea, uint32_t size, uint32_t lsa) {
     DmaSnap* slot_ptr = nullptr;
     for (DmaSnap& d : dma_snaps) {
@@ -581,6 +624,7 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
             done += chunk;
         }
         if (snap) remember_get(ea, size, lsa);
+        for (uint32_t l = lsa >> 7; l <= ((lsa + size - 1) >> 7) && l < 0x40000 / 128; l++) line_src[l] = ea;
     } else {
         std::memcpy(ls + lsa, p, size);
         mark_ls(lsa, size);
@@ -990,10 +1034,20 @@ void SpuThread::run() {
     const bool rec = aot::recording();
     bool block_start = true;
     uint32_t block_len = 0;
+    static const int job_log = std::getenv("GOWA_SPU_JOBS") ? std::atoi(std::getenv("GOWA_SPU_JOBS")) : 0;
     for (;;) {
         if (block_start) {
             block_start = false;
             block_len = 0;
+            if (job_log) {
+                uint32_t src = line_src[ctx.pc >> 7];
+                if (src != cur_src) {
+                    cur_src = src;
+                    uint32_t wid;
+                    std::memcpy(&wid, ls + 0x1dc, 4);
+                    note_job(id, __builtin_bswap32(wid), src, ctx.pc, job_log);
+                }
+            }
             if (aot_on) {
                 const CompiledBlock*& slot = block_cache[ctx.pc >> 2];
                 const CompiledBlock* b = slot;
