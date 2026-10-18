@@ -1,3 +1,4 @@
+#include <immintrin.h>
 #include "gpu/presenter.h"
 #include "gpu/rsx.h"
 #include "runtime/log.h"
@@ -311,28 +312,32 @@ uint64_t fnv(const void* data, size_t size, uint64_t h = 1469598103934665603ull)
 }
 
 uint64_t fast_hash(const uint8_t* p, size_t size) {
-    uint64_t h = 0x9E3779B97F4A7C15ull ^ size;
-    size_t n = size / 8;
-    for (size_t i = 0; i < n; i++) {
-        uint64_t v;
-        std::memcpy(&v, p + i * 8, 8);
-        h = (h ^ v) * 0xFF51AFD7ED558CCDull;
+    const __m256i k = _mm256_set1_epi64x(0x9E3779B1ll);
+    __m256i a = _mm256_set1_epi64x(static_cast<long long>(0x9E3779B97F4A7C15ull ^ size));
+    __m256i b = _mm256_set1_epi64x(static_cast<long long>(0xC2B2AE3D27D4EB4Full));
+    size_t i = 0;
+    for (; i + 64 <= size; i += 64) {
+        a = _mm256_xor_si256(a, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + i)));
+        b = _mm256_xor_si256(b, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + i + 32)));
+        a = _mm256_add_epi64(_mm256_mul_epu32(a, k), _mm256_srli_epi64(a, 29));
+        b = _mm256_add_epi64(_mm256_mul_epu32(b, k), _mm256_srli_epi64(b, 29));
+    }
+    alignas(32) uint64_t la[4], lb[4];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(la), a);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(lb), b);
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (int l = 0; l < 4; l++) {
+        h = (h ^ la[l]) * 0xFF51AFD7ED558CCDull;
+        h = (h ^ lb[l]) * 0xFF51AFD7ED558CCDull;
         h ^= h >> 29;
     }
-    for (size_t i = n * 8; i < size; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+    for (; i < size; i++) h = (h ^ p[i]) * 0x100000001B3ull;
     return h;
 }
 
 bool readable(uint32_t ea, uint64_t size) { return vm::range_mapped(ea, size); }
 
-float half_to_float(uint16_t h) {
-    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF;
-    float v;
-    if (e == 0) v = std::ldexp(float(m), -24);
-    else if (e == 31) v = m ? NAN : INFINITY;
-    else v = std::ldexp(float(m | 0x400), int(e) - 25);
-    return s ? -v : v;
-}
+float half_to_float(uint16_t h) { return _cvtsh_ss(h); }
 
 VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
