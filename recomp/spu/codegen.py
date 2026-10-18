@@ -23,6 +23,7 @@ BRANCHES = {
 
 
 RRR = set()
+OP_BITS = {}
 
 NO_WRITE = {
     "op_stqd", "op_stqx", "op_stqa", "op_stqr", "op_br", "op_bra", "op_brz", "op_brnz", "op_brhz", "op_brhnz",
@@ -38,6 +39,7 @@ def decode_table():
         opcode, bits, name = int(m.group(1), 16), int(m.group(2)), m.group(3)
         if bits == 4:
             RRR.add(name)
+        OP_BITS.setdefault(name, bits)
         shift = 11 - bits
         for k in range(1 << shift):
             table[(opcode << shift) | k] = name
@@ -49,11 +51,23 @@ def reg_sets(table, raw):
     for r in raw:
         w = struct.unpack(">I", struct.pack("<I", r))[0]
         name = table[w >> 21]
-        for shift in (0, 7, 14, 21):
-            reads.add((w >> shift) & 0x7F)
+        bits = OP_BITS.get(name, 11)
+        if bits == 4:
+            fields = [(w >> 7) & 0x7F, (w >> 14) & 0x7F, w & 0x7F]
+            rt = (w >> 21) & 0x7F
+        elif bits == 11:
+            fields = [w & 0x7F, (w >> 7) & 0x7F, (w >> 14) & 0x7F]
+            rt = w & 0x7F
+        elif bits in (8, 10):
+            fields = [w & 0x7F, (w >> 7) & 0x7F]
+            rt = w & 0x7F
+        else:
+            fields = [w & 0x7F]
+            rt = w & 0x7F
+        reads.update(fields)
         if name in NO_WRITE:
             continue
-        writes.add((w >> 21) & 0x7F if name in RRR else w & 0x7F)
+        writes.add(rt)
     return sorted(reads | writes), sorted(writes)
 
 
