@@ -273,6 +273,10 @@ void profile_thread(void* native, const char* name) {
             if (GetThreadContext(h, &c)) {
                 for (; n < depth; n++) {
                     pcs[n] = c.Rip;
+                    if (n + 1 >= depth) {
+                        n++;
+                        break;
+                    }
                     DWORD64 image = 0;
                     PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
                     if (!fn) {
