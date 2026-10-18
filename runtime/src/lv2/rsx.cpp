@@ -257,7 +257,8 @@ void execute(uint32_t reg, uint32_t arg) {
                 std::memcpy(&v, rep + 8, 4);
                 trace::emit(trace::T_REPORT, arg >> 24, a, __builtin_bswap32(v));
             }
-            if (std::getenv("GOWA_REPORT_LOG")) LOG_INFO("rsx", "report type %u loc 0x%08x off 0x%x -> ea 0x%08x", arg >> 24, loc, offset, a);
+            static const bool report_log = std::getenv("GOWA_REPORT_LOG") != nullptr;
+            if (report_log) LOG_INFO("rsx", "report type %u loc 0x%08x off 0x%x -> ea 0x%08x", arg >> 24, loc, offset, a);
         }
         break;
     }

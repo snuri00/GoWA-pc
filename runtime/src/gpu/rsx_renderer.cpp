@@ -155,7 +155,18 @@ struct Texture {
     TextureLayout layout;
     uint64_t hash = 0;
     uint64_t checked = ~0ull;
+    uint64_t last_used = 0;
+    uint64_t epoch = 0;
+    bool watched = false;
+    uint32_t churn = 0;
+    uint64_t nowatch_until = 0;
     VkImageLayout img_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t> pool_key;
+};
+
+struct PooledImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
 };
 
 struct VpEntry {
@@ -208,6 +219,8 @@ struct TempImage {
 
 std::map<std::tuple<Surface*, uint32_t, uint32_t, bool>, std::unique_ptr<TempImage>> g_temps;
 std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<Texture>> g_textures;
+std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, std::vector<PooledImage>> g_image_pool;
+std::vector<std::pair<uint64_t, std::unique_ptr<Texture>>> g_retired_textures;
 std::unordered_map<uint64_t, VkSampler> g_samplers;
 std::unordered_map<uint64_t, VkPipeline> g_pipelines;
 std::unordered_map<uint64_t, VpEntry> g_vp_cache;
@@ -286,6 +299,17 @@ struct Stats {
     uint64_t copies = 0;
     uint64_t copy_bytes = 0;
     uint64_t redirects = 0;
+    uint64_t hash_bytes = 0;
+    uint64_t hash_count = 0;
+    uint64_t hash_ticks = 0;
+    uint64_t upload_frame = 0;
+    uint64_t upload_bytes = 0;
+    uint64_t pool_hits = 0;
+    uint64_t image_allocs = 0;
+    uint64_t textures_freed = 0;
+    uint64_t watch_skips = 0;
+    uint64_t blit_fast = 0;
+    uint64_t blit_slow = 0;
 } g_stats;
 
 uint64_t ticks() {
@@ -600,6 +624,32 @@ void destroy_temp(TempImage* t) {
 
 void collect_garbage() {
     uint64_t serial = frame_serial();
+    const VkCtx& c = vk();
+    for (auto it = g_textures.begin(); it != g_textures.end();) {
+        if (serial > it->second->last_used + 240) {
+            vkDestroyImageView(c.device, it->second->view, nullptr);
+            it->second->view = VK_NULL_HANDLE;
+            g_retired_textures.emplace_back(serial, std::move(it->second));
+            it = g_textures.erase(it);
+            g_stats.textures_freed++;
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = g_retired_textures.begin(); it != g_retired_textures.end();) {
+        if (serial > it->first + 4) {
+            std::vector<PooledImage>& pool = g_image_pool[it->second->pool_key];
+            if (pool.size() < 32) {
+                pool.push_back({it->second->image, it->second->memory});
+            } else {
+                vkDestroyImage(c.device, it->second->image, nullptr);
+                vkFreeMemory(c.device, it->second->memory, nullptr);
+            }
+            it = g_retired_textures.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (auto it = g_retired_surfaces.begin(); it != g_retired_surfaces.end();) {
         if (serial > it->first + 4) {
             destroy_surface(it->second.get());
@@ -883,18 +933,48 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
         ii.samples = VK_SAMPLE_COUNT_1_BIT;
         ii.tiling = VK_IMAGE_TILING_OPTIMAL;
         ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (!allocate_image(ii, n->image, n->memory)) return nullptr;
+        n->pool_key = std::make_tuple(uint32_t(ii.imageType), uint32_t(ii.flags), uint32_t(ii.format), ii.extent.width, ii.extent.height, ii.extent.depth, ii.mipLevels, ii.arrayLayers);
+        auto pit = g_image_pool.find(n->pool_key);
+        if (pit != g_image_pool.end() && !pit->second.empty()) {
+            n->image = pit->second.back().image;
+            n->memory = pit->second.back().memory;
+            pit->second.pop_back();
+            g_stats.pool_hits++;
+        } else {
+            if (!allocate_image(ii, n->image, n->memory)) return nullptr;
+            g_stats.image_allocs++;
+        }
         n->view = make_view(n->image, l.format, l.view_type, VK_IMAGE_ASPECT_COLOR_BIT, l.mapping, l.levels, l.layers);
         tex = n.get();
         g_textures[key] = std::move(n);
     }
     uint64_t serial = frame_serial();
+    tex->last_used = serial;
     if (tex->checked == serial) return tex;
     tex->checked = serial;
     if (!readable(ea, tex->layout.source_size)) return nullptr;
+    if (tex->watched) {
+        if (tex->img_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && vm::range_epoch(ea, tex->layout.source_size) == tex->epoch) {
+            tex->churn = 0;
+            g_stats.watch_skips++;
+            return tex;
+        }
+        if (++tex->churn >= 3) tex->nowatch_until = serial + 600;
+    }
+    bool watch_ok = false;
+    uint64_t epoch = vm::watch_enabled() && serial >= tex->nowatch_until ? vm::watch_range(ea, tex->layout.source_size, watch_ok) : 0;
+    tex->watched = false;
     const uint8_t* src = vm::ptr(ea);
+    uint64_t ht = ticks();
     uint64_t h = fast_hash(src, tex->layout.source_size);
-    if (h == tex->hash && tex->img_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) return tex;
+    g_stats.hash_ticks += ticks() - ht;
+    g_stats.hash_bytes += tex->layout.source_size;
+    g_stats.hash_count++;
+    if (h == tex->hash && tex->img_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        tex->epoch = epoch;
+        tex->watched = watch_ok;
+        return tex;
+    }
     RingAlloc staging;
     if (!ring_alloc(tex->layout.decoded_size, 16, staging)) return nullptr;
     decode_texture(src, t, tex->layout, staging.ptr);
@@ -925,7 +1005,11 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 0, nullptr, 0, nullptr, 1, &br);
     tex->img_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     tex->hash = h;
+    tex->epoch = epoch;
+    tex->watched = watch_ok;
     g_stats.uploads++;
+    g_stats.upload_frame++;
+    g_stats.upload_bytes += tex->layout.source_size;
     return tex;
 }
 
@@ -1353,6 +1437,47 @@ void decode_attribute(uint32_t type, uint32_t size, const uint8_t* p, float* out
     }
 }
 
+void decode_vertices(uint32_t type, uint32_t size, const uint8_t* p, uint32_t stride, uint32_t count, float* out) {
+    if (type == 2 && size >= 1 && size <= 4) {
+        const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+        const __m128 def = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
+        const __m128 keep = _mm_castsi128_ps(_mm_cmplt_epi32(_mm_setr_epi32(0, 1, 2, 3), _mm_set1_epi32(int(size))));
+        for (uint32_t v = 0; v < count; v++, p += stride, out += 4) {
+            alignas(16) uint8_t tmp[16];
+            std::memcpy(tmp, p, size * 4);
+            __m128 f = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_load_si128(reinterpret_cast<const __m128i*>(tmp)), swap));
+            _mm_storeu_ps(out, _mm_blendv_ps(def, f, keep));
+        }
+        return;
+    }
+    switch (type) {
+    case 1:
+        for (uint32_t v = 0; v < count; v++, p += stride, out += 4) {
+            out[0] = out[1] = out[2] = 0.0f;
+            out[3] = 1.0f;
+            for (uint32_t i = 0; i < size; i++) out[i] = (int16_t((p[i * 2] << 8) | p[i * 2 + 1]) + 0.5f) / 32767.5f;
+        }
+        return;
+    case 3:
+        for (uint32_t v = 0; v < count; v++, p += stride, out += 4) {
+            out[0] = out[1] = out[2] = 0.0f;
+            out[3] = 1.0f;
+            for (uint32_t i = 0; i < size; i++) out[i] = half_to_float(uint16_t((p[i * 2] << 8) | p[i * 2 + 1]));
+        }
+        return;
+    case 4:
+        for (uint32_t v = 0; v < count; v++, p += stride, out += 4) {
+            out[0] = out[1] = out[2] = 0.0f;
+            out[3] = 1.0f;
+            for (uint32_t i = 0; i < size; i++) out[i] = p[i] / 255.0f;
+        }
+        return;
+    default:
+        for (uint32_t v = 0; v < count; v++, p += stride, out += 4) decode_attribute(type, size, p, out);
+        return;
+    }
+}
+
 uint32_t attribute_bytes(uint32_t type, uint32_t size) {
     switch (type) {
     case 2: return 4 * size;
@@ -1585,10 +1710,25 @@ void build_indices(std::vector<uint32_t>& raw, bool& inline_draw, uint32_t& inli
         if (u16 && restart_value > 0xFFFF) restart = false;
         for (auto [first, count] : g_ranges) {
             if (!raw.empty()) raw.push_back(RESTART);
-            for (uint32_t n = 0; n < count; n++) {
-                uint32_t v = u16 ? vm::read16(ea + (first + n) * 2) : vm::read32(ea + (first + n) * 4);
-                if (restart && v == restart_value) raw.push_back(RESTART);
-                else raw.push_back((v + base_index) & 0xFFFFF);
+            size_t at = raw.size();
+            raw.resize(at + count);
+            uint32_t* dst = raw.data() + at;
+            if (u16) {
+                const uint8_t* src = vm::ptr(ea + first * 2);
+                for (uint32_t n = 0; n < count; n++) {
+                    uint16_t w;
+                    std::memcpy(&w, src + n * 2, 2);
+                    uint32_t v = __builtin_bswap16(w);
+                    dst[n] = restart && v == restart_value ? RESTART : (v + base_index) & 0xFFFFF;
+                }
+            } else {
+                const uint8_t* src = vm::ptr(ea + first * 4);
+                for (uint32_t n = 0; n < count; n++) {
+                    uint32_t w;
+                    std::memcpy(&w, src + n * 4, 4);
+                    uint32_t v = __builtin_bswap32(w);
+                    dst[n] = restart && v == restart_value ? RESTART : (v + base_index) & 0xFFFFF;
+                }
             }
         }
         return;
@@ -1605,47 +1745,63 @@ void build_indices(std::vector<uint32_t>& raw, bool& inline_draw, uint32_t& inli
 
 VkPrimitiveTopology expand(uint32_t prim, const std::vector<uint32_t>& in, std::vector<uint32_t>& out, bool& restart) {
     restart = false;
-    std::vector<std::vector<uint32_t>> segs(1);
-    for (uint32_t v : in) {
-        if (v == RESTART) {
-            if (!segs.back().empty()) segs.emplace_back();
-        } else {
-            segs.back().push_back(v);
-        }
-    }
-    auto join = [&](bool keep_restart) {
-        for (auto& s : segs) {
-            if (s.empty()) continue;
-            if (!out.empty() && keep_restart) {
-                out.push_back(RESTART);
-                restart = true;
-            }
-            out.insert(out.end(), s.begin(), s.end());
-        }
+    out.clear();
+    const uint32_t* d = in.data();
+    size_t n = in.size(), pos = 0;
+    auto next = [&](size_t& b, size_t& e) {
+        while (pos < n && d[pos] == RESTART) pos++;
+        if (pos >= n) return false;
+        b = pos;
+        while (pos < n && d[pos] != RESTART) pos++;
+        e = pos;
+        return true;
     };
+    auto append = [&](size_t b, size_t e, bool keep_restart) {
+        if (e <= b) return;
+        if (!out.empty() && keep_restart) {
+            out.push_back(RESTART);
+            restart = true;
+        }
+        out.insert(out.end(), d + b, d + e);
+    };
+    size_t b, e;
     switch (prim) {
-    case 1: join(false); return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case 1:
+        out.reserve(n);
+        while (next(b, e)) append(b, e, false);
+        return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     case 2:
-        for (auto& s : segs) s.resize(s.size() & ~size_t(1));
-        join(false);
+        out.reserve(n);
+        while (next(b, e)) append(b, b + ((e - b) & ~size_t(1)), false);
         return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     case 3:
-        for (auto& s : segs) {
-            if (s.size() > 1) s.push_back(s[0]);
+        out.reserve(n + n / 2 + 2);
+        while (next(b, e)) {
+            append(b, e, true);
+            if (e - b > 1) out.push_back(d[b]);
         }
-        join(true);
         return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
-    case 4: join(true); return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case 4:
+        out.reserve(n);
+        while (next(b, e)) append(b, e, true);
+        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
     case 5:
-        for (auto& s : segs) s.resize(s.size() - s.size() % 3);
-        join(false);
+        out.reserve(n);
+        while (next(b, e)) append(b, e - (e - b) % 3, false);
         return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    case 6: case 9: join(true); return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-    case 7: case 10: join(true); return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    case 6: case 9:
+        out.reserve(n);
+        while (next(b, e)) append(b, e, true);
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case 7: case 10:
+        out.reserve(n);
+        while (next(b, e)) append(b, e, true);
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     case 8:
-        for (auto& s : segs) {
-            for (size_t i = 0; i + 3 < s.size(); i += 4) {
-                uint32_t q[6] = {s[i], s[i + 1], s[i + 2], s[i + 2], s[i + 3], s[i]};
+        out.reserve(n + n / 2);
+        while (next(b, e)) {
+            for (size_t i = b; i + 3 < e; i += 4) {
+                uint32_t q[6] = {d[i], d[i + 1], d[i + 2], d[i + 2], d[i + 3], d[i]};
                 out.insert(out.end(), q, q + 6);
             }
         }
@@ -1740,13 +1896,14 @@ bool draw() {
                                     R(CONTEXT_DMA_COLOR_B), R(CONTEXT_DMA_ZETA), R(SURFACE_FORMAT), R(SURFACE_COLOR_AOFFSET), R(SURFACE_ZETA_OFFSET), R(0x020C), w, h);
         return skip(__LINE__);
     }
-    std::vector<uint32_t> raw;
+    static std::vector<uint32_t> raw;
+    raw.clear();
     bool inline_draw = false;
     uint32_t inline_stride = 0;
     g_stats.phase[0] += ticks() - ph;
     ph = ticks();
     build_indices(raw, inline_draw, inline_stride);
-    std::vector<uint32_t> indices;
+    static std::vector<uint32_t> indices;
     bool restart = false;
     VkPrimitiveTopology topo = expand(g_prim, raw, indices, restart);
     if (topo == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM || indices.empty()) return skip(__LINE__);
@@ -1904,12 +2061,16 @@ bool draw() {
         } else {
             uint32_t last = stride == 0 ? 0 : freq > 1 ? ((div_ops >> i) & 1 ? freq - 1 : vmax / freq) : vmax;
             if (!readable(base, uint64_t(last) * stride + attribute_bytes(type, size))) return skip(__LINE__);
-            for (uint32_t v = 0; v < vcount; v++) {
-                uint32_t idx = vmin + v;
-                uint32_t element = idx;
-                if (stride == 0) element = 0;
-                else if (freq > 1) element = (div_ops >> i) & 1 ? idx % freq : idx / freq;
-                decode_attribute(type, size, vm::ptr(base + element * stride), out + v * 4);
+            if (stride && freq <= 1) {
+                decode_vertices(type, size, vm::ptr(base + vmin * stride), stride, vcount, out);
+            } else {
+                for (uint32_t v = 0; v < vcount; v++) {
+                    uint32_t idx = vmin + v;
+                    uint32_t element = idx;
+                    if (stride == 0) element = 0;
+                    else if (freq > 1) element = (div_ops >> i) & 1 ? idx % freq : idx / freq;
+                    decode_attribute(type, size, vm::ptr(base + element * stride), out + v * 4);
+                }
             }
             if (g_trace && stride && freq <= 1) {
                 uint32_t bytes = (vmax + 1) * stride;
@@ -2180,10 +2341,16 @@ void nv0039_transfer() {
     uint32_t dst = lv2::rsx_address(R(0x2310), R(0x2188));
     if (!src || !dst) return;
     if (trace::on(trace::RSX)) trace::emit(trace::T_COPY, trace::COPY_NV0039 | (in_stride << 8) | (out_stride << 16), src, dst, len, lines, uint64_t(uint32_t(in_pitch)) | (uint64_t(uint32_t(out_pitch)) << 32));
-    std::vector<uint8_t> line(len);
+    static std::vector<uint8_t> line;
+    line.resize(len);
     for (uint32_t l = 0; l < lines; l++) {
         uint32_t s = src + static_cast<uint32_t>(int64_t(in_pitch) * l), d = dst + static_cast<uint32_t>(int64_t(out_pitch) * l);
         if (!readable(s, uint64_t(len - 1) * in_stride + 1) || !readable(d, uint64_t(len - 1) * out_stride + 1)) return;
+        vm::host_write(d, uint64_t(len - 1) * out_stride + 1);
+        if (in_stride == 1 && out_stride == 1) {
+            std::memmove(vm::ptr(d), vm::ptr(s), len);
+            continue;
+        }
         for (uint32_t i = 0; i < len; i++) line[i] = *vm::ptr(s + i * in_stride);
         for (uint32_t i = 0; i < len; i++) *vm::ptr(d + i * out_stride) = line[i];
     }
@@ -2251,18 +2418,58 @@ void nv3089_transfer(uint32_t arg) {
                     uint64_t(in_pitch) | (uint64_t(swizzled ? 0 : dst_pitch) << 32),
                     uint64_t(out_x) | (uint64_t(out_y) << 16) | (uint64_t(src_bpp) << 32) | (uint64_t(dst_bpp) << 40) | (uint64_t(swizzled) << 48) | (uint64_t(scaled) << 49));
     }
-    std::vector<uint32_t> pixels(size_t(x1 - x0) * (y1 - y0));
+    bool unscaled = dsdx_raw == (1 << 20) && dtdy_raw == (1 << 20);
+    if (unscaled && !swizzled && src_bpp == dst_bpp && x1 - out_x <= in_w && y1 - out_y <= in_h) {
+        uint32_t row = (x1 - x0) * dst_bpp;
+        uint64_t s_lo = src + uint64_t(y0 - out_y) * in_pitch + (x0 - out_x) * src_bpp, s_hi = src + uint64_t(y1 - 1 - out_y) * in_pitch + (x0 - out_x) * src_bpp + row;
+        uint64_t d_lo = dst + uint64_t(y0) * dst_pitch + x0 * dst_bpp, d_hi = dst + uint64_t(y1 - 1) * dst_pitch + x0 * dst_bpp + row;
+        if (d_hi > 0x100000000ull || !vm::range_mapped(uint32_t(d_lo), d_hi - d_lo)) {
+            if (std::getenv("GOWA_COPY_LOG")) LOG_WARN("rsxcopy", "nv3089 skipped at line %d", __LINE__);
+            return;
+        }
+        vm::host_write(uint32_t(d_lo), d_hi - d_lo);
+        bool overlap = s_lo < d_hi && d_lo < s_hi;
+        static std::vector<uint8_t> staging;
+        if (overlap) {
+            staging.resize(size_t(row) * (y1 - y0));
+            for (uint32_t y = y0; y < y1; y++) std::memcpy(&staging[size_t(y - y0) * row], vm::ptr(src + (y - out_y) * in_pitch + (x0 - out_x) * src_bpp), row);
+            for (uint32_t y = y0; y < y1; y++) std::memcpy(vm::ptr(dst + y * dst_pitch + x0 * dst_bpp), &staging[size_t(y - y0) * row], row);
+        } else {
+            for (uint32_t y = y0; y < y1; y++) std::memcpy(vm::ptr(dst + y * dst_pitch + x0 * dst_bpp), vm::ptr(src + (y - out_y) * in_pitch + (x0 - out_x) * src_bpp), row);
+        }
+        g_stats.blit_fast++;
+        return;
+    }
+    g_stats.blit_slow++;
+    static std::vector<int32_t> cols;
+    cols.resize(x1 - x0);
+    for (uint32_t x = x0; x < x1; x++) {
+        double su = (x - out_x + 0.5) * dsdx;
+        cols[x - x0] = std::clamp(int32_t(su < 0 ? in_w + std::floor(su) : std::floor(su)), 0, int32_t(in_w - 1)) * int32_t(src_bpp);
+    }
+    static std::vector<uint32_t> pixels;
+    pixels.resize(size_t(x1 - x0) * (y1 - y0));
     size_t k = 0;
     for (uint32_t y = y0; y < y1; y++) {
         double sv = (y - out_y + 0.5) * dtdy;
         int32_t sy = std::clamp(int32_t(sv < 0 ? in_h + std::floor(sv) : std::floor(sv)), 0, int32_t(in_h - 1));
-        for (uint32_t x = x0; x < x1; x++) {
-            double su = (x - out_x + 0.5) * dsdx;
-            int32_t sx = std::clamp(int32_t(su < 0 ? in_w + std::floor(su) : std::floor(su)), 0, int32_t(in_w - 1));
-            uint32_t s = src + sy * in_pitch + sx * src_bpp;
-            pixels[k++] = src_bpp == 4 ? vm::read32(s) : vm::read16(s);
+        const uint8_t* rowp = vm::ptr(src + sy * in_pitch);
+        if (src_bpp == 4) {
+            for (uint32_t x = x0; x < x1; x++) {
+                uint32_t v;
+                std::memcpy(&v, rowp + cols[x - x0], 4);
+                pixels[k++] = __builtin_bswap32(v);
+            }
+        } else {
+            for (uint32_t x = x0; x < x1; x++) {
+                uint16_t v;
+                std::memcpy(&v, rowp + cols[x - x0], 2);
+                pixels[k++] = __builtin_bswap16(v);
+            }
         }
     }
+    if (swizzled) vm::host_write(dst, (uint64_t(1) << log_w) * (uint64_t(1) << log_h) * dst_bpp);
+    else vm::host_write(dst + y0 * dst_pitch, uint64_t(y1 - y0) * dst_pitch);
     k = 0;
     for (uint32_t y = y0; y < y1; y++) {
         for (uint32_t x = x0; x < x1; x++) {
@@ -2716,6 +2923,18 @@ bool present(uint32_t buffer_id) {
         std::memset(g_stats.phase, 0, sizeof g_stats.phase);
         LOG_INFO("rsx", "  copies %.1f per frame (%.1f MB), redirects %.1f", g_stats.copies / 60.0, g_stats.copy_bytes / 60.0 / 1048576.0, g_stats.redirects / 60.0);
         g_stats.copies = g_stats.copy_bytes = g_stats.redirects = 0;
+        LOG_INFO("rsx", "  texture hash %.1f per frame (%.1f MB, %.2f ms), unchanged by watch %.1f, uploads %.1f (%.1f MB)", g_stats.hash_count / 60.0, g_stats.hash_bytes / 60.0 / 1048576.0, g_stats.hash_ticks * ms,
+                 g_stats.watch_skips / 60.0, g_stats.upload_frame / 60.0, g_stats.upload_bytes / 60.0 / 1048576.0);
+        g_stats.watch_skips = 0;
+        LOG_INFO("rsx", "  nv3089 blits %.1f fast %.1f slow per frame", g_stats.blit_fast / 60.0, g_stats.blit_slow / 60.0);
+        g_stats.blit_fast = g_stats.blit_slow = 0;
+        static uint64_t last_faults = 0;
+        uint64_t faults = vm::watch_faults();
+        LOG_INFO("rsx", "  write watch faults %.1f per frame, %s", (faults - last_faults) / 60.0, vm::watch_top_pages().c_str());
+        last_faults = faults;
+        g_stats.hash_count = g_stats.hash_bytes = g_stats.hash_ticks = g_stats.upload_frame = g_stats.upload_bytes = 0;
+        LOG_INFO("rsx", "  texture images: %.1f allocated, %.1f reused, %.1f freed per frame, %zu live", g_stats.image_allocs / 60.0, g_stats.pool_hits / 60.0, g_stats.textures_freed / 60.0, g_textures.size());
+        g_stats.image_allocs = g_stats.pool_hits = g_stats.textures_freed = 0;
         g_stats.draw_ticks = g_stats.tex_ticks = g_stats.present_ticks = 0;
     }
     if (presents % 600 == 0) {

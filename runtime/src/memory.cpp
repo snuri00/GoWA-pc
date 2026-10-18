@@ -2,8 +2,13 @@
 #include "runtime/memory.h"
 #include "runtime/log.h"
 
+#include <algorithm>
+#include <cstdio>
+#include <vector>
 #include <map>
 #include <mutex>
+#include <cstdlib>
+#include <string>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -54,6 +59,7 @@ std::map<uint32_t, uint32_t> g_blocks;
 uint32_t g_used[static_cast<size_t>(Region::Count)] = {};
 
 bool commit(uint32_t addr, uint32_t size) {
+    watch_reset(addr, size);
     return VirtualAlloc(g_base + addr, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 }
 
@@ -69,6 +75,114 @@ bool overlaps(uint32_t addr, uint32_t size) {
 }
 
 uint8_t g_pagemap[0x100000];
+
+namespace {
+
+std::atomic<uint32_t> g_page_epoch[0x100000];
+std::atomic<uint8_t> g_page_watched[0x100000];
+SRWLOCK g_watch_locks[4096] = {};
+
+SRWLOCK& watch_lock(uint32_t page) { return g_watch_locks[page & 4095]; }
+std::atomic<uint64_t> g_watch_faults{0};
+std::atomic<uint16_t> g_fault_pages[0x100000];
+
+}
+
+uint64_t watch_faults() { return g_watch_faults.load(std::memory_order_relaxed); }
+
+std::string watch_top_pages() {
+    std::vector<std::pair<uint32_t, uint32_t>> v;
+    for (uint32_t i = 0; i < 0x100000; i++) {
+        uint32_t n = g_fault_pages[i].exchange(0, std::memory_order_relaxed);
+        if (n) v.push_back({n, i});
+    }
+    std::sort(v.rbegin(), v.rend());
+    std::string out = std::to_string(v.size()) + " pages:";
+    char b[32];
+    for (size_t i = 0; i < v.size() && i < 12; i++) {
+        std::snprintf(b, sizeof b, " %05x000x%u", v[i].second, v[i].first);
+        out += b;
+    }
+    return out;
+}
+
+bool watch_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("GOWA_WRITE_WATCH");
+        return !e || std::string(e) != "0";
+    }();
+    return on;
+}
+
+void watch_reset(uint32_t addr, uint64_t size) {
+    for (uint64_t a = addr & ~0xFFFull; a < uint64_t(addr) + size && a < 0x100000000ull; a += 0x1000) {
+        uint32_t page = uint32_t(a >> 12);
+        AcquireSRWLockExclusive(&watch_lock(page));
+        g_page_watched[page].store(0, std::memory_order_relaxed);
+        g_page_epoch[page].fetch_add(1, std::memory_order_acq_rel);
+        ReleaseSRWLockExclusive(&watch_lock(page));
+    }
+}
+
+uint64_t watch_range(uint32_t addr, uint32_t size, bool& ok) {
+    ok = true;
+    uint64_t sum = 0;
+    for (uint64_t a = addr & ~0xFFFull; a < uint64_t(addr) + size && a < 0x100000000ull; a += 0x1000) {
+        uint32_t page = uint32_t(a >> 12);
+        if (!g_page_watched[page].load(std::memory_order_acquire)) {
+            AcquireSRWLockExclusive(&watch_lock(page));
+            if (!g_page_watched[page].load(std::memory_order_relaxed)) {
+                DWORD old;
+                if (VirtualProtect(g_base + a, 0x1000, PAGE_READONLY, &old)) g_page_watched[page].store(1, std::memory_order_release);
+                else ok = false;
+            }
+            ReleaseSRWLockExclusive(&watch_lock(page));
+        }
+        sum += g_page_epoch[page].load(std::memory_order_acquire);
+    }
+    return sum;
+}
+
+uint64_t range_epoch(uint32_t addr, uint32_t size) {
+    uint64_t sum = 0;
+    for (uint64_t a = addr & ~0xFFFull; a < uint64_t(addr) + size && a < 0x100000000ull; a += 0x1000) sum += g_page_epoch[a >> 12].load(std::memory_order_acquire);
+    return sum;
+}
+
+bool watch_fault(uint32_t addr) {
+    uint32_t page = addr >> 12;
+    AcquireSRWLockExclusive(&watch_lock(page));
+    bool handled = false;
+    if (g_page_watched[page].load(std::memory_order_relaxed)) {
+        DWORD old;
+        VirtualProtect(g_base + (uint64_t(page) << 12), 0x1000, PAGE_READWRITE, &old);
+        g_page_watched[page].store(0, std::memory_order_release);
+        g_page_epoch[page].fetch_add(1, std::memory_order_acq_rel);
+        handled = true;
+        g_watch_faults.fetch_add(1, std::memory_order_relaxed);
+        g_fault_pages[page].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        MEMORY_BASIC_INFORMATION mi;
+        if (VirtualQuery(g_base + (uint64_t(page) << 12), &mi, sizeof mi) && mi.State == MEM_COMMIT && mi.Protect == PAGE_READWRITE) handled = true;
+    }
+    ReleaseSRWLockExclusive(&watch_lock(page));
+    return handled;
+}
+
+void host_write(uint32_t addr, uint64_t size) {
+    for (uint64_t a = addr & ~0xFFFull; a < uint64_t(addr) + size && a < 0x100000000ull; a += 0x1000) {
+        uint32_t page = uint32_t(a >> 12);
+        if (!g_page_watched[page].load(std::memory_order_acquire)) continue;
+        AcquireSRWLockExclusive(&watch_lock(page));
+        if (g_page_watched[page].load(std::memory_order_relaxed)) {
+            DWORD old;
+            VirtualProtect(g_base + a, 0x1000, PAGE_READWRITE, &old);
+            g_page_watched[page].store(0, std::memory_order_release);
+            g_page_epoch[page].fetch_add(1, std::memory_order_acq_rel);
+        }
+        ReleaseSRWLockExclusive(&watch_lock(page));
+    }
+}
 
 bool block_covers_locked(uint32_t addr) {
     auto it = g_blocks.upper_bound(addr);
@@ -155,6 +269,7 @@ bool dealloc(uint32_t addr) {
             g_used[i] -= it->second;
         }
     }
+    watch_reset(addr, it->second);
     VirtualFree(g_base + addr, it->second, MEM_DECOMMIT);
     uint32_t freed = it->second;
     g_blocks.erase(it);
