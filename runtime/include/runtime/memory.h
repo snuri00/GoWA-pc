@@ -28,6 +28,8 @@ uint32_t region_free(Region region);
 uint32_t region_size(Region region);
 bool is_mapped(uint32_t addr);
 bool range_mapped(uint32_t addr, uint64_t size);
+void mark_immutable(uint32_t addr, uint32_t size);
+bool is_immutable(uint32_t addr, uint32_t size);
 
 inline uint8_t* ptr(uint32_t addr) { return g_base + addr; }
 

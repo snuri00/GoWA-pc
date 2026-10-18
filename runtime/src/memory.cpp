@@ -173,6 +173,28 @@ bool is_mapped(uint32_t addr) {
     return std::atomic_ref<uint8_t>(g_pagemap[addr >> 12]).load(std::memory_order_acquire) != 0;
 }
 
+struct Immutable {
+    uint32_t lo;
+    uint32_t hi;
+};
+Immutable g_immutable[64];
+std::atomic<uint32_t> g_immutable_count{0};
+
+void mark_immutable(uint32_t addr, uint32_t size) {
+    uint32_t n = g_immutable_count.load();
+    if (n >= 64) return;
+    g_immutable[n] = {addr, addr + size};
+    g_immutable_count.store(n + 1, std::memory_order_release);
+}
+
+bool is_immutable(uint32_t addr, uint32_t size) {
+    uint32_t n = g_immutable_count.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < n; i++) {
+        if (addr >= g_immutable[i].lo && uint64_t(addr) + size <= g_immutable[i].hi) return true;
+    }
+    return false;
+}
+
 bool range_mapped(uint32_t addr, uint64_t size) {
     if (!size) return true;
     uint64_t end = uint64_t(addr) + size;

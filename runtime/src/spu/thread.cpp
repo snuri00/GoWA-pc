@@ -706,6 +706,15 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         }
     } else if (ea < 0xF0000000u) {
         race_on_get(id, ea, size, ctx.pc);
+        if (vm::is_immutable(ea, size)) {
+            if (std::memcmp(ls + lsa, vm::ptr(ea), size) != 0) {
+                std::memcpy(ls + lsa, vm::ptr(ea), size);
+                mark_ls(lsa, size);
+                forget_ls(lsa, size);
+            }
+            for (uint32_t l = lsa >> 7; l <= ((lsa + size - 1) >> 7) && l < 0x40000 / 128; l++) line_src[l] = ea;
+            return;
+        }
         bool snap = put_merge_enabled() && size >= 16;
         uint32_t done = 0;
         alignas(16) uint8_t line[128];
