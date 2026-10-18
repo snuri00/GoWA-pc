@@ -323,15 +323,7 @@ uint64_t fast_hash(const uint8_t* p, size_t size) {
     return h;
 }
 
-bool readable(uint32_t ea, uint64_t size) {
-    if (!size) return true;
-    uint64_t end = uint64_t(ea) + size;
-    if (end > 0x100000000ull) return false;
-    for (uint64_t a = ea & ~0xFFFull; a < end; a += 0x1000) {
-        if (!vm::is_mapped(static_cast<uint32_t>(a))) return false;
-    }
-    return true;
-}
+bool readable(uint32_t ea, uint64_t size) { return vm::range_mapped(ea, size); }
 
 float half_to_float(uint16_t h) {
     uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF;

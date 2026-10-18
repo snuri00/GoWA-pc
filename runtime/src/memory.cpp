@@ -1,3 +1,4 @@
+#include <atomic>
 #include "runtime/memory.h"
 #include "runtime/log.h"
 
@@ -67,6 +68,21 @@ bool overlaps(uint32_t addr, uint32_t size) {
 
 }
 
+uint8_t g_pagemap[0x100000];
+
+bool block_covers_locked(uint32_t addr) {
+    auto it = g_blocks.upper_bound(addr);
+    if (it == g_blocks.begin()) return false;
+    auto prev = std::prev(it);
+    return addr < prev->first + prev->second;
+}
+
+void refresh_pages_locked(uint32_t addr, uint64_t size) {
+    for (uint64_t a = addr & ~0xFFFull; a < uint64_t(addr) + size && a < 0x100000000ull; a += 0x1000) {
+        std::atomic_ref<uint8_t>(g_pagemap[a >> 12]).store(block_covers_locked(uint32_t(a)) ? 1 : 0, std::memory_order_release);
+    }
+}
+
 bool init() {
     void* p = VirtualAlloc(nullptr, 0x200000000ull, MEM_RESERVE, PAGE_NOACCESS);
     if (!p) {
@@ -84,6 +100,7 @@ bool map(uint32_t addr, uint32_t size) {
     uint32_t e = (addr + size + 0xFFFF) & ~0xFFFFu;
     if (!commit(a, e - a)) return false;
     g_blocks[a] = e - a;
+    refresh_pages_locked(a, uint64_t(e - a));
     return true;
 }
 
@@ -122,6 +139,7 @@ uint32_t alloc(Region region, uint32_t size, uint32_t align) {
         if (!commit(uint32_t(a), size)) return 0;
         std::memset(g_base + a, 0, size);
         g_blocks[uint32_t(a)] = size;
+        refresh_pages_locked(uint32_t(a), size);
         g_used[static_cast<size_t>(region)] += size;
         return uint32_t(a);
     }
@@ -138,7 +156,9 @@ bool dealloc(uint32_t addr) {
         }
     }
     VirtualFree(g_base + addr, it->second, MEM_DECOMMIT);
+    uint32_t freed = it->second;
     g_blocks.erase(it);
+    refresh_pages_locked(addr, freed);
     return true;
 }
 
@@ -150,11 +170,17 @@ uint32_t region_free(Region region) {
 uint32_t region_size(Region region) { return kRegions[static_cast<size_t>(region)].size; }
 
 bool is_mapped(uint32_t addr) {
-    std::lock_guard lk(g_lock);
-    auto it = g_blocks.upper_bound(addr);
-    if (it == g_blocks.begin()) return false;
-    auto prev = std::prev(it);
-    return addr < prev->first + prev->second;
+    return std::atomic_ref<uint8_t>(g_pagemap[addr >> 12]).load(std::memory_order_acquire) != 0;
+}
+
+bool range_mapped(uint32_t addr, uint64_t size) {
+    if (!size) return true;
+    uint64_t end = uint64_t(addr) + size;
+    if (end > 0x100000000ull) return false;
+    for (uint64_t a = addr & ~0xFFFull; a < end; a += 0x1000) {
+        if (!std::atomic_ref<uint8_t>(g_pagemap[a >> 12]).load(std::memory_order_relaxed)) return false;
+    }
+    return true;
 }
 
 }
