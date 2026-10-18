@@ -9,7 +9,7 @@ foreach(lang C CXX)
 endforeach()
 
 set(GOWA_GENERATED_DIR "${CMAKE_SOURCE_DIR}/out/ppu" CACHE PATH "Directory with generated PPU sources")
-set(GOWA_GENERATED_OPT "-O1" CACHE STRING "Optimization level for generated code")
+set(GOWA_GENERATED_OPT "-O2" CACHE STRING "Optimization level for generated code")
 
 set(GOWA_ARCH_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing)
 

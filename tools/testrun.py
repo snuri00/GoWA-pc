@@ -16,16 +16,11 @@ KEEP = 15
 
 
 def pad_menu(duration):
-    ev = [("cross", t) for t in range(10, 27, 4)]
-    for t in range(30, 46, 5):
-        ev += [("start", t), ("cross", t + 2)]
-    return ev
+    return [("cross", t) for t in range(10, 46, 3)]
 
 
 def pad_continue(duration):
-    ev = [("cross", t) for t in range(10, 27, 4)]
-    for t in range(30, 66, 5):
-        ev += [("start", t), ("cross", t + 2)]
+    ev = [("cross", t) for t in range(10, 70, 3)]
     buttons = ["square", "square", "triangle", "cross"]
     ev += [(buttons[(t // 2) % 4], t) for t in range(100, duration - 4, 2)]
     sticks = ["rx+", "rx-", "ry+", "ry-"]
@@ -45,10 +40,7 @@ def pad_ingame(duration):
 
 
 def pad_idle(duration):
-    ev = [("cross", t) for t in range(10, 27, 4)]
-    for t in range(30, 66, 5):
-        ev += [("start", t), ("cross", t + 2)]
-    return ev
+    return [("cross", t) for t in range(10, 70, 3)]
 
 
 def pad_boot(duration):
