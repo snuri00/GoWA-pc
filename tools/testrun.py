@@ -74,6 +74,61 @@ def resolve(name):
     return os.path.join(RUNS, matches[-1])
 
 
+def last_flip(log_path, state):
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(state.get("pos", 0))
+            data = f.read()
+            state["pos"] = f.tell()
+    except OSError:
+        return state.get("flip")
+    for m in re.finditer(rb"I +([0-9.]+) [^\r\n]*rsx: flip", data):
+        state["flip"] = float(m.group(1))
+    return state.get("flip")
+
+
+def supervise(env, duration):
+    proc = subprocess.Popen([EXE], cwd=RUN_DIR, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    t0 = time.time()
+    state = {}
+    requested = False
+    log_path = os.path.join(RUN_DIR, "gowa.log")
+    while True:
+        try:
+            return proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.time() - t0
+        if now >= duration:
+            break
+        flip = last_flip(log_path, state)
+        if not requested and flip is not None and now > 40 and now - flip > 20:
+            requested = True
+            open(os.path.join(RUN_DIR, "blackbox.req"), "w").close()
+            print("no flips for %.0fs, requesting blackbox capture" % (now - flip))
+    proc.kill()
+    subprocess.run(["taskkill", "/F", "/IM", "gowa.exe"], capture_output=True)
+    return 124
+
+
+def keep_blackbox(out):
+    src = os.path.join(RUN_DIR, "blackbox")
+    log = os.path.join(out, "gowa.log")
+    has = os.path.exists(log) and b"blackbox: capture" in open(log, "rb").read()
+    if not has:
+        return
+    dst = os.path.join(ROOT, "out", "blackbox", os.path.basename(out))
+    os.makedirs(dst, exist_ok=True)
+    shutil.copy(log, os.path.join(dst, "gowa.log"))
+    if os.path.isdir(src):
+        for f in os.listdir(src):
+            shutil.move(os.path.join(src, f), os.path.join(dst, f))
+    boxes = sorted(os.listdir(os.path.join(ROOT, "out", "blackbox")))
+    for d in boxes[:-4]:
+        shutil.rmtree(os.path.join(ROOT, "out", "blackbox", d), ignore_errors=True)
+    print("blackbox kept in", dst)
+
+
 def prune():
     dirs = run_dirs()
     for d in dirs[:-KEEP]:
@@ -159,16 +214,17 @@ def cmd_run(args):
         pass
     json.dump(meta, open(os.path.join(out, "meta.json"), "w"), indent=1)
     print("run", name, "for", duration, "s")
+    for f in ("blackbox.req", "blackbox.done"):
+        if os.path.exists(os.path.join(RUN_DIR, f)):
+            os.remove(os.path.join(RUN_DIR, f))
+    shutil.rmtree(os.path.join(RUN_DIR, "blackbox"), ignore_errors=True)
     t0 = time.time()
-    try:
-        rc = subprocess.run([EXE], cwd=RUN_DIR, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=duration).returncode
-    except subprocess.TimeoutExpired:
-        rc = 124
-        subprocess.run(["taskkill", "/F", "/IM", "gowa.exe"], capture_output=True)
+    rc = supervise(env, duration)
     wall = time.time() - t0
     time.sleep(1)
     if os.path.exists(os.path.join(RUN_DIR, "gowa.log")):
         shutil.copy(os.path.join(RUN_DIR, "gowa.log"), os.path.join(out, "gowa.log"))
+    keep_blackbox(out)
     shots = convert_snaps(out)
     summary = summarize(out, duration, rc, wall)
     summary["snapshots"] = len(shots)

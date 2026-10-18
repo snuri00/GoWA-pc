@@ -124,6 +124,11 @@ int main(int argc, char** argv) {
         if (watch_delay && tick == watch_delay) crash::arm_watch();
         else if (tick > watch_delay) crash::rearm_watch();
         if (tick == memdump_at) trace::dump_memory("memdump.bin");
+        if (GetFileAttributesA("blackbox.req") != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileA("blackbox.req");
+            hooks::capture("external request");
+            if (FILE* f = std::fopen("blackbox.done", "w")) std::fclose(f);
+        }
         if (status && tick % 3 == 2) {
             spu::status_dump();
             guest::status_dump();
