@@ -28,6 +28,8 @@ def pad_continue(duration):
         ev += [("start", t), ("cross", t + 2)]
     buttons = ["square", "square", "triangle", "cross"]
     ev += [(buttons[(t // 2) % 4], t) for t in range(100, duration - 4, 2)]
+    sticks = ["rx+", "rx-", "ry+", "ry-"]
+    ev += [(sticks[(t // 4) % 4], "%d:1.0" % (t + 2)) for t in range(150, duration - 4, 4)]
     return ev
 
 
@@ -148,7 +150,7 @@ def cmd_run(args):
     env["GOWA_SNAP_DIR"] = out
     pad = padfn(duration)
     if pad:
-        env["GOWA_AUTOPAD"] = ",".join("%s@%d" % p for p in pad)
+        env["GOWA_AUTOPAD"] = ",".join("%s@%s" % (b, t if isinstance(t, str) else "%d:0.6" % t) for b, t in pad)
     extra = {}
     for kv in args.env or []:
         k, _, v = kv.partition("=")
