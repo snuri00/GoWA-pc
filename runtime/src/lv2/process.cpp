@@ -95,7 +95,7 @@ LV2_SYSCALL(144, sys_time_get_timezone) {
 
 LV2_SYSCALL(141, sys_timer_usleep) {
     uint64_t us = u64arg(ctx, 0);
-    static const long min_us = std::getenv("GOWA_USLEEP_MIN") ? std::atol(std::getenv("GOWA_USLEEP_MIN")) : 0;
+    static const long min_us = std::getenv("GOWA_USLEEP_MIN") ? std::atol(std::getenv("GOWA_USLEEP_MIN")) : 100;
     static std::atomic<uint64_t> hist[8];
     static const bool stats = std::getenv("GOWA_USLEEP_STATS") != nullptr;
     if (stats) {
