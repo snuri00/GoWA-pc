@@ -413,9 +413,8 @@ SPU_INLINE uint32_t sfx_from_double(double v) {
 }
 
 SPU_INLINE __m128i sfx_special(__m128 r) {
-    __m128i ri = _mm_castps_si128(r);
-    __m128i mag = _mm_and_si128(ri, _mm_set1_epi32(0x7FFFFFFF));
-    return _mm_or_si128(_mm_cmpeq_epi32(_mm_and_si128(ri, _mm_set1_epi32(0x7F800000)), _mm_set1_epi32(0x7F800000)), _mm_cmpeq_epi32(mag, _mm_set1_epi32(0x7F7FFFFF)));
+    __m128i mag = _mm_and_si128(_mm_castps_si128(r), _mm_set1_epi32(0x7FFFFFFF));
+    return _mm_cmpgt_epi32(mag, _mm_set1_epi32(0x7F7FFFFE));
 }
 
 SPU_INLINE __m128i sfx_exp255(__m128 a) {
@@ -424,9 +423,7 @@ SPU_INLINE __m128i sfx_exp255(__m128 a) {
 }
 
 SPU_INLINE __m128 sfx_pos_zero(__m128 r) {
-    __m128i ri = _mm_castps_si128(r);
-    __m128i z = _mm_cmpeq_epi32(_mm_and_si128(ri, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
-    return _mm_castsi128_ps(_mm_andnot_si128(z, ri));
+    return _mm_andnot_ps(_mm_cmpeq_ps(r, _mm_setzero_ps()), r);
 }
 
 template <class F>
@@ -446,7 +443,7 @@ __attribute__((noinline, cold)) inline __m128 sfx_slow(__m128 a, __m128 b, __m12
 template <class Fast, class Slow>
 SPU_INLINE __m128 sfx_op(__m128 a, __m128 b, __m128 c, Fast fast, Slow slow) {
     __m128 r = fast(a, b, c);
-    __m128i bad = _mm_or_si128(_mm_or_si128(sfx_special(r), sfx_exp255(a)), _mm_or_si128(sfx_exp255(b), sfx_exp255(c)));
+    __m128i bad = sfx_special(r);
     if (!_mm_testz_si128(bad, bad)) r = sfx_slow(a, b, c, r, bad, slow);
     return sfx_pos_zero(r);
 }

@@ -3,12 +3,19 @@
 
 #include <intrin.h>
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <dbghelp.h>
+#include <thread>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -190,6 +197,62 @@ struct Slot {
     uint32_t valid = 0;
 };
 
+struct BlockStat {
+    uint64_t cycles = 0;
+    uint64_t insns = 0;
+    uint64_t calls = 0;
+};
+
+std::map<const spu::CompiledBlock*, BlockStat> g_stats;
+bool g_profile = false;
+bool g_sample = false;
+std::atomic<bool> g_sampling{false};
+std::map<uint64_t, uint64_t> g_rips;
+
+void sampler(HANDLE target) {
+    while (g_sampling.load()) {
+        Sleep(0);
+        if (SuspendThread(target) == static_cast<DWORD>(-1)) return;
+        CONTEXT c{};
+        c.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(target, &c)) g_rips[c.Rip]++;
+        ResumeThread(target);
+    }
+}
+
+void report_samples() {
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+    std::map<std::string, uint64_t> by_fn;
+    uint64_t total = 0;
+    alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
+    for (auto& [rip, n] : g_rips) {
+        auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        std::string name = SymFromAddr(GetCurrentProcess(), rip, &disp, sym) ? std::string(sym->Name) : "?";
+        by_fn[name] += n;
+        total += n;
+    }
+    std::vector<std::pair<std::string, uint64_t>> v(by_fn.begin(), by_fn.end());
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    for (size_t i = 0; i < v.size() && i < 30; i++) std::printf("  %5.1f%% %s
+", 100.0 * v[i].second / total, v[i].first.c_str());
+    std::FILE* f = std::fopen("spu_bench_rips.txt", "w");
+    if (f) {
+        for (auto& [rip, n] : g_rips) {
+            auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 255;
+            DWORD64 disp = 0;
+            if (SymFromAddr(GetCurrentProcess(), rip, &disp, sym)) std::fprintf(f, "%llu %s+0x%llx
+", static_cast<unsigned long long>(n), sym->Name, static_cast<unsigned long long>(disp));
+        }
+        std::fclose(f);
+    }
+}
+
 struct Result {
     uint64_t cycles = 0;
     uint64_t insns = 0;
@@ -225,6 +288,7 @@ Result run(State& s, const Capture& cap, bool regions) {
         }
         uint32_t ran = b->words;
         bool ok;
+        uint64_t b0 = g_profile ? __rdtsc() : 0;
         if (regions && b->region) {
             s.c.executed = 0;
             ok = b->region(s.c, host);
@@ -234,6 +298,12 @@ Result run(State& s, const Capture& cap, bool regions) {
             ok = b->fn(s.c, host);
         }
         n += ran;
+        if (g_profile) {
+            BlockStat& st = g_stats[b];
+            st.cycles += __rdtsc() - b0;
+            st.insns += ran;
+            st.calls++;
+        }
         s.c.irq_check = false;
         if (!ok) break;
         if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value == n) host.next(5, 0, uint32_t(n), true);
@@ -276,9 +346,18 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--reps" && i + 1 < argc) reps = std::atoi(argv[++i]);
         else if (a == "--no-regions") regions = false;
+        else if (a == "--profile") g_profile = true;
+        else if (a == "--sample") g_sample = true;
         else files.push_back(a);
     }
     State s;
+    std::thread sampler_thread;
+    if (g_sample) {
+        HANDLE self = nullptr;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        g_sampling = true;
+        sampler_thread = std::thread(sampler, self);
+    }
     uint64_t total_cycles = 0, total_insns = 0;
     int failures = 0;
     for (const std::string& f : files) {
@@ -299,6 +378,24 @@ int main(int argc, char** argv) {
         if (!best.exact) failures++;
         total_cycles += best.cycles;
         total_insns += best.insns;
+    }
+    if (g_sample) {
+        g_sampling = false;
+        sampler_thread.join();
+        report_samples();
+    }
+    if (g_profile) {
+        std::vector<std::pair<const spu::CompiledBlock*, BlockStat>> v(g_stats.begin(), g_stats.end());
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.cycles > b.second.cycles; });
+        uint64_t tot = 0;
+        for (auto& e : v) tot += e.second.cycles;
+        size_t count = 0;
+        const spu::CompiledBlock* all = spu::compiled_blocks(count);
+        for (size_t i = 0; i < v.size() && i < 40; i++) {
+            const BlockStat& st = v[i].second;
+            std::printf("  b%-6zu lsa %05x words %3u region %d: %5.1f%% cycles, %6.2f cycles/insn, %7.1f insns/call\n", static_cast<size_t>(v[i].first - all), v[i].first->lsa, v[i].first->words,
+                        v[i].first->region ? 1 : 0, 100.0 * st.cycles / tot, double(st.cycles) / st.insns, double(st.insns) / st.calls);
+        }
     }
     std::printf("total %.3f cycles/insn over %llu insns, %d mismatching\n", total_insns ? double(total_cycles) / total_insns : 0.0, static_cast<unsigned long long>(total_insns), failures);
     return failures ? 1 : 0;

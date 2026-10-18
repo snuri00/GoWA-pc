@@ -43,8 +43,19 @@ struct SpuThread : Host {
     std::atomic<uint32_t> ls_epoch{1};
     std::atomic<uint32_t> ls_all_epoch{1};
     std::unique_ptr<std::atomic<uint32_t>[]> line_epoch{new std::atomic<uint32_t>[0x40000 / 128]()};
+    std::atomic<bool> cap_on{false};
+    std::atomic_flag cap_lock = ATOMIC_FLAG_INIT;
+    std::vector<uint32_t> cap_lines;
+    void note_cap_write(uint32_t lsa, uint32_t size) {
+        while (cap_lock.test_and_set(std::memory_order_acquire)) {
+        }
+        uint32_t first = (lsa & 0x3FFFF) >> 7, last = ((lsa & 0x3FFFF) + size - 1) >> 7;
+        for (uint32_t l = first; l <= last && l < 0x40000 / 128; l++) cap_lines.push_back(l);
+        cap_lock.clear(std::memory_order_release);
+    }
     void mark_ls(uint32_t lsa, uint32_t size) {
         if (!size) return;
+        if (cap_on.load(std::memory_order_relaxed)) note_cap_write(lsa, size);
         uint32_t e = ls_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
         uint32_t first = (lsa & 0x3FFFF) >> 7, last = ((lsa & 0x3FFFF) + size - 1) >> 7;
         for (uint32_t l = first; l <= last && l < 0x40000 / 128; l++) line_epoch[l].store(e, std::memory_order_release);
@@ -54,6 +65,7 @@ struct SpuThread : Host {
         if (r) rsv::version(r).notify_all();
     }
     void mark_all_ls() {
+        if (cap_on.load(std::memory_order_relaxed)) note_cap_write(0, 0x40000);
         uint32_t e = ls_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
         ls_all_epoch.store(e, std::memory_order_release);
     }

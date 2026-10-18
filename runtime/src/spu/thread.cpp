@@ -581,7 +581,7 @@ bool SpuThread::merge_put(uint32_t ea, uint32_t size, uint32_t lsa) {
             while (done < i) {
                 uint32_t a = ea + done;
                 uint32_t chunk = (std::min)(i - done, 128 - (a & 127));
-                rsv::store_locked(a, src + done, chunk);
+                rsv::merge_bits(a, src + done, old + done, chunk);
                 done += chunk;
             }
         }
@@ -1029,15 +1029,14 @@ struct ReplayHost : Host {
 struct CaptureHost : Host {
     SpuThread& t;
     std::vector<uint8_t> out;
-    std::vector<uint8_t> shadow;
     uint32_t events = 0;
-    explicit CaptureHost(SpuThread& thread) : t(thread), shadow(LS_SIZE) {}
+    explicit CaptureHost(SpuThread& thread) : t(thread) {}
     template <class T>
     void put(const T& v) {
         const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
         out.insert(out.end(), p, p + sizeof v);
     }
-    void begin() { std::memcpy(shadow.data(), t.ls, LS_SIZE); }
+    void begin() {}
     void note_irq(uint32_t at) {
         begin();
         note(5, 0, at, true);
@@ -1053,11 +1052,17 @@ struct CaptureHost : Host {
         put(flags);
         size_t count_at = out.size();
         put(uint32_t(0));
+        std::vector<uint32_t> written;
+        while (t.cap_lock.test_and_set(std::memory_order_acquire)) {
+        }
+        written.swap(t.cap_lines);
+        t.cap_lock.clear(std::memory_order_release);
+        std::sort(written.begin(), written.end());
+        written.erase(std::unique(written.begin(), written.end()), written.end());
         uint32_t lines = 0;
-        for (uint32_t l = 0; l < LS_SIZE; l += 128) {
-            if (std::memcmp(shadow.data() + l, t.ls + l, 128) == 0) continue;
-            put(l);
-            out.insert(out.end(), t.ls + l, t.ls + l + 128);
+        for (uint32_t l : written) {
+            put(l << 7);
+            out.insert(out.end(), t.ls + (l << 7), t.ls + (l << 7) + 128);
             lines++;
         }
         std::memcpy(out.data() + count_at, &lines, 4);
@@ -1335,11 +1340,14 @@ void SpuThread::run() {
                         if (cap_at > 0.0 && !cap_done) {
                             if (!cap && logging::uptime() >= cap_at) {
                                 cap = std::make_unique<CaptureHost>(*this);
+                                cap_lines.clear();
+                                cap_on.store(true);
                                 cap_start = ctx;
                                 cap_ls.assign(ls, ls + LS_SIZE);
                                 cap_n = n;
                                 host = cap.get();
                             } else if (cap && n - cap_n >= cap_insns) {
+                                cap_on.store(false);
                                 write_capture(*this, cap_start, cap_ls, *cap, n - cap_n);
                                 cap.reset();
                                 host = this;

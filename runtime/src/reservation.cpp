@@ -125,6 +125,19 @@ void store_locked(uint32_t addr, const void* data, uint32_t size) {
     e.ver.notify_all();
 }
 
+void merge_bits(uint32_t addr, const uint8_t* data, const uint8_t* base, uint32_t size) {
+    Entry& e = entry(addr & ~127u);
+    std::lock_guard lk(e.lock);
+    e.ver.fetch_add(64, std::memory_order_acq_rel);
+    uint8_t* dst = vm::ptr(addr);
+    for (uint32_t i = 0; i < size; i++) {
+        uint8_t changed = data[i] ^ base[i];
+        if (changed) dst[i] = static_cast<uint8_t>((dst[i] & ~changed) | (data[i] & changed));
+    }
+    e.ver.fetch_add(64, std::memory_order_release);
+    e.ver.notify_all();
+}
+
 bool lost(uint32_t line, uint64_t rtime, const uint8_t* rdata) {
     static const bool strict = std::getenv("GOWA_RSV_STRICT") != nullptr;
     if (strict && entry(line).ver.load(std::memory_order_acquire) != rtime) return true;
