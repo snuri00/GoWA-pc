@@ -426,7 +426,7 @@ SPU_INLINE __m128 sfx_pos_zero(__m128 r) {
 }
 
 template <class F>
-SPU_INLINE __m128 sfx_slow(__m128 a, __m128 b, __m128 c, __m128 r, __m128i lanes, F f) {
+__attribute__((noinline, cold)) inline __m128 sfx_slow(__m128 a, __m128 b, __m128 c, __m128 r, __m128i lanes, F f) {
     alignas(16) uint32_t av[4], bv[4], cv[4], rv[4], lv[4];
     _mm_store_si128(reinterpret_cast<__m128i*>(av), _mm_castps_si128(a));
     _mm_store_si128(reinterpret_cast<__m128i*>(bv), _mm_castps_si128(b));
