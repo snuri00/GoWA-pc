@@ -117,9 +117,9 @@ void guest_backtrace(const ppu::Context& ctx) {
     bt += b;
     uint32_t sp = static_cast<uint32_t>(ctx.gpr[1]);
     for (int i = 0; i < 32 && sp && vm::range_mapped(sp, 24); i++) {
-        uint32_t next = vm::read32(sp);
+        uint32_t next = static_cast<uint32_t>(vm::read64(sp));
         if (!next || next <= sp || !vm::range_mapped(next, 24)) break;
-        uint32_t lr = vm::read32(next + 16);
+        uint32_t lr = static_cast<uint32_t>(vm::read64(next + 16));
         std::snprintf(b, sizeof b, " %08x", lr);
         bt += b;
         sp = next;
@@ -178,7 +178,7 @@ void impl(ppu::Context& ctx, uint8_t* base, uint32_t addr, ppu::BodyFn fn) {
         LOG_WARN("blackbox", "game error call %s lr %08x: '%s' r4=%llx r5=%llx r6=%llx", name_of(addr).c_str(), static_cast<uint32_t>(ctx.lr), msg.c_str(), static_cast<unsigned long long>(ctx.gpr[4]),
                  static_cast<unsigned long long>(ctx.gpr[5]), static_cast<unsigned long long>(ctx.gpr[6]));
         guest_backtrace(ctx);
-        if (g_panics.fetch_add(1) == 0) capture("game error");
+        if (g_panics.fetch_add(1) < 2) capture("game error");
         fn(ctx, base);
         return;
     }
@@ -277,9 +277,11 @@ void capture(const char* reason) {
     guest::status_dump();
     lv2::rsx_status();
     static const bool no_mem = std::getenv("GOWA_BLACKBOX_NOMEM") != nullptr;
-    if (!no_mem && n == 0) {
+    if (!no_mem && n < 2) {
         std::filesystem::create_directories("blackbox");
-        trace::dump_memory("blackbox/memory.bin");
+        char path[64];
+        std::snprintf(path, sizeof path, "blackbox/memory_%d.bin", n);
+        trace::dump_memory(path);
     }
     n++;
     LOG_WARN("blackbox", "capture done");

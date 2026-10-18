@@ -13,6 +13,11 @@
 #include <mutex>
 #include <thread>
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#pragma comment(lib, "Synchronization.lib")
+
 namespace rsv {
 
 namespace {
@@ -22,9 +27,9 @@ struct alignas(64) Entry {
     std::mutex lock;
 };
 
-Entry g_table[512];
+Entry g_table[65536];
 
-Entry& entry(uint32_t addr) { return g_table[(addr & 0xFF80) >> 7]; }
+Entry& entry(uint32_t addr) { return g_table[(addr >> 7) & 0xFFFF]; }
 
 }
 
@@ -77,10 +82,10 @@ void log_change(uint32_t line, uint32_t offset, const uint8_t* data, uint32_t si
     if (n) LOG_INFO("rsv", "%s line 0x%08x:%s", how, line, buf);
 }
 
-bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uint8_t* data, uint32_t offset, uint32_t size) {
+bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uint8_t* data, uint32_t offset, uint32_t size, bool data_only) {
     Entry& e = entry(line);
     std::lock_guard lk(e.lock);
-    if (e.ver.load(std::memory_order_acquire) != rtime) return false;
+    if (!data_only && e.ver.load(std::memory_order_acquire) != rtime) return false;
     if (std::memcmp(vm::ptr(line + offset), expected, size) != 0) return false;
     log_change(line, offset, data, size, size == 128 ? "putllc" : "stcx");
     e.ver.fetch_add(64, std::memory_order_acq_rel);
@@ -120,7 +125,7 @@ void store_locked(uint32_t addr, const void* data, uint32_t size) {
 }
 
 bool lost(uint32_t line, uint64_t rtime, const uint8_t* rdata) {
-    if (entry(line).ver.load(std::memory_order_acquire) != rtime) return true;
+    if (entry(line).ver.load(std::memory_order_acquire) == rtime) return false;
     return std::memcmp(vm::ptr(line), rdata, 128) != 0;
 }
 
@@ -133,12 +138,21 @@ void wait_change(uint32_t line, uint64_t rtime, uint32_t micros) {
 }
 
 bool wait_lost(uint32_t line, uint64_t rtime, const uint8_t* rdata, uint32_t micros) {
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
-    do {
+    Entry& e = entry(line);
+    for (int i = 0; i < 200; i++) {
         if (lost(line, rtime, rdata)) return true;
         _mm_pause();
-    } while (std::chrono::steady_clock::now() < deadline);
-    return false;
+    }
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
+    for (;;) {
+        uint64_t v = e.ver.load(std::memory_order_acquire);
+        if (lost(line, rtime, rdata)) return true;
+        auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) return false;
+        static const long sleep_after = std::getenv("GOWA_RSV_SLEEP_US") ? std::atol(std::getenv("GOWA_RSV_SLEEP_US")) : -1;
+        if (sleep_after >= 0 && micros - left >= sleep_after) WaitOnAddress(&e.ver, &v, sizeof v, static_cast<DWORD>((left + 999) / 1000));
+        else _mm_pause();
+    }
 }
 
 }

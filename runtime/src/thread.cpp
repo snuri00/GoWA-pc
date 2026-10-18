@@ -98,7 +98,7 @@ void status_dump() {
                      (unsigned long long)g[6], (unsigned long long)g[7], (unsigned long long)g[9], (unsigned long long)g[10], (unsigned long long)g[11]);
         }
         if (sc == 98) lv2::lwmutex_debug(static_cast<uint32_t>(t->ctx.gpr[3]));
-        if ((!sc || sc == 142 || t->name == "main_thread") && t->native) LOG_INFO("status", "   %s", crash::sample_stack(t->native, 14).c_str());
+        if ((!sc || sc == 142 || t->name == "main_thread") && t->native && GetThreadId(static_cast<HANDLE>(t->native)) != GetCurrentThreadId()) LOG_INFO("status", "   %s", crash::sample_stack(t->native, 14).c_str());
     }
 }
 

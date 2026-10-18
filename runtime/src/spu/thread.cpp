@@ -127,20 +127,20 @@ void SpuThread::push_snr(uint32_t number, uint32_t value) {
     snr[number] = orm && was ? (snr[number] | value) : value;
     snr_count[number] = true;
     if (!was || !orm) set_events(number == 0 ? EV_S1 : EV_S2);
-    cv.notify_all();
+    cv.notify_all(); wake_rsv_waiter();
 }
 
 void SpuThread::push_in_mbox(uint32_t value) {
     std::lock_guard lk(m);
     if (in_mbox.size() >= 4) in_mbox.back() = value;
     else in_mbox.push_back(value);
-    cv.notify_all();
+    cv.notify_all(); wake_rsv_waiter();
 }
 
 uint32_t SpuThread::pop_out_mbox() {
     std::lock_guard lk(m);
     out_mbox_full = false;
-    cv.notify_all();
+    cv.notify_all(); wake_rsv_waiter();
     return out_mbox;
 }
 
@@ -184,7 +184,7 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
                 uint8_t snap[128];
                 std::memcpy(snap, rdata, 128);
                 lk.unlock();
-                rsv::wait_lost(line, rt, snap, 100);
+                rsv::wait_lost(line, rt, snap, 1000);
                 lk.lock();
             } else {
                 cv.wait_for(lk, std::chrono::microseconds(100));
@@ -319,7 +319,7 @@ void SpuThread::write_channel(uint32_t ch, uint32_t value) {
                 std::lock_guard l2(m);
                 if (!in_mbox.empty()) {
                     in_mbox.assign(1, static_cast<uint32_t>(lv2::CELL_EBUSY));
-                    cv.notify_all();
+                    cv.notify_all(); wake_rsv_waiter();
                     return;
                 }
             }
@@ -518,7 +518,7 @@ void note_job(uint32_t id, uint32_t wid, uint32_t src, uint32_t pc, int mode, ui
                 std::sort(bv.begin(), bv.end(), [](auto& a, auto& b) { return a.second.cycles > b.second.cycles; });
                 uint64_t btot = 0;
                 for (auto& e : bv) btot += e.second.cycles;
-                for (size_t i = 0; i < bv.size() && i < 12; i++) {
+                for (size_t i = 0; i < bv.size() && i < 40; i++) {
                     const CompiledBlock* cb = static_cast<const CompiledBlock*>(bv[i].first);
                     LOG_INFO("spujob", "  block lsa %05x words %u: %.1f%% of cycles, %.1f cycles per insn, %.1f insns per call", cb->lsa, cb->words, btot ? 100.0 * bv[i].second.cycles / btot : 0.0,
                              bv[i].second.insns ? double(bv[i].second.cycles) / bv[i].second.insns : 0.0, bv[i].second.calls ? double(bv[i].second.insns) / bv[i].second.calls : 0.0);
@@ -723,7 +723,7 @@ bool SpuThread::run_list(uint32_t tag, uint32_t cmd, uint32_t lsa, uint32_t list
             set_events(EV_SN);
             stall_stat |= 1u << tag;
             stall_stat_count = true;
-            cv.notify_all();
+            cv.notify_all(); wake_rsv_waiter();
             return false;
         }
     }
@@ -784,7 +784,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
     case 0xB4: {
         uint32_t line = ea & ~127u;
         std::lock_guard lk(m);
-        bool ok = raddr == line && rsv::commit_if(line, rtime, rdata, ls + (lsa & 0x3FF80), 0, 128);
+        bool ok = raddr == line && rsv::commit_if(line, rtime, rdata, ls + (lsa & 0x3FF80), 0, 128, true);
         if (ok && trace::on(trace::ATOMIC)) trace::emit(trace::T_ATOMIC, slot | (0xB4u << 16), line, lsa & 0x3FF80, 128, ctx.pc, id);
         if (!ok) set_events(EV_LR);
         if (job_stats) (ok ? g_putllc_ok : g_putllc_fail).fetch_add(1, std::memory_order_relaxed);
@@ -848,7 +848,7 @@ bool SpuThread::stop_and_signal(uint32_t code) {
             out_mbox_full = false;
             if (!in_mbox.empty()) {
                 in_mbox.assign(1, static_cast<uint32_t>(lv2::CELL_EBUSY));
-                cv.notify_all();
+                cv.notify_all(); wake_rsv_waiter();
                 return true;
             }
         }
@@ -884,7 +884,7 @@ bool SpuThread::stop_and_signal(uint32_t code) {
         ql.unlock();
         std::lock_guard lk(m);
         in_mbox.assign({0u, static_cast<uint32_t>(e.data1), static_cast<uint32_t>(e.data2), static_cast<uint32_t>(e.data3)});
-        cv.notify_all();
+        cv.notify_all(); wake_rsv_waiter();
         return true;
     }
     default:
@@ -1287,9 +1287,61 @@ std::mutex g_reg_lock;
 std::vector<SpuThread*> g_reg;
 }
 
+void occupancy_sampler() {
+    std::map<std::pair<uint32_t, uint32_t>, uint64_t> by_job;
+    uint64_t conc[8] = {};
+    uint64_t samples = 0;
+    auto last = std::chrono::steady_clock::now();
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        int busy = 0;
+        {
+            std::lock_guard lk(g_reg_lock);
+            for (SpuThread* t : g_reg) {
+                if (!t->running) continue;
+                uint32_t pc = std::atomic_ref<uint32_t>(t->ctx.pc).load(std::memory_order_relaxed);
+                uint32_t wid;
+                std::memcpy(&wid, t->ls + 0x1dc, 4);
+                wid = __builtin_bswap32(wid);
+                uint32_t src = t->line_src[(pc & 0x3FFFF) >> 7];
+                bool job = pc >= 0x4000;
+                if (job) busy++;
+                by_job[{job ? wid : 0xFFFFFFFFu, job ? src : 0}]++;
+            }
+        }
+        conc[(std::min)(busy, 7)]++;
+        samples++;
+        auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds(10)) continue;
+        last = now;
+        std::vector<std::pair<std::pair<uint32_t, uint32_t>, uint64_t>> v(by_job.begin(), by_job.end());
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        std::string line;
+        for (size_t i = 0; i < v.size() && i < 14; i++) {
+            char b[64];
+            if (v[i].first.first == 0xFFFFFFFFu) std::snprintf(b, sizeof b, " [kernel %.2f]", double(v[i].second) / samples);
+            else std::snprintf(b, sizeof b, " [wid %u %08x %.2f]", v[i].first.first, v[i].first.second, double(v[i].second) / samples);
+            line += b;
+        }
+        LOG_INFO("spuocc", "avg SPUs per job:%s", line.c_str());
+        std::string c;
+        for (int i = 0; i < 8; i++) {
+            char b[32];
+            std::snprintf(b, sizeof b, " %d:%.0f%%", i, 100.0 * conc[i] / samples);
+            c += b;
+        }
+        LOG_INFO("spuocc", "SPUs running job code:%s", c.c_str());
+        by_job.clear();
+        std::memset(conc, 0, sizeof conc);
+        samples = 0;
+    }
+}
+
 void register_thread(SpuThread* t) {
     std::lock_guard lk(g_reg_lock);
     if (std::find(g_reg.begin(), g_reg.end(), t) == g_reg.end()) g_reg.push_back(t);
+    static std::once_flag once;
+    if (std::getenv("GOWA_SPU_OCC")) std::call_once(once, [] { std::thread(occupancy_sampler).detach(); });
 }
 
 void status_dump() {
