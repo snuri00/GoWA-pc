@@ -31,3 +31,4 @@ __pycache__/
 /docs/
 *.md
 /run/
+build_tc/

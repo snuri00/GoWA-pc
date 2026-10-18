@@ -1176,6 +1176,7 @@ void SpuThread::run() {
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &hh, 0, FALSE, DUPLICATE_SAME_ACCESS);
         native = hh;
     }
+    hle::install_builtin();
     register_thread(this);
     if (const char* e = std::getenv("GOWA_PROFILE_SPU")) {
         if (std::string(e) == "all" || static_cast<uint32_t>(std::atoi(e)) == slot) {

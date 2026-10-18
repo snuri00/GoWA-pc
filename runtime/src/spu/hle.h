@@ -19,5 +19,6 @@ struct Function {
 void register_function(const Function& f);
 const Function* lookup(const uint8_t* ls, uint32_t pc);
 bool any_at(uint32_t pc);
+void install_builtin();
 
 }

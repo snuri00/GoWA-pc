@@ -34,6 +34,7 @@ target_include_directories(gowa_volk PUBLIC third_party/volk third_party/Vulkan-
 target_compile_definitions(gowa_volk PUBLIC VK_USE_PLATFORM_WIN32_KHR VK_NO_PROTOTYPES)
 
 add_library(gowa_runtime OBJECT ${GOWA_RUNTIME_SOURCES})
+set_source_files_properties("${CMAKE_SOURCE_DIR}/runtime/src/spu/texcreator_native.cpp" PROPERTIES COMPILE_OPTIONS "/clang:-frounding-math")
 target_include_directories(gowa_runtime PRIVATE third_party/volk third_party/Vulkan-Headers/include third_party/glslang "${CMAKE_BINARY_DIR}/include")
 target_compile_definitions(gowa_runtime PRIVATE VK_NO_PROTOTYPES)
 target_link_libraries(gowa_runtime PUBLIC gowa_ppu_ops)
