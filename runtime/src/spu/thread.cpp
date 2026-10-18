@@ -1,4 +1,5 @@
 #include "spu/aot.h"
+#include "hle.h"
 #include "thread.h"
 #include "../lv2/event.h"
 #include "../lv2/sync.h"
@@ -1276,6 +1277,15 @@ void SpuThread::run() {
                     uint32_t wid;
                     std::memcpy(&wid, ls + 0x1dc, 4);
                     note_job(id, __builtin_bswap32(wid), src, ctx.pc, job_log, prev, delta);
+                }
+            }
+            if (hle::any_at(ctx.pc)) {
+                if (const hle::Function* f = hle::lookup(ls, ctx.pc)) {
+                    if (f->handler(ctx)) {
+                        ctx.pc = ctx.gpr[0].u32[3] & PC_MASK;
+                        block_start = true;
+                        continue;
+                    }
                 }
             }
             if (aot_on) {

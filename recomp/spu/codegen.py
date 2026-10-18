@@ -158,6 +158,7 @@ def emit_pure_block(table, idx, lsa, raw, out):
 
 REGION_MAX = int(os.environ.get("GOWA_SPU_REGION_MAX", "64"))
 REGION_BUDGET = 4096
+HLE_ENTRIES = {0x56E0}
 COND_BRANCH = {"op_brz", "op_brnz", "op_brhz", "op_brhnz", "op_biz", "op_binz", "op_bihz", "op_bihnz"}
 
 
@@ -201,7 +202,7 @@ def build_regions(table, blocks):
     region_of = [-1] * len(blocks)
     regions = []
     for seed in range(len(blocks)):
-        if not pure[seed] or region_of[seed] >= 0:
+        if not pure[seed] or region_of[seed] >= 0 or blocks[seed][0] in HLE_ENTRIES:
             continue
         members = [seed]
         region_of[seed] = len(regions)
@@ -214,7 +215,7 @@ def build_regions(table, blocks):
                 if len(cands) != 1:
                     continue
                 j = cands[0]
-                if not pure[j] or region_of[j] >= 0:
+                if not pure[j] or region_of[j] >= 0 or blocks[j][0] in HLE_ENTRIES:
                     continue
                 region_of[j] = len(regions)
                 members.append(j)
@@ -304,7 +305,7 @@ def build_regions_any(table, blocks, region_of):
     taken = [r >= 0 for r in region_of]
     regions = []
     for seed in range(len(blocks)):
-        if taken[seed]:
+        if taken[seed] or blocks[seed][0] in HLE_ENTRIES:
             continue
         members = [seed]
         taken[seed] = True
@@ -317,7 +318,7 @@ def build_regions_any(table, blocks, region_of):
                 if len(cands) != 1:
                     continue
                 j = cands[0]
-                if j in members:
+                if j in members or blocks[j][0] in HLE_ENTRIES:
                     continue
                 members.append(j)
                 queue.append(j)

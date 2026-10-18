@@ -142,6 +142,23 @@ struct State {
 };
 
 bool g_skip_same = true;
+std::FILE* g_dma_log = nullptr;
+std::vector<uint32_t> g_watch;
+std::FILE* g_watch_log = nullptr;
+uint32_t g_watch_max = 1u << 30;
+
+void watch_hit(const spu::Context& c) {
+    static std::map<uint32_t, uint32_t> hits;
+    if (++hits[c.pc] > g_watch_max) return;
+    std::fprintf(g_watch_log, "pc %05x lr %05x sp %05x\n", c.pc, c.gpr[0].u32[3], c.gpr[1].u32[3]);
+    for (int r = 3; r <= 12; r++) {
+        const spu::v128& v = c.gpr[r];
+        float f[4];
+        std::memcpy(f, v.u32, 16);
+        std::fprintf(g_watch_log, "  r%-3d %08x %08x %08x %08x | %g %g %g %g\n", r, v.u32[3], v.u32[2], v.u32[1], v.u32[0], f[3], f[2], f[1], f[0]);
+    }
+}
+uint32_t g_mfc[6] = {};
 
 class Replay : public spu::Host {
 public:
@@ -184,7 +201,31 @@ public:
         const Event* e = next(0, ch, 0, false);
         return e ? e->value : 0;
     }
-    void write_channel(uint32_t ch, uint32_t value) override { next(1, ch, value, true); }
+    void write_channel(uint32_t ch, uint32_t value) override {
+        if (g_dma_log && ch >= 16 && ch <= 21) {
+            g_mfc[ch - 16] = value;
+            if (ch == 21) {
+                uint32_t cmd = value & 0xFF, lsa = g_mfc[0] & 0x3FFFF, ea = g_mfc[2], size = g_mfc[3];
+                bool put = (cmd & 0xF0) == 0x20 || (cmd & 0xF0) == 0x30;
+                std::fprintf(g_dma_log, "%s cmd %02x pc %05x lsa %05x ea %08x size %x", put ? "PUT" : "GET", cmd, s.c.pc, lsa, ea, size);
+                if (put && size && lsa + size <= spu::LS_SIZE && size <= 0x4000) {
+                    std::fprintf(g_dma_log, " data");
+                    for (uint32_t i = 0; i < size; i++) std::fprintf(g_dma_log, "%s%02x", (i & 63) ? "" : " ", s.ls[lsa + i]);
+                }
+                std::fprintf(g_dma_log, "\n");
+            }
+        }
+        next(1, ch, value, true);
+        if (g_dma_log && ch == 21) {
+            uint32_t cmd = value & 0xFF, lsa = g_mfc[0] & 0x3FFFF, size = g_mfc[3];
+            bool get = (cmd & 0xF0) == 0x40;
+            if (get && size && size <= 0x4000 && lsa + size <= spu::LS_SIZE) {
+                std::fprintf(g_dma_log, "GETDATA lsa %05x size %x data", lsa, size);
+                for (uint32_t i = 0; i < size; i++) std::fprintf(g_dma_log, "%s%02x", (i & 63) ? "" : " ", s.ls[lsa + i]);
+                std::fprintf(g_dma_log, "\n");
+            }
+        }
+    }
     uint32_t channel_count(uint32_t ch) override {
         const Event* e = next(2, ch, 0, false);
         return e ? e->value : 0;
@@ -275,6 +316,7 @@ Result run(State& s, const Capture& cap, bool regions) {
     ULONG64 t0 = 0;
     QueryThreadCycleTime(GetCurrentThread(), &t0);
     while (n < cap.insns && !s.c.halted) {
+        if (g_watch_log && std::find(g_watch.begin(), g_watch.end(), s.c.pc) != g_watch.end()) watch_hit(s.c);
         Slot& slot = cache[s.c.pc >> 2];
         const spu::CompiledBlock* b = slot.b;
         if (!b || !s.fresh(s.c.pc, b->words, slot.valid)) {
@@ -356,6 +398,18 @@ int main(int argc, char** argv) {
         else if (a == "--profile") g_profile = true;
         else if (a == "--sample") g_sample = true;
         else if (a == "--no-skip-same") g_skip_same = false;
+        else if (a == "--dma-log" && i + 1 < argc) g_dma_log = std::fopen(argv[++i], "w");
+        else if (a == "--watch" && i + 2 < argc) {
+            std::string list = argv[++i];
+            g_watch_log = std::fopen(argv[++i], "w");
+            size_t pos = 0;
+            while (pos < list.size()) {
+                size_t e = list.find(',', pos);
+                if (e == std::string::npos) e = list.size();
+                g_watch.push_back(static_cast<uint32_t>(std::strtoul(list.substr(pos, e - pos).c_str(), nullptr, 16)));
+                pos = e + 1;
+            }
+        }
         else files.push_back(a);
     }
     State s;
