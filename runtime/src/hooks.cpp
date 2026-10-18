@@ -302,13 +302,39 @@ bool skip_repeated_mip_eviction(ppu::Context& ctx) {
     return true;
 }
 
+bool wait_previous_edge_list_started(ppu::Context& ctx) {
+    uint32_t cur = vm::read32(0xa0c13c);
+    if (cur > 2) return false;
+    uint32_t prev = (cur + 2) % 3;
+    if (!*vm::ptr(0xa0c12b + prev)) return false;
+    uint32_t list = vm::read32(0xa0c11c + prev * 4);
+    if (!list || !vm::range_mapped(list, 0x30)) return false;
+    uint32_t state = vm::read32(list);
+    if (!state || !vm::range_mapped(state + 0x70, 2)) return false;
+    if (vm::read16(state + 0x70)) return false;
+    auto start = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; !vm::read16(state + 0x70); i++) {
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(200)) {
+            LOG_WARN("patch", "edge list %u did not start within 200 ms", prev);
+            return false;
+        }
+        if (i < 256) std::this_thread::yield();
+        else std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1) < 8) {
+        LOG_WARN("patch", "waited %.3f ms for edge list %u to pass its MeshPrep barrier", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), prev);
+    }
+    return false;
+}
+
 void install_patches() {
     if (const char* e = std::getenv("GOWA_GAME_PATCHES"); e && std::string(e) == "0") return;
     struct Patch {
         uint32_t addr;
         bool (*guard)(ppu::Context&);
     };
-    static const Patch patches[] = {{0x39ea58, skip_repeated_mip_eviction}};
+    static const Patch patches[] = {{0x39ea58, skip_repeated_mip_eviction}, {0x41c480, wait_previous_edge_list_started}};
     for (const Patch& p : patches) {
         Hook*& h = g_hooks[p.addr];
         if (!h) {

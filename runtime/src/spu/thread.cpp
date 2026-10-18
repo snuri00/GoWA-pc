@@ -103,6 +103,44 @@ void SpuThread::check_interrupt() {
     ctx.pc = (w & 0xFD80007Fu) == 0x30000000u ? ((w >> 5) & 0x3FFFCu) : 0;
 }
 
+static const std::vector<std::pair<uint32_t, uint32_t>> g_dma_watch = [] {
+    std::vector<std::pair<uint32_t, uint32_t>> v;
+    if (const char* e = std::getenv("GOWA_SPU_DMA")) {
+        std::string list = e;
+        size_t pos = 0;
+        while (pos < list.size()) {
+            size_t end = list.find(',', pos);
+            if (end == std::string::npos) end = list.size();
+            std::string item = list.substr(pos, end - pos);
+            size_t dash = item.find('-');
+            uint32_t lo = static_cast<uint32_t>(std::strtoul(item.c_str(), nullptr, 16));
+            uint32_t hi = dash != std::string::npos ? static_cast<uint32_t>(std::strtoul(item.c_str() + dash + 1, nullptr, 16)) : lo + 1;
+            v.push_back({lo, hi});
+            pos = end + 1;
+        }
+    }
+    return v;
+}();
+
+static bool dma_watched(uint32_t ea, uint32_t size) {
+    for (auto& [lo, hi] : g_dma_watch) {
+        if (ea < hi && ea + size > lo) return true;
+    }
+    return false;
+}
+
+void SpuThread::log_watched_dma(const char* what, uint32_t cmd, uint32_t ea, uint32_t lsa, uint32_t size, const uint8_t* data) {
+    std::string hex;
+    char b[4];
+    uint32_t n = size < 64 ? size : 64;
+    for (uint32_t i = 0; i < n; i++) {
+        std::snprintf(b, sizeof b, "%02x", data ? data[i] : vm::ptr(ea)[i]);
+        hex += b;
+        if ((i & 3) == 3) hex += ' ';
+    }
+    LOG_INFO("spudma", "thread 0x%x pc 0x%05x %s cmd 0x%02x ea 0x%08x lsa 0x%05x size 0x%x %s", id, ctx.pc, what, cmd, ea, lsa, size, hex.c_str());
+}
+
 static const bool job_stats = std::getenv("GOWA_SPU_JOBS") != nullptr;
 
 void SpuThread::collect_events() {
@@ -620,16 +658,7 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
     }
     lsa &= 0x3FFFF;
     bool put = (cmd & 0xF0) == 0x20 || (cmd & 0xF0) == 0x30 || (cmd & 0xF0) == 0xA0;
-    static const uint64_t dma_watch = [] {
-        const char* e = std::getenv("GOWA_SPU_DMA");
-        if (!e) return uint64_t(0);
-        const char* dash = std::strchr(e, '-');
-        uint64_t lo = std::strtoul(e, nullptr, 16), hi = dash ? std::strtoul(dash + 1, nullptr, 16) : lo + 1;
-        return (hi << 32) | lo;
-    }();
-    if (dma_watch && ea < (dma_watch >> 32) && ea + size > static_cast<uint32_t>(dma_watch)) {
-        LOG_INFO("spudma", "thread 0x%x pc 0x%05x %s cmd 0x%02x ea 0x%08x lsa 0x%05x size 0x%x", id, ctx.pc, put ? "PUT" : "GET", cmd, ea, lsa, size);
-    }
+    if (dma_watched(ea, size)) log_watched_dma(put ? "PUT" : "GET", cmd, ea, lsa, size, put ? ls + lsa : nullptr);
     if (ea < 0xF0000000u && (ea < 0x10000 || !vm::is_mapped(ea) || !vm::is_mapped(ea + size - 1))) {
         static std::atomic<int> reported{0};
         if (reported.fetch_add(1) < 20) {
@@ -814,6 +843,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
         rtime = ver;
         std::memcpy(rdata, snap, 128);
         std::memcpy(ls + (lsa & 0x3FF80), snap, 128);
+        if (dma_watched(line, 128)) log_watched_dma("GETLLAR", 0xD0, line, lsa & 0x3FF80, 128, snap);
         forget_ls(lsa & 0x3FF80, 128);
         mark_ls(lsa & 0x3FF80, 128);
         atomic_stat = 4;
@@ -823,7 +853,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
     case 0xB4: {
         uint32_t line = ea & ~127u;
         std::lock_guard lk(m);
-        bool ok = raddr == line && rsv::commit_if(line, rtime, rdata, ls + (lsa & 0x3FF80), 0, 128, true);
+        bool ok = raddr == line && rsv::commit_if(line, rtime, rdata, ls + (lsa & 0x3FF80), 0, 128);
         if (ok && trace::on(trace::ATOMIC)) trace::emit(trace::T_ATOMIC, slot | (0xB4u << 16), line, lsa & 0x3FF80, 128, ctx.pc, id);
         if (!ok) set_events(EV_LR);
         if (job_stats) (ok ? g_putllc_ok : g_putllc_fail).fetch_add(1, std::memory_order_relaxed);

@@ -64,8 +64,8 @@ bool watched_line(uint32_t line) {
         }
         return v;
     }();
-    static const bool jm = std::getenv("GOWA_RSV_LOG") && std::string(std::getenv("GOWA_RSV_LOG")) == "jm";
-    if (jm) return vm::read32(line) == 0x007a7b00u || line == 0x3001ad00u;
+    static const bool jm = std::getenv("GOWA_RSV_LOG") && std::string(std::getenv("GOWA_RSV_LOG")).rfind("jm", 0) == 0;
+    if (jm && (vm::read32(line) == 0x007a7b00u || line == 0x3001ad00u)) return true;
     for (uint32_t l : lines) if (l == line) return true;
     return false;
 }

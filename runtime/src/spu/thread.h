@@ -39,6 +39,7 @@ struct SpuThread : Host {
     uint64_t src_insn_mark = 0;
     uint32_t dma_snap_next = 0;
     void remember_get(uint32_t ea, uint32_t size, uint32_t lsa);
+    void log_watched_dma(const char* what, uint32_t cmd, uint32_t ea, uint32_t lsa, uint32_t size, const uint8_t* data);
     void forget_ls(uint32_t lsa, uint32_t size);
     bool merge_put(uint32_t ea, uint32_t size, uint32_t lsa);
     std::atomic<uint32_t> ls_epoch{1};
