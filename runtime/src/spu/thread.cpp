@@ -7,6 +7,9 @@
 #include "runtime/trace.h"
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 
 #include <algorithm>
 #include <thread>
@@ -30,6 +33,7 @@ void profile_thread(void* native, const char* name);
 namespace spu {
 
 namespace {
+std::atomic<uint64_t> g_ev_reads{0}, g_ev_waits{0}, g_ev_wait_us{0}, g_getllar{0}, g_putllc_ok{0}, g_putllc_fail{0}, g_getllar_same{0};
 
 enum : uint32_t {
     EV_LR = 0x400, EV_S1 = 0x200, EV_S2 = 0x100, EV_TM = 0x20, EV_SN = 0x2,
@@ -91,6 +95,8 @@ void SpuThread::check_interrupt() {
     w = __builtin_bswap32(w);
     ctx.pc = (w & 0xFD80007Fu) == 0x30000000u ? ((w >> 5) & 0x3FFFCu) : 0;
 }
+
+static const bool job_stats = std::getenv("GOWA_SPU_JOBS") != nullptr;
 
 void SpuThread::collect_events() {
     if (!dec_frozen) {
@@ -157,6 +163,11 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
     switch (ch) {
     case 0: {
         collect_events();
+        if (job_stats) {
+            g_ev_reads.fetch_add(1, std::memory_order_relaxed);
+            if (!event_count) g_ev_waits.fetch_add(1, std::memory_order_relaxed);
+        }
+        auto wait_start = job_stats && !event_count ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         while (!event_count) {
             if (stop_flag.load(std::memory_order_relaxed)) {
                 ctx.halted = true;
@@ -175,6 +186,7 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
             }
             collect_events();
         }
+        if (job_stats && wait_start.time_since_epoch().count()) g_ev_wait_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_start).count(), std::memory_order_relaxed);
         event_count = false;
         return events & event_mask;
     }
@@ -438,6 +450,15 @@ std::atomic<uint64_t> g_interp_insns{0};
 std::atomic<uint64_t> g_aot_insns{0};
 std::atomic<uint64_t> g_region_insns{0};
 std::atomic<uint64_t> g_block_calls{0};
+std::atomic<uint64_t> g_cyc_cycles{0};
+std::atomic<uint64_t> g_gen_cycles{0};
+struct BlockCyc {
+    uint64_t cycles = 0;
+    uint64_t insns = 0;
+    uint64_t calls = 0;
+};
+std::map<const void*, BlockCyc> g_block_cyc;
+std::atomic<uint64_t> g_cyc_insns{0};
 std::map<uint32_t, uint64_t> g_interp_pcs;
 }
 
@@ -478,7 +499,25 @@ void note_job(uint32_t id, uint32_t wid, uint32_t src, uint32_t pc, int mode, ui
                     hot += b;
                 }
                 uint64_t ri = g_region_insns.exchange(0), bc = g_block_calls.exchange(0);
-                LOG_INFO("spujob", "region share %.1f%%, %.1f insns per dispatch", ai ? 100.0 * ri / ai : 0.0, bc ? double(ai) / bc : 0.0);
+                uint64_t cc = g_cyc_cycles.exchange(0), ci = g_cyc_insns.exchange(0), gc = g_gen_cycles.exchange(0);
+                LOG_INFO("spujob", "region share %.1f%%, %.1f insns per dispatch, %.1f cycles per insn, %.1f in generated code", ai ? 100.0 * ri / ai : 0.0, bc ? double(ai) / bc : 0.0, ci ? double(cc) / ci : 0.0, ai ? double(gc) / ai : 0.0);
+                LOG_INFO("spujob", "event reads %llu (blocked %llu, %llu us), getllar %llu (unchanged %llu), putllc ok %llu fail %llu", static_cast<unsigned long long>(g_ev_reads.exchange(0)),
+                         static_cast<unsigned long long>(g_ev_waits.exchange(0)), static_cast<unsigned long long>(g_ev_wait_us.exchange(0)), static_cast<unsigned long long>(g_getllar.exchange(0)),
+                         static_cast<unsigned long long>(g_getllar_same.exchange(0)), static_cast<unsigned long long>(g_putllc_ok.exchange(0)), static_cast<unsigned long long>(g_putllc_fail.exchange(0)));
+                std::vector<std::pair<const void*, BlockCyc>> bv;
+                {
+                    std::lock_guard lk(g_job_lock);
+                    bv.assign(g_block_cyc.begin(), g_block_cyc.end());
+                    g_block_cyc.clear();
+                }
+                std::sort(bv.begin(), bv.end(), [](auto& a, auto& b) { return a.second.cycles > b.second.cycles; });
+                uint64_t btot = 0;
+                for (auto& e : bv) btot += e.second.cycles;
+                for (size_t i = 0; i < bv.size() && i < 12; i++) {
+                    const CompiledBlock* cb = static_cast<const CompiledBlock*>(bv[i].first);
+                    LOG_INFO("spujob", "  block lsa %05x words %u: %.1f%% of cycles, %.1f cycles per insn, %.1f insns per call", cb->lsa, cb->words, btot ? 100.0 * bv[i].second.cycles / btot : 0.0,
+                             bv[i].second.insns ? double(bv[i].second.cycles) / bv[i].second.insns : 0.0, bv[i].second.calls ? double(bv[i].second.insns) / bv[i].second.calls : 0.0);
+                }
                 LOG_INFO("spujob", "interpreted %.2f%% of %llu insns, hot interpreted block starts:%s", (ii + ai) ? 100.0 * ii / double(ii + ai) : 0.0, static_cast<unsigned long long>(ii + ai), hot.c_str());
             }
         }).detach();
@@ -723,6 +762,10 @@ void SpuThread::process_mfc(uint32_t cmd) {
         if (raddr && raddr != line && rsv::lost(raddr, rtime, rdata)) set_events(EV_LR);
         uint8_t snap[128];
         uint64_t ver = rsv::snapshot(line, snap);
+        if (job_stats) {
+            g_getllar.fetch_add(1, std::memory_order_relaxed);
+            if (raddr == line && std::memcmp(snap, rdata, 128) == 0) g_getllar_same.fetch_add(1, std::memory_order_relaxed);
+        }
         if (raddr == line && ver != rtime && std::memcmp(snap, rdata, 128) == 0) set_events(EV_LR);
         raddr = line;
         rtime = ver;
@@ -739,6 +782,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
         bool ok = raddr == line && rsv::commit_if(line, rtime, rdata, ls + (lsa & 0x3FF80), 0, 128);
         if (ok && trace::on(trace::ATOMIC)) trace::emit(trace::T_ATOMIC, slot | (0xB4u << 16), line, lsa & 0x3FF80, 128, ctx.pc, id);
         if (!ok) set_events(EV_LR);
+        if (job_stats) (ok ? g_putllc_ok : g_putllc_fail).fetch_add(1, std::memory_order_relaxed);
         raddr = 0;
         atomic_stat = ok ? 0 : 1;
         atomic_stat_count = true;
@@ -1064,6 +1108,12 @@ void SpuThread::run() {
     static const bool no_fresh = std::getenv("GOWA_SPU_NO_FRESH") != nullptr;
     const bool use_regions = !verify && !std::getenv("GOWA_SPU_NO_REGIONS");
     uint32_t irq_countdown = 256;
+    uint64_t cyc_mark = 0;
+    uint64_t loc_aot = 0, loc_calls = 0, loc_region = 0;
+    static const uint64_t slow_cycles = std::getenv("GOWA_SPU_SLOW") ? std::strtoull(std::getenv("GOWA_SPU_SLOW"), nullptr, 0) : 0;
+    std::unordered_map<const void*, BlockCyc> local_cyc;
+    uint32_t local_cyc_n = 0;
+    uint32_t cyc_insn_mark = 0;
     const bool rec = aot::recording();
     bool block_start = true;
     uint32_t block_len = 0;
@@ -1108,12 +1158,13 @@ void SpuThread::run() {
                 if (b) {
                     bool ok;
                     uint32_t ran = slot.words;
+                    uint64_t t0 = job_log >= 3 ? __rdtsc() : 0;
                     if (slot.region) {
                         ctx.executed = 0;
                         ok = slot.region(ctx, *this);
                         if (ctx.executed) {
                             ran = ctx.executed;
-                            if (job_log) g_region_insns.fetch_add(ran, std::memory_order_relaxed);
+                            if (job_log) loc_region += ran;
                         }
                         else ok = slot.fn(ctx, *this);
                     } else {
@@ -1121,8 +1172,26 @@ void SpuThread::run() {
                     }
                     n += ran;
                     if (job_log) {
-                        g_aot_insns.fetch_add(ran, std::memory_order_relaxed);
-                        g_block_calls.fetch_add(1, std::memory_order_relaxed);
+                        loc_aot += ran;
+                        loc_calls++;
+                        if (job_log >= 3) {
+                            uint64_t dt = __rdtsc() - t0;
+                            g_gen_cycles.fetch_add(dt, std::memory_order_relaxed);
+                            local_cyc[b].cycles += dt;
+                            local_cyc[b].insns += ran;
+                            local_cyc[b].calls++;
+                            if (++local_cyc_n >= 20000) {
+                                std::lock_guard lk(g_job_lock);
+                                for (auto& [k, v] : local_cyc) {
+                                    BlockCyc& g = g_block_cyc[k];
+                                    g.cycles += v.cycles;
+                                    g.insns += v.insns;
+                                    g.calls += v.calls;
+                                }
+                                local_cyc.clear();
+                                local_cyc_n = 0;
+                            }
+                        }
                     }
                     if (!ok) break;
                     block_start = true;
@@ -1139,6 +1208,24 @@ void SpuThread::run() {
                     }
                     if ((n & ~1023u) != ((n - ran) & ~1023u)) {
                         insns.fetch_add(1024, std::memory_order_relaxed);
+                        if (slow_cycles) {
+                            uint64_t until = __rdtsc() + slow_cycles;
+                            while (__rdtsc() < until) _mm_pause();
+                        }
+                        if (job_log && (n & ~0xFFFFu) != ((n - ran) & ~0xFFFFu)) {
+                            ULONG64 cyc = 0;
+                            QueryThreadCycleTime(GetCurrentThread(), &cyc);
+                            if (cyc_mark) {
+                                g_cyc_cycles.fetch_add(cyc - cyc_mark, std::memory_order_relaxed);
+                                g_cyc_insns.fetch_add(uint32_t(n - cyc_insn_mark), std::memory_order_relaxed);
+                            }
+                            g_aot_insns.fetch_add(loc_aot, std::memory_order_relaxed);
+                            g_block_calls.fetch_add(loc_calls, std::memory_order_relaxed);
+                            g_region_insns.fetch_add(loc_region, std::memory_order_relaxed);
+                            loc_aot = loc_calls = loc_region = 0;
+                            cyc_mark = cyc;
+                            cyc_insn_mark = n;
+                        }
                         pc_samples[pc_sample_pos.fetch_add(1, std::memory_order_relaxed) & 255] = ctx.pc;
                         if (stop_flag.load(std::memory_order_relaxed)) break;
                     }
