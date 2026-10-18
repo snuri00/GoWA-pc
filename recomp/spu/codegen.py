@@ -277,6 +277,91 @@ def emit_region(table, k, members, blocks, out):
 STATE_FIELDS = ("pc", "srr0", "interrupts_enabled", "irq_check", "halted")
 
 
+def build_regions_any(table, blocks, region_of):
+    by_lsa = {}
+    for i, (lsa, _) in enumerate(blocks):
+        by_lsa.setdefault(lsa, []).append(i)
+    taken = [r >= 0 for r in region_of]
+    regions = []
+    for seed in range(len(blocks)):
+        if taken[seed]:
+            continue
+        members = [seed]
+        taken[seed] = True
+        queue = [seed]
+        while queue and len(members) < REGION_MAX:
+            i = queue.pop(0)
+            lsa, raw = blocks[i]
+            for t in successors(table, lsa, raw):
+                cands = by_lsa.get(t, [])
+                if len(cands) != 1:
+                    continue
+                j = cands[0]
+                if j in members:
+                    continue
+                members.append(j)
+                queue.append(j)
+                if len(members) >= REGION_MAX:
+                    break
+        if len(members) >= 2:
+            for j in members:
+                taken[j] = True
+            regions.append(members)
+        else:
+            taken[seed] = False
+    return regions
+
+
+def emit_region_direct(table, k, members, blocks, out):
+    out.append("bool q%d(Context& c0, Host& h) {" % k)
+    out.append("    switch (c0.pc) {")
+    for i in members:
+        out.append("    case 0x%x: break;" % blocks[i][0])
+    out.append("    default: c0.executed = 0; return true;")
+    out.append("    }")
+    out.append("    uint32_t done = 0;")
+    out.append("    switch (c0.pc) {")
+    for i in members:
+        out.append("    case 0x%x: goto B%d;" % (blocks[i][0], i))
+    out.append("    default: goto EXIT;")
+    out.append("    }")
+    for i in members:
+        lsa, raw = blocks[i]
+        n = len(raw)
+        out.append("B%d:" % i)
+        last_branch = False
+        for kk, r in enumerate(raw):
+            w = word_of(r)
+            pc = (lsa + kk * 4) & 0x3FFFC
+            name = table[w >> 21]
+            if name in CONTROL:
+                out.append("    c0.pc = 0x%x;" % ((pc + 4) & 0x3FFFC))
+                out.append("    if (!%s(c0, h, 0x%08xu, 0x%xu)) { c0.executed = done + %d; return false; }" % (name, w, pc, kk + 1))
+                if kk != n - 1 and name not in BRANCHES:
+                    out.append("    if (c0.pc != 0x%x) { done += %d; goto EXIT; }" % ((pc + 4) & 0x3FFFC, kk + 1))
+                last_branch = kk == n - 1
+            else:
+                out.append("    %s(c0, h, 0x%08xu, 0x%xu);" % (name, w, pc))
+                last_branch = False
+        if not last_branch:
+            out.append("    c0.pc = 0x%x;" % ((lsa + n * 4) & 0x3FFFC))
+        out.append("    done += %d;" % n)
+        out.append("    goto NEXT;")
+    out.append("NEXT:")
+    out.append("    if (c0.irq_check || c0.halted || done >= %d) goto EXIT;" % REGION_BUDGET)
+    out.append("    switch (c0.pc) {")
+    for i in members:
+        lsa, raw = blocks[i]
+        out.append("    case 0x%x: if (region_valid(c0, %du, 0x%xu, %du, w%d)) goto B%d; goto EXIT;" % (lsa, i, lsa, len(raw), i, i))
+    out.append("    default: goto EXIT;")
+    out.append("    }")
+    out.append("EXIT:")
+    out.append("    c0.executed = done;")
+    out.append("    return true;")
+    out.append("}")
+    out.append("")
+
+
 def emit_local_block(table, idx, lsa, raw, out):
     reads, writes = reg_sets(table, raw)
     regs = sorted(set(reads) | set(writes))
@@ -394,6 +479,12 @@ def main():
         open(os.path.join(out_dir, "spu_%03d.cpp" % f), "w", newline="\n").write("\n".join(out))
     use_regions = not os.environ.get("GOWA_SPU_NO_REGIONS")
     regions, region_of = build_regions(table, blocks) if use_regions else ([], [-1] * len(blocks))
+    qregions = build_regions_any(table, blocks, region_of) if use_regions and not os.environ.get("GOWA_SPU_NO_DIRECT_REGIONS") else []
+    qregion_of = [-1] * len(blocks)
+    for k, m in enumerate(qregions):
+        for i in m:
+            if qregion_of[i] < 0 and region_of[i] < 0:
+                qregion_of[i] = k
     per_file = 60
     rfiles = (len(regions) + per_file - 1) // per_file
     for f in range(rfiles):
@@ -409,11 +500,27 @@ def main():
         out.append("}")
         out.append("")
         open(os.path.join(out_dir, "spu_r%03d.cpp" % f), "w", newline="\n").write("\n".join(out))
+    qfiles = (len(qregions) + per_file - 1) // per_file
+    for f in range(qfiles):
+        out = ['#include "ops_impl.h"', "", "namespace spu::gen {", ""]
+        needed = set()
+        for k in range(f * per_file, min(len(qregions), (f + 1) * per_file)):
+            needed.update(qregions[k])
+        for i in sorted(needed):
+            out.append("extern const uint32_t w%d[];" % i)
+        out.append("")
+        for k in range(f * per_file, min(len(qregions), (f + 1) * per_file)):
+            emit_region_direct(table, k, qregions[k], blocks, out)
+        out.append("}")
+        out.append("")
+        open(os.path.join(out_dir, "spu_q%03d.cpp" % f), "w", newline="\n").write("\n".join(out))
     reg = ['#include "spu/aot.h"', "", "namespace spu::gen {", ""]
     for i in range(len(blocks)):
         reg.append("bool b%d(Context& c, Host& h);" % i)
     for k in range(len(regions)):
         reg.append("bool r%d(Context& c, Host& h);" % k)
+    for k in range(len(qregions)):
+        reg.append("bool q%d(Context& c, Host& h);" % k)
     reg.append("")
     for i, (lsa, raw) in enumerate(blocks):
         reg.append("extern const uint32_t w%d[] = {%s};" % (i, ", ".join("0x%08xu" % r for r in raw)))
@@ -425,7 +532,7 @@ def main():
     if blocks:
         reg.append("const CompiledBlock g_blocks[] = {")
         for i, (lsa, raw) in enumerate(blocks):
-            reg.append("    {0x%xu, %du, gen::w%d, gen::b%d, %s, %s}," % (lsa, len(raw), i, i, "true" if is_pure(table, raw) else "false", ("gen::r%d" % region_of[i]) if region_of[i] >= 0 else "nullptr"))
+            reg.append("    {0x%xu, %du, gen::w%d, gen::b%d, %s, %s}," % (lsa, len(raw), i, i, "true" if is_pure(table, raw) else "false", ("gen::r%d" % region_of[i]) if region_of[i] >= 0 else ("gen::q%d" % qregion_of[i]) if qregion_of[i] >= 0 else "nullptr"))
         reg.append("};")
         reg.append("")
         reg.append("const CompiledBlock* compiled_blocks(size_t& count) {")
@@ -441,7 +548,7 @@ def main():
     reg.append("}")
     reg.append("")
     open(os.path.join(out_dir, "spu_registry.cpp"), "w", newline="\n").write("\n".join(reg))
-    print("%d blocks, %d instructions, %d files, %d regions covering %d blocks" % (len(blocks), sum(len(r) for _, r in blocks), files, len(regions), sum(len(m) for m in regions)))
+    print("%d blocks, %d instructions, %d files, %d regions covering %d blocks, %d direct regions covering %d blocks" % (len(blocks), sum(len(r) for _, r in blocks), files, len(regions), sum(len(m) for m in regions), len(qregions), sum(len(m) for m in qregions)))
     return 0
 
 
