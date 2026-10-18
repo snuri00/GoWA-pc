@@ -1053,8 +1053,14 @@ void SpuThread::run() {
         if (!int_ok) halted_in_verify = true;
         return true;
     };
-    std::vector<const CompiledBlock*> block_cache(aot_on ? LS_SIZE / 4 : 0, nullptr);
-    std::vector<uint32_t> block_valid(aot_on ? LS_SIZE / 4 : 0, 0);
+    struct alignas(32) Slot {
+        const CompiledBlock* b;
+        BlockFn fn;
+        BlockFn region;
+        uint32_t words;
+        uint32_t valid;
+    };
+    std::vector<Slot> block_cache(aot_on ? LS_SIZE / 4 : 0, Slot{});
     static const bool no_fresh = std::getenv("GOWA_SPU_NO_FRESH") != nullptr;
     const bool use_regions = !verify && !std::getenv("GOWA_SPU_NO_REGIONS");
     uint32_t irq_countdown = 256;
@@ -1079,16 +1085,18 @@ void SpuThread::run() {
                 }
             }
             if (aot_on) {
-                const CompiledBlock*& slot = block_cache[ctx.pc >> 2];
-                const CompiledBlock* b = slot;
-                uint32_t& valid = block_valid[ctx.pc >> 2];
-                if (!b || no_fresh || !ls_fresh(ctx.pc, b->words, valid)) {
+                Slot& slot = block_cache[ctx.pc >> 2];
+                const CompiledBlock* b = slot.b;
+                if (!b || no_fresh || !ls_fresh(ctx.pc, slot.words, slot.valid)) {
                     uint32_t e = ls_epoch.load(std::memory_order_acquire);
                     if (!b || std::memcmp(ls + ctx.pc, b->code, b->words * 4) != 0) {
                         b = aot::find(ls, ctx.pc);
-                        slot = b;
+                        slot.b = b;
+                        slot.fn = b ? b->fn : nullptr;
+                        slot.region = b && use_regions ? b->region : nullptr;
+                        slot.words = b ? b->words : 0;
                     }
-                    valid = b ? e : 0;
+                    slot.valid = b ? e : 0;
                 }
                 if (b && verify && verify_block(b)) {
                     n += b->words;
@@ -1099,17 +1107,17 @@ void SpuThread::run() {
                 if (b && pure_only && !b->pure) b = nullptr;
                 if (b) {
                     bool ok;
-                    uint32_t ran = b->words;
-                    if (b->region && use_regions) {
+                    uint32_t ran = slot.words;
+                    if (slot.region) {
                         ctx.executed = 0;
-                        ok = b->region(ctx, *this);
+                        ok = slot.region(ctx, *this);
                         if (ctx.executed) {
                             ran = ctx.executed;
                             if (job_log) g_region_insns.fetch_add(ran, std::memory_order_relaxed);
                         }
-                        else ok = b->fn(ctx, *this);
+                        else ok = slot.fn(ctx, *this);
                     } else {
-                        ok = b->fn(ctx, *this);
+                        ok = slot.fn(ctx, *this);
                     }
                     n += ran;
                     if (job_log) {
