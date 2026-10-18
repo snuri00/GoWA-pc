@@ -574,6 +574,16 @@ bool SpuThread::merge_put(uint32_t ea, uint32_t size, uint32_t lsa) {
             std::memcpy(base, src, size);
             return false;
         }
+        uint32_t table = vm::is_mapped(0x9B2298) ? vm::read32(0x9B2298) : 0;
+        if (table && ea >= table && ea + size <= table + 0xA280 && ((ea - table) & 15) == 0 && (size & 15) == 0) {
+            for (uint32_t i = 0; i < size; i += 16) {
+                if (std::memcmp(vm::ptr(ea + i), base + i, 16) != 0) continue;
+                if (std::memcmp(src + i, base + i, 16) == 0) continue;
+                rsv::merge_bits(ea + i, src + i, base + i, 16);
+            }
+            std::memcpy(base, src, size);
+            return true;
+        }
         uint32_t i = 0;
         while (i < size) {
             uint32_t n = (std::min)(4u, size - i);
@@ -1144,6 +1154,10 @@ void SpuThread::run() {
     swprintf(w, 64, L"SPU %u %hs", slot, name.c_str());
     SetThreadDescription(GetCurrentThread(), w);
     if (!std::getenv("GOWA_SPU_NORMAL_PRIO")) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    if (const char* aff = std::getenv("GOWA_SPU_AFFINITY")) {
+        int stride = std::atoi(aff);
+        if (stride > 0) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << ((slot * stride) % 12));
+    }
     _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
     LOG_INFO("spu", "thread 0x%x '%s' start pc 0x%05x args 0x%llx 0x%llx", id, name.c_str(), ctx.pc,
              static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));

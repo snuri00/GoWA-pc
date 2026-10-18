@@ -214,6 +214,12 @@ def cmd_run(args):
         pass
     json.dump(meta, open(os.path.join(out, "meta.json"), "w"), indent=1)
     print("run", name, "for", duration, "s")
+    golden = os.path.join(RUN_DIR, "savedata_golden")
+    if os.path.isdir(golden) and not args.keep_save:
+        dst = os.path.join(RUN_DIR, "vfs", "dev_hdd0", "home", "00000001", "savedata")
+        for d in os.listdir(golden):
+            shutil.rmtree(os.path.join(dst, d), ignore_errors=True)
+            shutil.copytree(os.path.join(golden, d), os.path.join(dst, d))
     for f in ("blackbox.req", "blackbox.done"):
         if os.path.exists(os.path.join(RUN_DIR, f)):
             os.remove(os.path.join(RUN_DIR, f))
@@ -336,6 +342,7 @@ def main():
     p.add_argument("--snap-from", type=float)
     p.add_argument("--trace")
     p.add_argument("--env", action="append")
+    p.add_argument("--keep-save", action="store_true")
     p = sub.add_parser("show")
     p.add_argument("run", nargs="?", default="last")
     sub.add_parser("list")
