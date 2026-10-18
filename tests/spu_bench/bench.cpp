@@ -141,6 +141,8 @@ struct State {
     }
 };
 
+bool g_skip_same = true;
+
 class Replay : public spu::Host {
 public:
     State& s;
@@ -164,8 +166,10 @@ public:
             s.c.halted = true;
         }
         if (!e.lines.empty()) {
-            uint32_t ep = s.epoch.fetch_add(1) + 1;
+            uint32_t ep = 0;
             for (auto& [l, d] : e.lines) {
+                if (g_skip_same && std::memcmp(s.ls + l, d, 128) == 0) continue;
+                if (!ep) ep = s.epoch.fetch_add(1) + 1;
                 std::memcpy(s.ls + l, d, 128);
                 s.line_epoch[l >> 7].store(ep);
             }
@@ -211,12 +215,14 @@ std::map<uint64_t, uint64_t> g_rips;
 
 void sampler(HANDLE target) {
     while (g_sampling.load()) {
-        Sleep(0);
+        uint64_t until = __rdtsc() + 400000;
+        while (__rdtsc() < until) _mm_pause();
         if (SuspendThread(target) == static_cast<DWORD>(-1)) return;
         CONTEXT c{};
         c.ContextFlags = CONTEXT_CONTROL;
-        if (GetThreadContext(target, &c)) g_rips[c.Rip]++;
+        bool ok = GetThreadContext(target, &c) != 0;
         ResumeThread(target);
+        if (ok) g_rips[c.Rip]++;
     }
 }
 
@@ -237,8 +243,7 @@ void report_samples() {
     }
     std::vector<std::pair<std::string, uint64_t>> v(by_fn.begin(), by_fn.end());
     std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
-    for (size_t i = 0; i < v.size() && i < 30; i++) std::printf("  %5.1f%% %s
-", 100.0 * v[i].second / total, v[i].first.c_str());
+    for (size_t i = 0; i < v.size() && i < 30; i++) std::printf("  %5.1f%% %s\n", 100.0 * v[i].second / total, v[i].first.c_str());
     std::FILE* f = std::fopen("spu_bench_rips.txt", "w");
     if (f) {
         for (auto& [rip, n] : g_rips) {
@@ -246,8 +251,7 @@ void report_samples() {
             sym->SizeOfStruct = sizeof(SYMBOL_INFO);
             sym->MaxNameLen = 255;
             DWORD64 disp = 0;
-            if (SymFromAddr(GetCurrentProcess(), rip, &disp, sym)) std::fprintf(f, "%llu %s+0x%llx
-", static_cast<unsigned long long>(n), sym->Name, static_cast<unsigned long long>(disp));
+            if (SymFromAddr(GetCurrentProcess(), rip, &disp, sym)) std::fprintf(f, "%llu %s+0x%llx\n", static_cast<unsigned long long>(n), sym->Name, static_cast<unsigned long long>(disp));
         }
         std::fclose(f);
     }
@@ -348,6 +352,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-regions") regions = false;
         else if (a == "--profile") g_profile = true;
         else if (a == "--sample") g_sample = true;
+        else if (a == "--no-skip-same") g_skip_same = false;
         else files.push_back(a);
     }
     State s;
@@ -385,6 +390,10 @@ int main(int argc, char** argv) {
         report_samples();
     }
     if (g_profile) {
+        if (std::FILE* f = std::fopen("spu_bench_blocks.txt", "w")) {
+            for (auto& [b, st] : g_stats) std::fprintf(f, "%u %u %llu %llu %llu\n", b->lsa, b->words, static_cast<unsigned long long>(st.calls), static_cast<unsigned long long>(st.insns), static_cast<unsigned long long>(st.cycles));
+            std::fclose(f);
+        }
         std::vector<std::pair<const spu::CompiledBlock*, BlockStat>> v(g_stats.begin(), g_stats.end());
         std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.cycles > b.second.cycles; });
         uint64_t tot = 0;

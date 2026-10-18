@@ -539,10 +539,18 @@ void note_job(uint32_t id, uint32_t wid, uint32_t src, uint32_t pc, int mode, ui
     if (mode >= 2) LOG_INFO("spujob", "thread 0x%x enters code %08x wid %u pc 0x%05x", id, src, wid, pc);
 }
 
+void SpuThread::forget_ls(uint32_t lsa, uint32_t size) {
+    for (DmaSnap& d : dma_snaps) {
+        if (d.size && d.lsa < lsa + size && lsa < d.lsa + d.size) d.size = 0;
+    }
+}
+
 void SpuThread::remember_get(uint32_t ea, uint32_t size, uint32_t lsa) {
+    forget_ls(lsa, size);
+    if (size < 16) return;
     DmaSnap* slot_ptr = nullptr;
     for (DmaSnap& d : dma_snaps) {
-        if (d.size && d.ea == ea) {
+        if (!d.size) {
             slot_ptr = &d;
             break;
         }
@@ -559,32 +567,35 @@ void SpuThread::remember_get(uint32_t ea, uint32_t size, uint32_t lsa) {
 
 bool SpuThread::merge_put(uint32_t ea, uint32_t size, uint32_t lsa) {
     for (DmaSnap& d : dma_snaps) {
-        if (!d.size || d.ea != ea || d.size != size) continue;
-        d.size = 0;
-        if (std::memcmp(vm::ptr(ea), d.data.data(), size) == 0) return false;
+        if (!d.size || ea < d.ea || ea + size > d.ea + d.size || d.lsa + (ea - d.ea) != lsa) continue;
+        uint8_t* base = d.data.data() + (ea - d.ea);
         const uint8_t* src = ls + lsa;
-        const uint8_t* old = d.data.data();
+        if (std::memcmp(vm::ptr(ea), base, size) == 0) {
+            std::memcpy(base, src, size);
+            return false;
+        }
         uint32_t i = 0;
         while (i < size) {
             uint32_t n = (std::min)(4u, size - i);
-            if (std::memcmp(src + i, old + i, n) == 0) {
+            if (std::memcmp(src + i, base + i, n) == 0) {
                 i += n;
                 continue;
             }
             uint32_t start = i;
             while (i < size) {
                 uint32_t k = (std::min)(4u, size - i);
-                if (std::memcmp(src + i, old + i, k) == 0) break;
+                if (std::memcmp(src + i, base + i, k) == 0) break;
                 i += k;
             }
             uint32_t done = start;
             while (done < i) {
                 uint32_t a = ea + done;
                 uint32_t chunk = (std::min)(i - done, 128 - (a & 127));
-                rsv::merge_bits(a, src + done, old + done, chunk);
+                rsv::merge_bits(a, src + done, base + done, chunk);
                 done += chunk;
             }
         }
+        std::memcpy(base, src, size);
         return true;
     }
     return false;
@@ -684,18 +695,24 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         }
     } else if (ea < 0xF0000000u) {
         race_on_get(id, ea, size, ctx.pc);
-        mark_ls(lsa, size);
         bool snap = put_merge_enabled() && size >= 16;
         uint32_t done = 0;
         alignas(16) uint8_t line[128];
+        uint32_t dirty_lo = 0xFFFFFFFFu, dirty_hi = 0;
         while (done < size) {
             uint32_t a = ea + done;
             uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
             rsv::snapshot(a & ~127u, line);
-            std::memcpy(ls + lsa + done, line + (a & 127), chunk);
+            if (std::memcmp(ls + lsa + done, line + (a & 127), chunk) != 0) {
+                std::memcpy(ls + lsa + done, line + (a & 127), chunk);
+                dirty_lo = (std::min)(dirty_lo, lsa + done);
+                dirty_hi = (std::max)(dirty_hi, lsa + done + chunk);
+            }
             done += chunk;
         }
+        if (dirty_hi) mark_ls(dirty_lo, dirty_hi - dirty_lo);
         if (snap) remember_get(ea, size, lsa);
+        else forget_ls(lsa, size);
         for (uint32_t l = lsa >> 7; l <= ((lsa + size - 1) >> 7) && l < 0x40000 / 128; l++) line_src[l] = ea;
     } else {
         std::memcpy(ls + lsa, p, size);
@@ -777,6 +794,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
         rtime = ver;
         std::memcpy(rdata, snap, 128);
         std::memcpy(ls + (lsa & 0x3FF80), snap, 128);
+        forget_ls(lsa & 0x3FF80, 128);
         mark_ls(lsa & 0x3FF80, 128);
         atomic_stat = 4;
         atomic_stat_count = true;
@@ -1129,6 +1147,11 @@ void SpuThread::run() {
     _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
     LOG_INFO("spu", "thread 0x%x '%s' start pc 0x%05x args 0x%llx 0x%llx", id, name.c_str(), ctx.pc,
              static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));
+    if (!native) {
+        HANDLE hh = nullptr;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &hh, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        native = hh;
+    }
     register_thread(this);
     if (const char* e = std::getenv("GOWA_PROFILE_SPU")) {
         if (std::string(e) == "all" || static_cast<uint32_t>(std::atoi(e)) == slot) {
@@ -1413,6 +1436,8 @@ void occupancy_sampler() {
     uint64_t conc[8] = {};
     uint64_t samples = 0;
     auto last = std::chrono::steady_clock::now();
+    std::map<SpuThread*, std::pair<uint64_t, uint64_t>> prev_cpu;
+    uint64_t prev_tsc = __rdtsc();
     for (;;) {
         std::this_thread::sleep_for(std::chrono::microseconds(500));
         int busy = 0;
@@ -1452,6 +1477,24 @@ void occupancy_sampler() {
             c += b;
         }
         LOG_INFO("spuocc", "SPUs running job code:%s", c.c_str());
+        {
+            uint64_t tsc = __rdtsc();
+            std::string u;
+            std::lock_guard lk(g_reg_lock);
+            for (SpuThread* t : g_reg) {
+                ULONG64 cyc = 0;
+                if (t->native) QueryThreadCycleTime(static_cast<HANDLE>(t->native), &cyc);
+                uint64_t ins = t->insns.load();
+                auto& pv = prev_cpu[t];
+                char b[96];
+                if (pv.first) std::snprintf(b, sizeof b, " [%u cpu %.0f%% %.0fM insn/s]", t->slot, 100.0 * double(cyc - pv.first) / double(tsc - prev_tsc), double(ins - pv.second) / 10.0 / 1e6);
+                else b[0] = 0;
+                u += b;
+                pv = {cyc, ins};
+            }
+            prev_tsc = tsc;
+            if (!u.empty()) LOG_INFO("spuocc", "thread cpu:%s", u.c_str());
+        }
         by_job.clear();
         std::memset(conc, 0, sizeof conc);
         samples = 0;

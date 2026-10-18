@@ -136,7 +136,7 @@ def emit_pure_block(table, idx, lsa, raw, out):
     out.append("")
 
 
-REGION_MAX = 64
+REGION_MAX = int(os.environ.get("GOWA_SPU_REGION_MAX", "64"))
 REGION_BUDGET = 4096
 COND_BRANCH = {"op_brz", "op_brnz", "op_brhz", "op_brhnz", "op_biz", "op_binz", "op_bihz", "op_bihnz"}
 
@@ -312,8 +312,8 @@ def build_regions_any(table, blocks, region_of):
     return regions
 
 
-def emit_region_direct(table, k, members, blocks, out):
-    out.append("bool q%d(Context& c0, Host& h) {" % k)
+def emit_region_direct(table, k, members, blocks, out, prefix="q"):
+    out.append("bool %s%d(Context& c0, Host& h) {" % (prefix, k))
     out.append("    switch (c0.pc) {")
     for i in members:
         out.append("    case 0x%x: break;" % blocks[i][0])
@@ -425,7 +425,7 @@ def emit_local_block(table, idx, lsa, raw, out):
 
 
 def emit_block(table, idx, lsa, raw, out):
-    if not os.environ.get("GOWA_SPU_NO_LOCAL") and is_pure(table, raw):
+    if os.environ.get("GOWA_SPU_LOCAL") and is_pure(table, raw):
         emit_pure_block(table, idx, lsa, raw, out)
         return
     if os.environ.get("GOWA_SPU_LOCAL_IMPURE"):
@@ -496,7 +496,10 @@ def main():
             out.append("extern const uint32_t w%d[];" % i)
         out.append("")
         for k in range(f * per_file, min(len(regions), (f + 1) * per_file)):
-            emit_region(table, k, regions[k], blocks, out)
+            if os.environ.get("GOWA_SPU_LOCAL"):
+                emit_region(table, k, regions[k], blocks, out)
+            else:
+                emit_region_direct(table, k, regions[k], blocks, out, "r")
         out.append("}")
         out.append("")
         open(os.path.join(out_dir, "spu_r%03d.cpp" % f), "w", newline="\n").write("\n".join(out))

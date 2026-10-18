@@ -33,12 +33,13 @@ struct SpuThread : Host {
         uint32_t lsa = 0;
         std::vector<uint8_t> data;
     };
-    std::array<DmaSnap, 16> dma_snaps{};
+    std::array<DmaSnap, 64> dma_snaps{};
     std::unique_ptr<uint32_t[]> line_src{new uint32_t[0x40000 / 128]()};
     uint32_t cur_src = 0;
     uint64_t src_insn_mark = 0;
     uint32_t dma_snap_next = 0;
     void remember_get(uint32_t ea, uint32_t size, uint32_t lsa);
+    void forget_ls(uint32_t lsa, uint32_t size);
     bool merge_put(uint32_t ea, uint32_t size, uint32_t lsa);
     std::atomic<uint32_t> ls_epoch{1};
     std::atomic<uint32_t> ls_all_epoch{1};
@@ -108,6 +109,7 @@ struct SpuThread : Host {
     uint32_t dec_value = 0;
     bool dec_frozen = false;
     bool irq_taken = false;
+    void* native = nullptr;
 
     uint32_t mfc_lsa = 0, mfc_eal = 0, mfc_size = 0, mfc_tag = 0;
     uint32_t tag_mask = 0;
