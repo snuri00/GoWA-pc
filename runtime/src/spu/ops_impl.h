@@ -248,7 +248,13 @@ SPU_INLINE bool op_shufb(Context& c, Host&, uint32_t w, uint32_t) {
     return true;
 }
 
-SPU_INLINE bool op_fsmb(Context& c, Host&, uint32_t w, uint32_t) { uint32_t m = pref(G(RA(w))) & 0xFFFF; v128 r; for (int i = 0; i < 16; i++) set_be_byte(r, i, (m >> (15 - i)) & 1 ? 0xFF : 0); G(RT(w)) = r; return true; }
+SPU_INLINE bool op_fsmb(Context& c, Host&, uint32_t w, uint32_t) {
+    uint32_t mv = pref(G(RA(w))) & 0xFFFF;
+    __m128i b = _mm_shuffle_epi8(_mm_cvtsi32_si128(int(mv)), _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1));
+    __m128i bits = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+    G(RT(w)).vi = _mm_cmpeq_epi8(_mm_and_si128(b, bits), bits);
+    return true;
+}
 SPU_INLINE bool op_fsmh(Context& c, Host&, uint32_t w, uint32_t) { uint32_t m = pref(G(RA(w))) & 0xFF; v128 r; for (int i = 0; i < 8; i++) r.u16[7 - i] = (m >> (7 - i)) & 1 ? 0xFFFF : 0; G(RT(w)) = r; return true; }
 SPU_INLINE bool op_fsm(Context& c, Host&, uint32_t w, uint32_t) { uint32_t m = pref(G(RA(w))) & 0xF; v128 r; for (int i = 0; i < 4; i++) r.u32[3 - i] = (m >> (3 - i)) & 1 ? 0xFFFFFFFF : 0; G(RT(w)) = r; return true; }
 SPU_INLINE bool op_gbb(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)); uint32_t m = 0; for (int i = 0; i < 16; i++) m = (m << 1) | (be_byte(a, i) & 1); G(RT(w)) = pref_only(m); return true; }
@@ -313,13 +319,28 @@ SPU_INLINE bool op_rotqmbi(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) =
 SPU_INLINE bool op_rotqmbii(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = qshr_bits(G(RA(w)), (0u - uint32_t(I7(w))) & 7); return true; }
 
 SPU_INLINE v128 insert_mask(uint32_t t, int size) {
-    v128 r;
-    for (int i = 0; i < 16; i++) set_be_byte(r, i, uint8_t(0x10 + i));
-    uint32_t base = t & ~uint32_t(size - 1) & 0xF;
-    static const uint8_t pat[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-    if (size == 1) set_be_byte(r, int(t & 0xF), 0x03);
-    else if (size == 2) { set_be_byte(r, int(base), 0x02); set_be_byte(r, int(base) + 1, 0x03); }
-    else for (int k = 0; k < size; k++) set_be_byte(r, int(base) + k, pat[k]);
+    const __m128i base = _mm_setr_epi8(0x1F, 0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10);
+    __m128i pat, msk;
+    if (size == 1) {
+        pat = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3);
+        msk = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1);
+    } else if (size == 2) {
+        pat = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 2);
+        msk = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1);
+    } else if (size == 4) {
+        pat = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 2, 1, 0);
+        msk = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1);
+    } else {
+        pat = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 7, 6, 5, 4, 3, 2, 1, 0);
+        msk = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1);
+    }
+    uint32_t pos = (size == 1 ? t : (t & ~uint32_t(size - 1))) & 0xF;
+    v128 p, m, r;
+    p.vi = pat;
+    m.vi = msk;
+    p = qshr_bytes(p, pos);
+    m = qshr_bytes(m, pos);
+    r.vi = _mm_blendv_epi8(base, p.vi, m.vi);
     return r;
 }
 SPU_INLINE bool op_cbd(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = insert_mask(pref(G(RA(w))) + uint32_t(I7(w)), 1); return true; }
