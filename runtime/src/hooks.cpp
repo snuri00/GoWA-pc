@@ -47,6 +47,7 @@ struct Hook {
     uint32_t addr = 0;
     bool ring = false;
     bool panic = false;
+    bool (*guard)(ppu::Context&) = nullptr;
     std::vector<Dump> dumps;
     std::atomic<uint64_t> calls{0};
     std::atomic<uint32_t> logged{0};
@@ -172,6 +173,7 @@ void impl(ppu::Context& ctx, uint8_t* base, uint32_t addr, ppu::BodyFn fn) {
         return;
     }
     h->calls.fetch_add(1, std::memory_order_relaxed);
+    if (h->guard && h->guard(ctx)) return;
     if (h->panic) {
         record(h, ctx);
         std::string msg = guest_string(static_cast<uint32_t>(ctx.gpr[3]));
@@ -287,6 +289,38 @@ void capture(const char* reason) {
     LOG_WARN("blackbox", "capture done");
 }
 
+bool skip_repeated_mip_eviction(ppu::Context& ctx) {
+    uint32_t slot = static_cast<uint32_t>(ctx.gpr[4]);
+    if (!vm::range_mapped(slot, 0x48)) return false;
+    uint32_t record = vm::read32(slot + 0x44);
+    if (!record || !vm::range_mapped(record, 0x20)) return false;
+    uint32_t evict = vm::read32(slot + 0x1c);
+    uint32_t size = vm::read32(record + 0xc);
+    if (size >= evict) return false;
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1) < 8) LOG_WARN("patch", "skipped repeated top-mip eviction of record 0x%08x (size 0x%x, evict 0x%x)", record, size, evict);
+    return true;
+}
+
+void install_patches() {
+    if (const char* e = std::getenv("GOWA_GAME_PATCHES"); e && std::string(e) == "0") return;
+    struct Patch {
+        uint32_t addr;
+        bool (*guard)(ppu::Context&);
+    };
+    static const Patch patches[] = {{0x39ea58, skip_repeated_mip_eviction}};
+    for (const Patch& p : patches) {
+        Hook*& h = g_hooks[p.addr];
+        if (!h) {
+            h = new Hook;
+            h->addr = p.addr;
+            h->ring = true;
+        }
+        h->guard = p.guard;
+        ppu::hook_flags[p.addr >> 2] = 1;
+    }
+}
+
 void init() {
     if (const char* n = std::getenv("GOWA_SYMBOLS")) load_names(n);
     else load_names("../docs/re/symbols.txt");
@@ -295,7 +329,11 @@ void init() {
     if (!bb) bb = "52bd7c:panic,3a2adc:ring,3a2690:ring,3a12a0:ring,3a0000:ring:p9b26ac*=0x40,39f3c4:ring,39f06c:ring,39b6f4:ring:d3=0x40";
     if (*bb && std::string(bb) != "0") combined += (combined.empty() ? "" : ",") + std::string(bb);
     const char* spec = combined.c_str();
-    if (!*spec) return;
+    if (!*spec) {
+        install_patches();
+        if (!g_hooks.empty()) ppu::hook_impl = impl;
+        return;
+    }
     if (const char* m = std::getenv("GOWA_HOOK_MAX")) g_max = static_cast<uint32_t>(std::atoi(m));
     if (const char* a = std::getenv("GOWA_HOOK_AT")) g_at = std::atof(a);
     g_count_only = std::getenv("GOWA_HOOK_COUNT") != nullptr;
@@ -351,6 +389,7 @@ void init() {
         ppu::hook_flags[addr >> 2] = 1;
         if (!h->ring && !h->panic) LOG_INFO("hook", "hooked %s at 0x%08x", name_of(addr).c_str(), addr);
     }
+    install_patches();
     if (g_hooks.empty()) return;
     ppu::hook_impl = impl;
     if (g_count_only) std::thread(summary_thread).detach();
