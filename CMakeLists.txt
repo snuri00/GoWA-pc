@@ -67,6 +67,11 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/out/conformance/tests.cpp")
     target_compile_options(ppu_conformance PRIVATE ${GOWA_ARCH_FLAGS} /clang:${GOWA_GENERATED_OPT})
 endif()
 
+add_executable(spu_bench tests/spu_bench/bench.cpp runtime/src/spu/interpreter.cpp runtime/src/spu/aot.cpp runtime/src/log.cpp)
+target_include_directories(spu_bench PRIVATE runtime/include runtime/src/spu)
+target_link_libraries(spu_bench PRIVATE gowa_spu gowa_ppu_ops)
+target_compile_options(spu_bench PRIVATE ${GOWA_ARCH_FLAGS} /clang:-frounding-math /EHsc)
+
 add_executable(spu_conformance tests/spu_conformance/harness.cpp runtime/src/spu/interpreter.cpp)
 target_include_directories(spu_conformance PRIVATE runtime/include)
 target_link_libraries(spu_conformance PRIVATE gowa_ppu_ops)

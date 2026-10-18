@@ -85,7 +85,8 @@ void log_change(uint32_t line, uint32_t offset, const uint8_t* data, uint32_t si
 bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uint8_t* data, uint32_t offset, uint32_t size, bool data_only) {
     Entry& e = entry(line);
     std::lock_guard lk(e.lock);
-    if (!data_only && e.ver.load(std::memory_order_acquire) != rtime) return false;
+    static const bool strict = std::getenv("GOWA_RSV_STRICT") != nullptr;
+    if ((strict || !data_only) && e.ver.load(std::memory_order_acquire) != rtime) return false;
     if (std::memcmp(vm::ptr(line + offset), expected, size) != 0) return false;
     log_change(line, offset, data, size, size == 128 ? "putllc" : "stcx");
     e.ver.fetch_add(64, std::memory_order_acq_rel);
@@ -125,7 +126,8 @@ void store_locked(uint32_t addr, const void* data, uint32_t size) {
 }
 
 bool lost(uint32_t line, uint64_t rtime, const uint8_t* rdata) {
-    if (entry(line).ver.load(std::memory_order_acquire) == rtime) return false;
+    static const bool strict = std::getenv("GOWA_RSV_STRICT") != nullptr;
+    if (strict && entry(line).ver.load(std::memory_order_acquire) != rtime) return true;
     return std::memcmp(vm::ptr(line), rdata, 128) != 0;
 }
 

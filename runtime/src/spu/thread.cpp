@@ -94,6 +94,7 @@ void SpuThread::check_interrupt() {
     collect_events();
     if (!event_count) return;
     ctx.interrupts_enabled = false;
+    irq_taken = true;
     ctx.srr0 = ctx.pc;
     uint32_t w;
     std::memcpy(&w, ls, 4);
@@ -1025,6 +1026,94 @@ struct ReplayHost : Host {
     void halt(uint32_t pc, uint32_t word) override { next(4, pc, word, true); }
 };
 
+struct CaptureHost : Host {
+    SpuThread& t;
+    std::vector<uint8_t> out;
+    std::vector<uint8_t> shadow;
+    uint32_t events = 0;
+    explicit CaptureHost(SpuThread& thread) : t(thread), shadow(LS_SIZE) {}
+    template <class T>
+    void put(const T& v) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        out.insert(out.end(), p, p + sizeof v);
+    }
+    void begin() { std::memcpy(shadow.data(), t.ls, LS_SIZE); }
+    void note_irq(uint32_t at) {
+        begin();
+        note(5, 0, at, true);
+    }
+    void note(int32_t kind, uint32_t ch, uint32_t value, bool result) {
+        events++;
+        put(kind);
+        put(ch);
+        put(value);
+        put(t.ctx.pc);
+        put(t.ctx.srr0);
+        uint8_t flags[4] = {uint8_t(t.ctx.interrupts_enabled), uint8_t(t.ctx.halted), uint8_t(result), 0};
+        put(flags);
+        size_t count_at = out.size();
+        put(uint32_t(0));
+        uint32_t lines = 0;
+        for (uint32_t l = 0; l < LS_SIZE; l += 128) {
+            if (std::memcmp(shadow.data() + l, t.ls + l, 128) == 0) continue;
+            put(l);
+            out.insert(out.end(), t.ls + l, t.ls + l + 128);
+            lines++;
+        }
+        std::memcpy(out.data() + count_at, &lines, 4);
+    }
+    uint32_t read_channel(uint32_t ch) override {
+        begin();
+        uint32_t v = t.read_channel(ch);
+        note(0, ch, v, true);
+        return v;
+    }
+    void write_channel(uint32_t ch, uint32_t value) override {
+        begin();
+        t.write_channel(ch, value);
+        note(1, ch, value, true);
+    }
+    uint32_t channel_count(uint32_t ch) override {
+        begin();
+        uint32_t v = t.channel_count(ch);
+        note(2, ch, v, true);
+        return v;
+    }
+    bool stop_and_signal(uint32_t code) override {
+        begin();
+        bool r = t.stop_and_signal(code);
+        note(3, code, 0, r);
+        return r;
+    }
+    void halt(uint32_t pc, uint32_t word) override {
+        begin();
+        t.halt(pc, word);
+        note(4, pc, word, true);
+    }
+};
+
+void write_capture(SpuThread& t, const Context& start, const std::vector<uint8_t>& ls0, CaptureHost& cap, uint32_t insns) {
+    CreateDirectoryA("spucap", nullptr);
+    char path[64];
+    std::snprintf(path, sizeof path, "spucap/cap_%u.bin", t.slot);
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    uint32_t hdr[4] = {0x43555053u, 1u, t.slot, insns};
+    std::fwrite(hdr, 4, 4, f);
+    uint32_t st[3] = {start.pc, start.srr0, uint32_t(start.interrupts_enabled)};
+    std::fwrite(st, 4, 3, f);
+    std::fwrite(start.gpr, 16, 128, f);
+    std::fwrite(ls0.data(), 1, LS_SIZE, f);
+    std::fwrite(&cap.events, 4, 1, f);
+    std::fwrite(cap.out.data(), 1, cap.out.size(), f);
+    uint32_t fin[3] = {t.ctx.pc, t.ctx.srr0, uint32_t(t.ctx.interrupts_enabled)};
+    std::fwrite(fin, 4, 3, f);
+    std::fwrite(t.ctx.gpr, 16, 128, f);
+    std::fwrite(t.ls, 1, LS_SIZE, f);
+    std::fclose(f);
+    LOG_INFO("spucap", "thread %u captured %u insns, %u channel events, %zu bytes", t.slot, insns, cap.events, cap.out.size());
+}
+
 }
 
 void SpuThread::run() {
@@ -1114,6 +1203,14 @@ void SpuThread::run() {
     const bool use_regions = !verify && !std::getenv("GOWA_SPU_NO_REGIONS");
     uint32_t irq_countdown = 256;
     uint64_t cyc_mark = 0;
+    Host* host = this;
+    static const double cap_at = std::getenv("GOWA_SPU_CAPTURE_AT") ? std::atof(std::getenv("GOWA_SPU_CAPTURE_AT")) : 0.0;
+    static const uint32_t cap_insns = std::getenv("GOWA_SPU_CAPTURE_INSNS") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_SPU_CAPTURE_INSNS"), nullptr, 0)) : 20000000u;
+    std::unique_ptr<CaptureHost> cap;
+    Context cap_start;
+    std::vector<uint8_t> cap_ls;
+    uint32_t cap_n = 0;
+    bool cap_done = false;
     uint64_t loc_aot = 0, loc_calls = 0, loc_region = 0;
     static const uint64_t slow_cycles = std::getenv("GOWA_SPU_SLOW") ? std::strtoull(std::getenv("GOWA_SPU_SLOW"), nullptr, 0) : 0;
     std::unordered_map<const void*, BlockCyc> local_cyc;
@@ -1166,14 +1263,14 @@ void SpuThread::run() {
                     uint64_t t0 = job_log >= 3 ? __rdtsc() : 0;
                     if (slot.region) {
                         ctx.executed = 0;
-                        ok = slot.region(ctx, *this);
+                        ok = slot.region(ctx, *host);
                         if (ctx.executed) {
                             ran = ctx.executed;
                             if (job_log) loc_region += ran;
                         }
-                        else ok = slot.fn(ctx, *this);
+                        else ok = slot.fn(ctx, *host);
                     } else {
-                        ok = slot.fn(ctx, *this);
+                        ok = slot.fn(ctx, *host);
                     }
                     n += ran;
                     if (job_log) {
@@ -1200,6 +1297,7 @@ void SpuThread::run() {
                     }
                     if (!ok) break;
                     block_start = true;
+                    uint32_t pc_before_irq = ctx.pc;
                     if (ctx.irq_check) {
                         ctx.irq_check = false;
                         check_interrupt();
@@ -1211,6 +1309,7 @@ void SpuThread::run() {
                             irq_countdown -= ran;
                         }
                     }
+                    if (cap && ctx.pc != pc_before_irq) cap->note_irq(n - cap_n);
                     if ((n & ~1023u) != ((n - ran) & ~1023u)) {
                         insns.fetch_add(1024, std::memory_order_relaxed);
                         if (slow_cycles) {
@@ -1233,6 +1332,20 @@ void SpuThread::run() {
                         }
                         pc_samples[pc_sample_pos.fetch_add(1, std::memory_order_relaxed) & 255] = ctx.pc;
                         if (stop_flag.load(std::memory_order_relaxed)) break;
+                        if (cap_at > 0.0 && !cap_done) {
+                            if (!cap && logging::uptime() >= cap_at) {
+                                cap = std::make_unique<CaptureHost>(*this);
+                                cap_start = ctx;
+                                cap_ls.assign(ls, ls + LS_SIZE);
+                                cap_n = n;
+                                host = cap.get();
+                            } else if (cap && n - cap_n >= cap_insns) {
+                                write_capture(*this, cap_start, cap_ls, *cap, n - cap_n);
+                                cap.reset();
+                                host = this;
+                                cap_done = true;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1247,7 +1360,7 @@ void SpuThread::run() {
         std::memcpy(&word, ls + ctx.pc, 4);
         word = __builtin_bswap32(word);
         if (job_log) g_interp_insns.fetch_add(1, std::memory_order_relaxed);
-        if (!step(ctx, *this)) break;
+        if (!step(ctx, *host)) break;
         if (aot::is_terminator(word) || ++block_len >= aot::MAX_BLOCK_WORDS) block_start = true;
         if (!bps.empty()) {
             for (uint32_t bp : bps) {

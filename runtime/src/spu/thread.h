@@ -95,6 +95,7 @@ struct SpuThread : Host {
     uint64_t dec_start = 0;
     uint32_t dec_value = 0;
     bool dec_frozen = false;
+    bool irq_taken = false;
 
     uint32_t mfc_lsa = 0, mfc_eal = 0, mfc_size = 0, mfc_tag = 0;
     uint32_t tag_mask = 0;
