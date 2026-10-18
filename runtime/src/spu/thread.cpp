@@ -85,6 +85,11 @@ void SpuThread::set_events(uint32_t bits) {
 
 void SpuThread::check_interrupt() {
     if (!ctx.interrupts_enabled) return;
+    uint32_t mask = std::atomic_ref<uint32_t>(event_mask).load(std::memory_order_relaxed);
+    if (!std::atomic_ref<bool>(event_count).load(std::memory_order_acquire) && !((mask & EV_LR) && raddr)) {
+        if (!(mask & EV_TM) || dec_frozen) return;
+        if (timebase_now() - dec_start <= dec_value) return;
+    }
     std::lock_guard lk(m);
     collect_events();
     if (!event_count) return;

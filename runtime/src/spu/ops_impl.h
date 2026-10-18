@@ -241,6 +241,10 @@ SPU_INLINE bool op_shufb(Context& c, Host&, uint32_t w, uint32_t) {
     __m128i ra = _mm_shuffle_epi8(G(RA(w)).vi, idx);
     __m128i rb = _mm_shuffle_epi8(G(RB(w)).vi, idx);
     __m128i r = _mm_blendv_epi8(ra, rb, _mm_slli_epi16(ctl, 3));
+    if (_mm_movemask_epi8(ctl) == 0) [[likely]] {
+        G(RRR_T(w)).vi = r;
+        return true;
+    }
     __m128i t = _mm_and_si128(ctl, _mm_set1_epi8(static_cast<char>(0xE0)));
     __m128i special = _mm_or_si128(_mm_cmpeq_epi8(t, _mm_set1_epi8(static_cast<char>(0xC0))),
                                    _mm_and_si128(_mm_cmpeq_epi8(t, _mm_set1_epi8(static_cast<char>(0xE0))), _mm_set1_epi8(static_cast<char>(0x80))));

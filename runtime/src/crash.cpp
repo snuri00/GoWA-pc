@@ -186,7 +186,10 @@ LONG watch_handler(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+thread_local bool t_sampling = false;
+
 LONG WINAPI handler(EXCEPTION_POINTERS* ep) {
+    if (t_sampling) return EXCEPTION_CONTINUE_SEARCH;
     if (g_watch_count) {
         LONG r = watch_handler(ep);
         if (r == EXCEPTION_CONTINUE_EXECUTION) return r;
@@ -256,6 +259,37 @@ std::string sample_stack(void* native, int depth) {
     return line;
 }
 
+int sample_stack(CONTEXT& c, DWORD64* pcs, int depth) {
+    int n = 0;
+    t_sampling = true;
+    __try {
+        for (; n < depth; n++) {
+            pcs[n] = c.Rip;
+            if (n + 1 >= depth) {
+                t_sampling = false;
+                return n + 1;
+            }
+            DWORD64 image = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
+            if (!fn) {
+                t_sampling = false;
+                return n + 1;
+            }
+            PVOID handler_data = nullptr;
+            DWORD64 frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, fn, &c, &handler_data, &frame, nullptr);
+            if (!c.Rip) {
+                t_sampling = false;
+                return n + 1;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        n++;
+    }
+    t_sampling = false;
+    return n;
+}
+
 void profile_thread(void* native, const char* name) {
     std::thread([native, name] {
         HANDLE h = static_cast<HANDLE>(native);
@@ -269,29 +303,7 @@ void profile_thread(void* native, const char* name) {
             c.ContextFlags = CONTEXT_FULL;
             static const int depth = std::getenv("GOWA_PROFILE_DEPTH") ? (std::min)(16, std::atoi(std::getenv("GOWA_PROFILE_DEPTH"))) : 3;
             DWORD64 pcs[16] = {};
-            int n = 0;
-            if (GetThreadContext(h, &c)) {
-                for (; n < depth; n++) {
-                    pcs[n] = c.Rip;
-                    if (n + 1 >= depth) {
-                        n++;
-                        break;
-                    }
-                    DWORD64 image = 0;
-                    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
-                    if (!fn) {
-                        n++;
-                        break;
-                    }
-                    PVOID handler_data = nullptr;
-                    DWORD64 frame = 0;
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, fn, &c, &handler_data, &frame, nullptr);
-                    if (!c.Rip) {
-                        n++;
-                        break;
-                    }
-                }
-            }
+            int n = GetThreadContext(h, &c) ? sample_stack(c, pcs, depth) : 0;
             ResumeThread(h);
             std::string key;
             for (int i = 0; i < n; i++) {
