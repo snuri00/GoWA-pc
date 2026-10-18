@@ -16,6 +16,7 @@ struct TextureRegs {
     uint32_t filter = 0;
     uint32_t rect = 0;
     uint32_t control3 = 0;
+    uint32_t border = 0;
 };
 
 struct TextureRegion {

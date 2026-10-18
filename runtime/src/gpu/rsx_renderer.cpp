@@ -811,6 +811,7 @@ VkSampler sampler(const TextureRegs& t, uint32_t levels, bool shadow) {
     uint64_t key = fnv(&t.address, 4);
     key = fnv(&t.control0, 4, key);
     key = fnv(&t.filter, 4, key);
+    key = fnv(&t.border, 4, key);
     uint32_t extra = levels | (shadow ? 0x100 : 0);
     key = fnv(&extra, 4, key);
     auto it = g_samplers.find(key);
@@ -840,7 +841,12 @@ VkSampler sampler(const TextureRegs& t, uint32_t levels, bool shadow) {
         si.compareEnable = VK_TRUE;
         si.compareOp = (g_experiment & 256) ? VK_COMPARE_OP_NEVER : reversed_compare(t.address >> 28);
     }
-    si.borderColor = t.offset == 0xFFFFFFFF ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    {
+        uint32_t bc = t.border;
+        bool white = ((bc >> 16) & 0xFF) >= 0x80 && ((bc >> 8) & 0xFF) >= 0x80 && (bc & 0xFF) >= 0x80;
+        bool opaque = (bc >> 24) >= 0x80;
+        si.borderColor = white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : opaque ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    }
     VkSampler s = VK_NULL_HANDLE;
     vkCreateSampler(vk().device, &si, nullptr, &s);
     g_samplers[key] = s;
@@ -857,6 +863,7 @@ TextureRegs texture_regs(uint32_t unit) {
     t.control1 = R(b + 0x10);
     t.filter = R(b + 0x14);
     t.rect = R(b + 0x18);
+    t.border = R(b + 0x1C);
     t.control3 = R(TEXTURE_CONTROL3 + unit * 4);
     return t;
 }
@@ -1231,7 +1238,7 @@ Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& c
         uint32_t tea = lv2::rsx_address(t.offset, (t.format & 3) - 1);
         if (std::getenv("GOWA_TEX_DUMP") && tea && std::string(g_bind_kind) == "memory") dump_texture(t, tea);
         uint32_t w0 = tea && readable(tea, 64) ? vm::read32(tea) : 0, w1 = tea && readable(tea, 64) ? vm::read32(tea + 4) : 0, w8 = tea && readable(tea, 64) ? vm::read32(tea + 32) : 0;
-        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s data %08x %08x %08x addr 0x%x c1 0x%x c3 0x%x filter 0x%x", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind, w0, w1, w8, t.address, t.control1, t.control3, t.filter);
+        LOG_INFO("rsx", "  tex%u off 0x%x fmt 0x%x rect %ux%u c0 0x%x dim %u -> %s data %08x %08x %08x addr 0x%x c1 0x%x c3 0x%x filter 0x%x border 0x%x", unit, t.offset, t.format, t.rect >> 16, t.rect & 0xFFFF, t.control0, dim, g_bind_kind, w0, w1, w8, t.address, t.control1, t.control3, t.filter, t.border);
     }
     return b;
 }
