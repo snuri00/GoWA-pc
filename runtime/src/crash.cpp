@@ -291,9 +291,10 @@ void profile_thread(void* native, const char* name) {
             ResumeThread(h);
             std::string key;
             for (int i = 0; i < n; i++) {
+                static const bool by_rip = std::getenv("GOWA_PROFILE_RIP") != nullptr;
                 std::string sym = symbol_of(pcs[i]);
                 size_t plus = sym.rfind('+');
-                if (plus != std::string::npos) sym.resize(plus);
+                if (plus != std::string::npos && !(by_rip && i == 0)) sym.resize(plus);
                 key += (i ? " <- " : "") + sym;
             }
             counts[key]++;
