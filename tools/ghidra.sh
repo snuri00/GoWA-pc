@@ -17,7 +17,7 @@ import)
 decomp)
     out="${GOWA_DECOMP_OUT:-$ROOT/out/decomp}"
     mkdir -p "$out"
-    cmd //c "$(cygpath -w "$HEADLESS")" "$(cygpath -w "$PROJ")" gowa -process GOWA.patched.elf -noanalysis -scriptPath "$(cygpath -w "$ROOT/tools/ghidra")" -postScript ExportDecomp.java "$(cygpath -w "$out")" "names=$(cygpath -w "$ROOT/docs/re/symbols.txt")" "$@"
+    cmd //c "$(cygpath -w "$HEADLESS")" "$(cygpath -w "$PROJ")" gowa -process GOWA.patched.elf -noanalysis -scriptPath "$(cygpath -w "$ROOT/tools/ghidra")" -postScript ExportDecomp.java "$(cygpath -w "$out")" --names "$(cygpath -w "$ROOT/docs/re/symbols.txt")" "$@"
     ;;
 *)
     echo "usage: tools/ghidra.sh import | decomp <addr>... | decomp @listfile"

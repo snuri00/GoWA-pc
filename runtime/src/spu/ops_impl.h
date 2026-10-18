@@ -478,7 +478,7 @@ SPU_INLINE bool op_cflts(Context& c, Host&, uint32_t w, uint32_t) {
     double scale = std::bit_cast<double>(uint64_t(1023 + 173 - int(I8(w))) << 52);
     v128 a = G(RA(w)), r;
     for (int i = 0; i < 4; i++) {
-        double v = double(a.f32[i]) * scale;
+        double v = sfx_to_double(a.u32[i]) * scale;
         r.s32[i] = v >= 2147483647.0 ? INT32_MAX : v <= -2147483648.0 ? INT32_MIN : int32_t(v);
     }
     G(RT(w)) = r;
@@ -488,7 +488,7 @@ SPU_INLINE bool op_cfltu(Context& c, Host&, uint32_t w, uint32_t) {
     double scale = std::bit_cast<double>(uint64_t(1023 + 173 - int(I8(w))) << 52);
     v128 a = G(RA(w)), r;
     for (int i = 0; i < 4; i++) {
-        double v = double(a.f32[i]) * scale;
+        double v = sfx_to_double(a.u32[i]) * scale;
         r.u32[i] = v >= 4294967295.0 ? UINT32_MAX : v <= 0.0 ? 0 : uint32_t(v);
     }
     G(RT(w)) = r;
@@ -497,14 +497,14 @@ SPU_INLINE bool op_cfltu(Context& c, Host&, uint32_t w, uint32_t) {
 SPU_INLINE bool op_csflt(Context& c, Host&, uint32_t w, uint32_t) {
     double scale = std::bit_cast<double>(uint64_t(1023 + int(I8(w)) - 155) << 52);
     v128 a = G(RA(w)), r;
-    for (int i = 0; i < 4; i++) r.f32[i] = float(double(a.s32[i]) * scale);
+    for (int i = 0; i < 4; i++) r.u32[i] = sfx_from_double(double(a.s32[i]) * scale);
     G(RT(w)) = r;
     return true;
 }
 SPU_INLINE bool op_cuflt(Context& c, Host&, uint32_t w, uint32_t) {
     double scale = std::bit_cast<double>(uint64_t(1023 + int(I8(w)) - 155) << 52);
     v128 a = G(RA(w)), r;
-    for (int i = 0; i < 4; i++) r.f32[i] = float(double(a.u32[i]) * scale);
+    for (int i = 0; i < 4; i++) r.u32[i] = sfx_from_double(double(a.u32[i]) * scale);
     G(RT(w)) = r;
     return true;
 }

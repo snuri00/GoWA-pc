@@ -25,8 +25,8 @@ public class ExportDecomp extends GhidraScript {
                 for (String line : Files.readAllLines(new File(args[i].substring(1)).toPath())) {
                     if (!line.isBlank()) targets.add(line.trim());
                 }
-            } else if (args[i].startsWith("names=")) {
-                applyNames(new File(args[i].substring(6)));
+            } else if (args[i].equals("--names") && i + 1 < args.length) {
+                applyNames(new File(args[++i]));
             } else {
                 targets.add(args[i]);
             }
