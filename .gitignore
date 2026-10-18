@@ -32,3 +32,4 @@ __pycache__/
 *.md
 /run/
 build_tc/
+build_edge/

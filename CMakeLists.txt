@@ -18,7 +18,7 @@ add_library(gowa_ppu_ops STATIC runtime/src/ppu_ops.cpp runtime/src/reservation.
 target_include_directories(gowa_ppu_ops PUBLIC runtime/include "${CMAKE_SOURCE_DIR}/out/include")
 target_compile_options(gowa_ppu_ops PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
 
-file(GLOB GOWA_RUNTIME_SOURCES CONFIGURE_DEPENDS runtime/src/*.cpp runtime/src/lv2/*.cpp runtime/src/hle/*.cpp runtime/src/spu/*.cpp runtime/src/rsx/*.cpp runtime/src/gpu/*.cpp)
+file(GLOB GOWA_RUNTIME_SOURCES CONFIGURE_DEPENDS runtime/src/*.cpp runtime/src/lv2/*.cpp runtime/src/hle/*.cpp runtime/src/spu/*.cpp runtime/src/spu/edge/*.cpp runtime/src/rsx/*.cpp runtime/src/gpu/*.cpp)
 list(REMOVE_ITEM GOWA_RUNTIME_SOURCES "${CMAKE_SOURCE_DIR}/runtime/src/ppu_ops.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/main.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/reservation.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/memory.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/log.cpp")
 set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
 set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
@@ -34,7 +34,8 @@ target_include_directories(gowa_volk PUBLIC third_party/volk third_party/Vulkan-
 target_compile_definitions(gowa_volk PUBLIC VK_USE_PLATFORM_WIN32_KHR VK_NO_PROTOTYPES)
 
 add_library(gowa_runtime OBJECT ${GOWA_RUNTIME_SOURCES})
-set_source_files_properties("${CMAKE_SOURCE_DIR}/runtime/src/spu/texcreator_native.cpp" PROPERTIES COMPILE_OPTIONS "/clang:-frounding-math")
+file(GLOB GOWA_EDGE_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/runtime/src/spu/edge/*.cpp")
+set_source_files_properties("${CMAKE_SOURCE_DIR}/runtime/src/spu/texcreator_native.cpp" ${GOWA_EDGE_SOURCES} PROPERTIES COMPILE_OPTIONS "/clang:-frounding-math")
 target_include_directories(gowa_runtime PRIVATE third_party/volk third_party/Vulkan-Headers/include third_party/glslang "${CMAKE_BINARY_DIR}/include")
 target_compile_definitions(gowa_runtime PRIVATE VK_NO_PROTOTYPES)
 target_link_libraries(gowa_runtime PUBLIC gowa_ppu_ops)
@@ -69,7 +70,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/out/conformance/tests.cpp")
     target_compile_options(ppu_conformance PRIVATE ${GOWA_ARCH_FLAGS} /clang:${GOWA_GENERATED_OPT})
 endif()
 
-add_executable(spu_bench tests/spu_bench/bench.cpp runtime/src/spu/interpreter.cpp runtime/src/spu/aot.cpp runtime/src/log.cpp)
+add_executable(spu_bench tests/spu_bench/bench.cpp runtime/src/spu/interpreter.cpp runtime/src/spu/aot.cpp runtime/src/spu/hle.cpp runtime/src/spu/hle_builtin.cpp runtime/src/spu/texcreator_native.cpp ${GOWA_EDGE_SOURCES} runtime/src/log.cpp)
 target_include_directories(spu_bench PRIVATE runtime/include runtime/src/spu)
 target_link_libraries(spu_bench PRIVATE gowa_spu gowa_ppu_ops dbghelp)
 target_compile_options(spu_bench PRIVATE ${GOWA_ARCH_FLAGS} /clang:-frounding-math /EHsc)

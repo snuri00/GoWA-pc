@@ -158,7 +158,7 @@ def emit_pure_block(table, idx, lsa, raw, out):
 
 REGION_MAX = int(os.environ.get("GOWA_SPU_REGION_MAX", "64"))
 REGION_BUDGET = 4096
-HLE_ENTRIES = {0x56E0}
+HLE_ENTRIES = {0x56E0, 0x73E0, 0x88B0, 0xA880, 0xBBC8, 0xD158, 0xD618, 0xDBC8, 0xDCB0, 0xE550, 0xF538}
 COND_BRANCH = {"op_brz", "op_brnz", "op_brhz", "op_brhnz", "op_biz", "op_binz", "op_bihz", "op_bihnz"}
 
 

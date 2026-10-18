@@ -1,5 +1,6 @@
 #include "spu/aot.h"
 #include "spu/context.h"
+#include "hle.h"
 
 #include <intrin.h>
 
@@ -142,6 +143,18 @@ struct State {
 };
 
 bool g_skip_same = true;
+bool g_hle = false;
+bool g_to_last_event = false;
+std::string g_state_out;
+uint64_t g_hle_calls = 0;
+uint64_t g_hle_insns = 0;
+bool g_hle_strict = false;
+spu::Context g_iso;
+std::vector<uint8_t> g_iso_ls;
+std::vector<uint64_t> g_counts;
+size_t g_count_pos = 0;
+bool g_have_counts = false;
+uint64_t g_hle_tsc = 0;
 std::FILE* g_dma_log = nullptr;
 std::vector<uint32_t> g_watch;
 std::FILE* g_watch_log = nullptr;
@@ -167,6 +180,15 @@ public:
     size_t pos = 0;
     std::string error;
     Replay(State& st, const Capture& c) : s(st), cap(c) {}
+    void apply_lines(const Event& e) {
+        uint32_t ep = 0;
+        for (auto& [l, d] : e.lines) {
+            if (g_skip_same && std::memcmp(s.ls + l, d, 128) == 0) continue;
+            if (!ep) ep = s.epoch.fetch_add(1) + 1;
+            std::memcpy(s.ls + l, d, 128);
+            s.line_epoch[l >> 7].store(ep);
+        }
+    }
     const Event* next(int kind, uint32_t ch, uint32_t value, bool check) {
         if (pos >= cap.events.size()) {
             if (error.empty()) error = "extra channel op kind " + std::to_string(kind) + " ch " + std::to_string(ch);
@@ -182,15 +204,7 @@ public:
             }
             s.c.halted = true;
         }
-        if (!e.lines.empty()) {
-            uint32_t ep = 0;
-            for (auto& [l, d] : e.lines) {
-                if (g_skip_same && std::memcmp(s.ls + l, d, 128) == 0) continue;
-                if (!ep) ep = s.epoch.fetch_add(1) + 1;
-                std::memcpy(s.ls + l, d, 128);
-                s.line_epoch[l >> 7].store(ep);
-            }
-        }
+        if (!e.lines.empty()) apply_lines(e);
         s.c.pc = e.pc;
         s.c.srr0 = e.srr0;
         s.c.interrupts_enabled = e.ie != 0;
@@ -307,6 +321,42 @@ struct Result {
     bool exact = false;
 };
 
+class IsoHost : public spu::Host {
+public:
+    bool failed = false;
+    uint32_t read_channel(uint32_t) override {
+        failed = true;
+        return 0;
+    }
+    void write_channel(uint32_t, uint32_t) override { failed = true; }
+    uint32_t channel_count(uint32_t) override {
+        failed = true;
+        return 0;
+    }
+    bool stop_and_signal(uint32_t) override {
+        failed = true;
+        return false;
+    }
+    void halt(uint32_t, uint32_t) override { failed = true; }
+};
+
+bool iso_count(const State& s, uint64_t& k) {
+    g_iso_ls.assign(s.ls, s.ls + spu::LS_SIZE + 16);
+    g_iso = s.c;
+    g_iso.ls = g_iso_ls.data();
+    g_iso.line_epoch = nullptr;
+    g_iso.halted = false;
+    uint32_t ret = s.c.gpr[0].u32[3] & spu::PC_MASK, sp = s.c.gpr[1].u32[3];
+    IsoHost host;
+    for (k = 0; k < 50000000;) {
+        spu::step(g_iso, host);
+        k++;
+        if (host.failed) return false;
+        if (g_iso.pc == ret && g_iso.gpr[1].u32[3] == sp) return true;
+    }
+    return false;
+}
+
 Result run(State& s, const Capture& cap, bool regions) {
     Result r;
     s.reset(cap);
@@ -315,7 +365,46 @@ Result run(State& s, const Capture& cap, bool regions) {
     uint64_t n = 0;
     ULONG64 t0 = 0;
     QueryThreadCycleTime(GetCurrentThread(), &t0);
-    while (n < cap.insns && !s.c.halted) {
+    bool to_last = g_to_last_event;
+    uint64_t excluded = 0;
+    while (!s.c.halted && (to_last ? host.pos < cap.events.size() : n < cap.insns)) {
+        if (g_hle && spu::hle::any_at(s.c.pc)) {
+            if (const spu::hle::Function* f = spu::hle::lookup(s.ls, s.c.pc)) {
+                ULONG64 x0 = 0, x1 = 0;
+                QueryThreadCycleTime(GetCurrentThread(), &x0);
+                uint64_t k = 0;
+                bool iso_ok;
+                if (g_have_counts) {
+                    k = g_count_pos < g_counts.size() ? g_counts[g_count_pos++] : UINT64_MAX;
+                    iso_ok = k != UINT64_MAX;
+                } else {
+                    iso_ok = iso_count(s, k);
+                    g_counts.push_back(iso_ok && n + k < cap.insns ? k : UINT64_MAX);
+                }
+                QueryThreadCycleTime(GetCurrentThread(), &x1);
+                excluded += x1 - x0;
+                if (iso_ok && n + k < cap.insns) {
+                    spu::Context before = s.c;
+                    uint64_t h0 = __rdtsc();
+                    bool handled = f->handler(s.c);
+                    if (g_have_counts) g_hle_tsc += __rdtsc() - h0;
+                    if (handled) {
+                        if (!g_hle_strict && !g_have_counts) {
+                            spu::v128 r3 = s.c.gpr[3];
+                            std::memcpy(s.c.gpr, g_iso.gpr, sizeof s.c.gpr);
+                            if (std::memcmp(&r3, &g_iso.gpr[3], 16) != 0 && host.error.empty()) host.error = "hle r3 differs";
+                        }
+                        s.c.pc = before.gpr[0].u32[3] & spu::PC_MASK;
+                        uint64_t target = n + k;
+                        while (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value <= target) host.apply_lines(cap.events[host.pos++]);
+                        n = target;
+                        g_hle_calls++;
+                        g_hle_insns += k;
+                        continue;
+                    }
+                }
+            }
+        }
         if (g_watch_log && std::find(g_watch.begin(), g_watch.end(), s.c.pc) != g_watch.end()) watch_hit(s.c);
         Slot& slot = cache[s.c.pc >> 2];
         const spu::CompiledBlock* b = slot.b;
@@ -357,9 +446,21 @@ Result run(State& s, const Capture& cap, bool regions) {
     }
     ULONG64 t1 = 0;
     QueryThreadCycleTime(GetCurrentThread(), &t1);
-    r.cycles = t1 - t0;
+    r.cycles = t1 - t0 - excluded;
     r.insns = n;
     r.error = host.error;
+    if (!g_state_out.empty()) {
+        if (std::FILE* f = std::fopen(g_state_out.c_str(), "wb")) {
+            std::fwrite(s.c.gpr, 16, 128, f);
+            std::fwrite(s.ls, 1, spu::LS_SIZE, f);
+            std::fclose(f);
+        }
+    }
+    if (to_last) {
+        r.exact = r.error.empty();
+        if (r.exact) r.error = "stopped at last event";
+        return r;
+    }
     if (r.error.empty() && host.pos != cap.events.size()) r.error = "consumed " + std::to_string(host.pos) + " of " + std::to_string(cap.events.size()) + " events";
     if (r.error.empty() && n != cap.insns) r.error = "executed " + std::to_string(n) + " of " + std::to_string(cap.insns) + " insns";
     if (r.error.empty()) {
@@ -398,6 +499,10 @@ int main(int argc, char** argv) {
         else if (a == "--profile") g_profile = true;
         else if (a == "--sample") g_sample = true;
         else if (a == "--no-skip-same") g_skip_same = false;
+        else if (a == "--hle") g_hle = true;
+        else if (a == "--hle-strict") g_hle = g_hle_strict = true;
+        else if (a == "--to-last-event") g_to_last_event = true;
+        else if (a == "--state-out" && i + 1 < argc) g_state_out = argv[++i];
         else if (a == "--dma-log" && i + 1 < argc) g_dma_log = std::fopen(argv[++i], "w");
         else if (a == "--watch" && i + 2 < argc) {
             std::string list = argv[++i];
@@ -412,6 +517,7 @@ int main(int argc, char** argv) {
         }
         else files.push_back(a);
     }
+    if (g_hle) spu::hle::install_builtin();
     State s;
     std::thread sampler_thread;
     if (g_sample) {
@@ -430,9 +536,18 @@ int main(int argc, char** argv) {
             continue;
         }
         Result best;
+        g_counts.clear();
+        g_have_counts = false;
         for (int k = 0; k < reps; k++) {
+            g_count_pos = 0;
             Result r = run(s, cap, regions);
-            if (k == 0 || r.cycles < best.cycles) best = r;
+            if (g_hle && k == 0) {
+                std::printf("%-28s hle verify run: %s\n", f.c_str(), r.exact ? "exact" : r.error.c_str());
+                if (!r.exact) failures++;
+                g_have_counts = true;
+                if (reps > 1) continue;
+            }
+            if (!best.insns || r.cycles < best.cycles) best = r;
         }
         std::printf("%-28s slot %u insns %9llu events %6zu  %6.2f cycles/insn  %5.1f insns/dispatch  interp %llu  %s\n", f.c_str(), cap.slot, static_cast<unsigned long long>(best.insns),
                     cap.events.size(), best.insns ? double(best.cycles) / best.insns : 0.0, best.dispatches ? double(best.insns) / best.dispatches : 0.0,
@@ -441,6 +556,7 @@ int main(int argc, char** argv) {
         total_cycles += best.cycles;
         total_insns += best.insns;
     }
+    if (g_hle) std::printf("hle: %llu native calls replaced %llu SPU insns (all reps), %llu TSC cycles in handlers (timing reps)\n", static_cast<unsigned long long>(g_hle_calls), static_cast<unsigned long long>(g_hle_insns), static_cast<unsigned long long>(g_hle_tsc));
     if (g_sample) {
         g_sampling = false;
         sampler_thread.join();
