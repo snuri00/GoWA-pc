@@ -138,7 +138,9 @@ void SpuThread::log_watched_dma(const char* what, uint32_t cmd, uint32_t ea, uin
         hex += b;
         if ((i & 3) == 3) hex += ' ';
     }
-    LOG_INFO("spudma", "thread 0x%x pc 0x%05x %s cmd 0x%02x ea 0x%08x lsa 0x%05x size 0x%x %s", id, ctx.pc, what, cmd, ea, lsa, size, hex.c_str());
+    uint32_t code[4];
+    for (int i = 0; i < 4; i++) code[i] = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(ls + 0x4100 + i * 4));
+    LOG_INFO("spudma", "thread 0x%x pc 0x%05x %s cmd 0x%02x ea 0x%08x lsa 0x%05x size 0x%x %s code4100 %08x%08x%08x%08x", id, ctx.pc, what, cmd, ea, lsa, size, hex.c_str(), code[0], code[1], code[2], code[3]);
 }
 
 static const bool job_stats = std::getenv("GOWA_SPU_JOBS") != nullptr;

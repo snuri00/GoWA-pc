@@ -84,11 +84,13 @@ SRWLOCK g_watch_locks[4096] = {};
 
 SRWLOCK& watch_lock(uint32_t page) { return g_watch_locks[page & 4095]; }
 std::atomic<uint64_t> g_watch_faults{0};
+std::atomic<uint64_t> g_stale_repairs{0};
 std::atomic<uint16_t> g_fault_pages[0x100000];
 
 }
 
 uint64_t watch_faults() { return g_watch_faults.load(std::memory_order_relaxed); }
+uint64_t watch_stale_repairs() { return g_stale_repairs.load(std::memory_order_relaxed); }
 
 std::string watch_top_pages() {
     std::vector<std::pair<uint32_t, uint32_t>> v;
@@ -118,7 +120,13 @@ void watch_reset(uint32_t addr, uint64_t size) {
     for (uint64_t a = addr & ~0xFFFull; a < uint64_t(addr) + size && a < 0x100000000ull; a += 0x1000) {
         uint32_t page = uint32_t(a >> 12);
         AcquireSRWLockExclusive(&watch_lock(page));
-        g_page_watched[page].store(0, std::memory_order_relaxed);
+        if (g_page_watched[page].load(std::memory_order_relaxed)) {
+            DWORD old;
+            VirtualProtect(g_base + a, 0x1000, PAGE_READWRITE, &old);
+            g_page_watched[page].store(0, std::memory_order_relaxed);
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 4) LOG_WARN("vm", "remapped watched page 0x%08llx", static_cast<unsigned long long>(a));
+        }
         g_page_epoch[page].fetch_add(1, std::memory_order_acq_rel);
         ReleaseSRWLockExclusive(&watch_lock(page));
     }
@@ -149,7 +157,7 @@ uint64_t range_epoch(uint32_t addr, uint32_t size) {
     return sum;
 }
 
-bool watch_fault(uint32_t addr) {
+bool watch_fault(uint32_t addr, bool repair_stale) {
     uint32_t page = addr >> 12;
     AcquireSRWLockExclusive(&watch_lock(page));
     bool handled = false;
@@ -163,7 +171,17 @@ bool watch_fault(uint32_t addr) {
         g_fault_pages[page].fetch_add(1, std::memory_order_relaxed);
     } else {
         MEMORY_BASIC_INFORMATION mi;
-        if (VirtualQuery(g_base + (uint64_t(page) << 12), &mi, sizeof mi) && mi.State == MEM_COMMIT && mi.Protect == PAGE_READWRITE) handled = true;
+        if (VirtualQuery(g_base + (uint64_t(page) << 12), &mi, sizeof mi) && mi.State == MEM_COMMIT) {
+            if (mi.Protect == PAGE_READWRITE) {
+                handled = true;
+            } else if (repair_stale && mi.Protect == PAGE_READONLY) {
+                DWORD old;
+                VirtualProtect(g_base + (uint64_t(page) << 12), 0x1000, PAGE_READWRITE, &old);
+                g_page_epoch[page].fetch_add(1, std::memory_order_acq_rel);
+                g_stale_repairs.fetch_add(1, std::memory_order_relaxed);
+                handled = true;
+            }
+        }
     }
     ReleaseSRWLockExclusive(&watch_lock(page));
     return handled;

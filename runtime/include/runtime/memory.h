@@ -36,7 +36,8 @@ uint64_t watch_faults();
 std::string watch_top_pages();
 uint64_t watch_range(uint32_t addr, uint32_t size, bool& ok);
 uint64_t range_epoch(uint32_t addr, uint32_t size);
-bool watch_fault(uint32_t addr);
+bool watch_fault(uint32_t addr, bool repair_stale);
+uint64_t watch_stale_repairs();
 void host_write(uint32_t addr, uint64_t size);
 void watch_reset(uint32_t addr, uint64_t size);
 

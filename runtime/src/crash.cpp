@@ -192,7 +192,7 @@ thread_local bool t_sampling = false;
 LONG WINAPI handler(EXCEPTION_POINTERS* ep) {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2 && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
         auto* fault = reinterpret_cast<uint8_t*>(ep->ExceptionRecord->ExceptionInformation[1]);
-        if (fault >= vm::g_base && fault < vm::g_base + 0x100000000ull && vm::watch_fault(static_cast<uint32_t>(fault - vm::g_base))) return EXCEPTION_CONTINUE_EXECUTION;
+        if (fault >= vm::g_base && fault < vm::g_base + 0x100000000ull && vm::watch_fault(static_cast<uint32_t>(fault - vm::g_base), g_watch_count == 0)) return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (t_sampling) return EXCEPTION_CONTINUE_SEARCH;
     if (g_watch_count) {

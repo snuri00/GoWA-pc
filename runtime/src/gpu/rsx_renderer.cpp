@@ -2930,7 +2930,7 @@ bool present(uint32_t buffer_id) {
         g_stats.blit_fast = g_stats.blit_slow = 0;
         static uint64_t last_faults = 0;
         uint64_t faults = vm::watch_faults();
-        LOG_INFO("rsx", "  write watch faults %.1f per frame, %s", (faults - last_faults) / 60.0, vm::watch_top_pages().c_str());
+        LOG_INFO("rsx", "  write watch faults %.1f per frame, stale repairs %llu, %s", (faults - last_faults) / 60.0, static_cast<unsigned long long>(vm::watch_stale_repairs()), vm::watch_top_pages().c_str());
         last_faults = faults;
         g_stats.hash_count = g_stats.hash_bytes = g_stats.hash_ticks = g_stats.upload_frame = g_stats.upload_bytes = 0;
         LOG_INFO("rsx", "  texture images: %.1f allocated, %.1f reused, %.1f freed per frame, %zu live", g_stats.image_allocs / 60.0, g_stats.pool_hits / 60.0, g_stats.textures_freed / 60.0, g_textures.size());
