@@ -663,10 +663,29 @@ void transition(Surface* s, VkImageLayout to) {
     s->layout = to;
 }
 
+void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w, uint32_t h);
+
 void clear(uint32_t mask) {
-    if (g_trace) LOG_INFO("rsx", "trace clear 0x%x color 0x%x zeta 0x%x clip %ux%u target 0x%x", mask, R(SURFACE_COLOR_AOFFSET), R(SURFACE_ZETA_OFFSET), clip_w(), clip_h(), R(SURFACE_COLOR_TARGET));
-    end_pass();
-    VkCommandBuffer cmd = frame_cmd();
+    if (g_trace) LOG_INFO("rsx", "trace clear 0x%x color 0x%x zeta 0x%x clip %ux%u target 0x%x scissor 0x%x 0x%x", mask, R(SURFACE_COLOR_AOFFSET), R(SURFACE_ZETA_OFFSET), clip_w(), clip_h(), R(SURFACE_COLOR_TARGET),
+                      R(SCISSOR_HORIZONTAL), R(SCISSOR_VERTICAL));
+    g_clears++;
+    uint32_t w = clip_w(), h = clip_h();
+    std::vector<Surface*> colors = color_targets();
+    Surface* depth = depth_target();
+    if (!w || !h || (colors.empty() && !depth)) return;
+    uint32_t sx = R(SCISSOR_HORIZONTAL) & 0xFFFF, sw = R(SCISSOR_HORIZONTAL) >> 16;
+    uint32_t sy = R(SCISSOR_VERTICAL) & 0xFFFF, sh = R(SCISSOR_VERTICAL) >> 16;
+    uint32_t x0 = std::min(sx, w), y0 = std::min(sy, h), x1 = std::min(sx + sw, w), y1 = std::min(sy + sh, h);
+    for (Surface* c : colors) {
+        x1 = std::min(x1, c->width);
+        y1 = std::min(y1, c->height);
+    }
+    if (depth) {
+        x1 = std::min(x1, depth->width);
+        y1 = std::min(y1, depth->height);
+    }
+    if (x1 <= x0 || y1 <= y0) return;
+    std::vector<VkClearAttachment> atts;
     if (mask & 0xF0) {
         uint32_t v = R(COLOR_CLEAR_VALUE);
         VkClearColorValue cv{};
@@ -674,31 +693,40 @@ void clear(uint32_t mask) {
         cv.float32[1] = ((v >> 8) & 0xFF) / 255.0f;
         cv.float32[2] = (v & 0xFF) / 255.0f;
         cv.float32[3] = ((v >> 24) & 0xFF) / 255.0f;
-        for (Surface* s : color_targets()) {
-            transition(s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdClearColorImage(cmd, s->image, s->layout, &cv, 1, &range);
-            s->generation++;
-            if (s->main) s->dirty = true;
+        for (uint32_t i = 0; i < colors.size(); i++) {
+            VkClearAttachment a{};
+            a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            a.colorAttachment = i;
+            a.clearValue.color = cv;
+            atts.push_back(a);
+            colors[i]->generation++;
+            if (colors[i]->main) colors[i]->dirty = true;
         }
     }
-    if (mask & 0x3) {
-        if (Surface* s = depth_target()) {
-            uint32_t v = R(ZSTENCIL_CLEAR_VALUE);
-            VkClearDepthStencilValue dv{};
-            if (s->format == VK_FORMAT_D16_UNORM) {
-                dv.depth = (v & 0xFFFF) / 65535.0f;
-            } else {
-                dv.depth = (v >> 8) / 16777215.0f;
-                dv.stencil = v & 0xFF;
-            }
-            transition(s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            VkImageSubresourceRange range{s->aspect, 0, 1, 0, 1};
-            vkCmdClearDepthStencilImage(cmd, s->image, s->layout, &dv, 1, &range);
-            s->generation++;
+    if ((mask & 0x3) && depth) {
+        uint32_t v = R(ZSTENCIL_CLEAR_VALUE);
+        VkClearAttachment a{};
+        if (depth->format == VK_FORMAT_D16_UNORM) {
+            a.clearValue.depthStencil.depth = (v & 0xFFFF) / 65535.0f;
+            if (mask & 0x1) a.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        } else {
+            a.clearValue.depthStencil.depth = (v >> 8) / 16777215.0f;
+            a.clearValue.depthStencil.stencil = v & 0xFF;
+            if (mask & 0x1) a.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (mask & 0x2) a.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        }
+        if (a.aspectMask) {
+            atts.push_back(a);
+            depth->generation++;
         }
     }
-    g_clears++;
+    if (atts.empty()) return;
+    begin_pass(colors, depth, w, h);
+    VkClearRect rect{};
+    rect.rect = {{int32_t(x0), int32_t(y0)}, {x1 - x0, y1 - y0}};
+    rect.baseArrayLayer = 0;
+    rect.layerCount = 1;
+    vkCmdClearAttachments(frame_cmd(), static_cast<uint32_t>(atts.size()), atts.data(), 1, &rect);
 }
 
 bool init_objects() {
