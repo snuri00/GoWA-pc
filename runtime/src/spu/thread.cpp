@@ -428,14 +428,20 @@ bool put_merge_enabled() {
 namespace {
 struct JobStat {
     uint64_t entries = 0;
+    uint64_t insns = 0;
     uint32_t wid = 0;
     uint32_t pc = 0;
 };
 std::mutex g_job_lock;
 std::map<uint32_t, JobStat> g_jobs;
+std::atomic<uint64_t> g_interp_insns{0};
+std::atomic<uint64_t> g_aot_insns{0};
+std::atomic<uint64_t> g_region_insns{0};
+std::atomic<uint64_t> g_block_calls{0};
+std::map<uint32_t, uint64_t> g_interp_pcs;
 }
 
-void note_job(uint32_t id, uint32_t wid, uint32_t src, uint32_t pc, int mode) {
+void note_job(uint32_t id, uint32_t wid, uint32_t src, uint32_t pc, int mode, uint32_t prev_src, uint64_t prev_insns) {
     static std::once_flag once;
     std::call_once(once, [] {
         std::thread([] {
@@ -445,20 +451,41 @@ void note_job(uint32_t id, uint32_t wid, uint32_t src, uint32_t pc, int mode) {
                 {
                     std::lock_guard lk(g_job_lock);
                     v.assign(g_jobs.begin(), g_jobs.end());
+                    for (auto& [k, j] : g_jobs) j.insns = 0;
                 }
-                std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.entries > b.second.entries; });
+                std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.insns > b.second.insns; });
+                uint64_t total = 0;
+                for (auto& e : v) total += e.second.insns;
                 std::string line;
                 for (size_t i = 0; i < v.size() && i < 16; i++) {
                     char b[80];
-                    std::snprintf(b, sizeof b, " [code %08x wid %u pc %05x n %llu]", v[i].first, v[i].second.wid, v[i].second.pc, static_cast<unsigned long long>(v[i].second.entries));
+                    std::snprintf(b, sizeof b, " [code %08x wid %u %.1f%%]", v[i].first, v[i].second.wid, total ? 100.0 * v[i].second.insns / total : 0.0);
                     line += b;
                 }
                 LOG_INFO("spujob", "top:%s", line.c_str());
+                uint64_t ii = g_interp_insns.exchange(0), ai = g_aot_insns.exchange(0);
+                std::vector<std::pair<uint32_t, uint64_t>> pcs;
+                {
+                    std::lock_guard lk(g_job_lock);
+                    pcs.assign(g_interp_pcs.begin(), g_interp_pcs.end());
+                    g_interp_pcs.clear();
+                }
+                std::sort(pcs.begin(), pcs.end(), [](auto& a, auto& b) { return a.second > b.second; });
+                std::string hot;
+                for (size_t i = 0; i < pcs.size() && i < 12; i++) {
+                    char b[48];
+                    std::snprintf(b, sizeof b, " %05x:%llu", pcs[i].first, static_cast<unsigned long long>(pcs[i].second));
+                    hot += b;
+                }
+                uint64_t ri = g_region_insns.exchange(0), bc = g_block_calls.exchange(0);
+                LOG_INFO("spujob", "region share %.1f%%, %.1f insns per dispatch", ai ? 100.0 * ri / ai : 0.0, bc ? double(ai) / bc : 0.0);
+                LOG_INFO("spujob", "interpreted %.2f%% of %llu insns, hot interpreted block starts:%s", (ii + ai) ? 100.0 * ii / double(ii + ai) : 0.0, static_cast<unsigned long long>(ii + ai), hot.c_str());
             }
         }).detach();
     });
     {
         std::lock_guard lk(g_job_lock);
+        g_jobs[prev_src].insns += prev_insns;
         JobStat& j = g_jobs[src];
         j.entries++;
         j.wid = wid;
@@ -1042,10 +1069,13 @@ void SpuThread::run() {
             if (job_log) {
                 uint32_t src = line_src[ctx.pc >> 7];
                 if (src != cur_src) {
+                    uint32_t prev = cur_src;
+                    uint64_t delta = uint32_t(n - uint32_t(src_insn_mark));
+                    src_insn_mark = n;
                     cur_src = src;
                     uint32_t wid;
                     std::memcpy(&wid, ls + 0x1dc, 4);
-                    note_job(id, __builtin_bswap32(wid), src, ctx.pc, job_log);
+                    note_job(id, __builtin_bswap32(wid), src, ctx.pc, job_log, prev, delta);
                 }
             }
             if (aot_on) {
@@ -1073,12 +1103,19 @@ void SpuThread::run() {
                     if (b->region && use_regions) {
                         ctx.executed = 0;
                         ok = b->region(ctx, *this);
-                        if (ctx.executed) ran = ctx.executed;
+                        if (ctx.executed) {
+                            ran = ctx.executed;
+                            if (job_log) g_region_insns.fetch_add(ran, std::memory_order_relaxed);
+                        }
                         else ok = b->fn(ctx, *this);
                     } else {
                         ok = b->fn(ctx, *this);
                     }
                     n += ran;
+                    if (job_log) {
+                        g_aot_insns.fetch_add(ran, std::memory_order_relaxed);
+                        g_block_calls.fetch_add(1, std::memory_order_relaxed);
+                    }
                     if (!ok) break;
                     block_start = true;
                     if (ctx.irq_check) {
@@ -1101,10 +1138,15 @@ void SpuThread::run() {
                 }
             }
             if (rec) aot::record(ls, ctx.pc);
+            if (job_log) {
+                std::lock_guard lk(g_job_lock);
+                g_interp_pcs[ctx.pc]++;
+            }
         }
         uint32_t word;
         std::memcpy(&word, ls + ctx.pc, 4);
         word = __builtin_bswap32(word);
+        if (job_log) g_interp_insns.fetch_add(1, std::memory_order_relaxed);
         if (!step(ctx, *this)) break;
         if (aot::is_terminator(word) || ++block_len >= aot::MAX_BLOCK_WORDS) block_start = true;
         if (!bps.empty()) {

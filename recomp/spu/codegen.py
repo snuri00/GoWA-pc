@@ -260,9 +260,77 @@ def emit_region(table, k, members, blocks, out):
     out.append("")
 
 
+STATE_FIELDS = ("pc", "srr0", "interrupts_enabled", "irq_check", "halted")
+
+
+def emit_local_block(table, idx, lsa, raw, out):
+    reads, writes = reg_sets(table, raw)
+    regs = sorted(set(reads) | set(writes))
+    out.append("bool b%d(Context& c0, Host& h) {" % idx)
+    out.append("    Context c;")
+    for f in ("ls", "line_epoch", "epoch", "all_epoch", "block_valid") + STATE_FIELDS:
+        out.append("    c.%s = c0.%s;" % (f, f))
+    for r in regs:
+        out.append("    c.gpr[%d] = c0.gpr[%d];" % (r, r))
+
+    def flush(skip=()):
+        for r in writes:
+            if r not in skip:
+                out.append("    c0.gpr[%d] = c.gpr[%d];" % (r, r))
+
+    n = len(raw)
+    for k, r in enumerate(raw):
+        w = word_of(r)
+        pc = (lsa + k * 4) & 0x3FFFC
+        name = table[w >> 21]
+        if name not in CONTROL:
+            out.append("    %s(c, h, 0x%08xu, 0x%xu);" % (name, w, pc))
+            continue
+        ops = sorted({w & 0x7F, (w >> 7) & 0x7F, (w >> 14) & 0x7F})
+        if k == n - 1:
+            out.append("    c.pc = 0x%x;" % ((pc + 4) & 0x3FFFC))
+            flush()
+            for o in ops:
+                if o not in writes:
+                    out.append("    c0.gpr[%d] = c.gpr[%d];" % (o, o))
+            for f in STATE_FIELDS:
+                out.append("    c0.%s = c.%s;" % (f, f))
+            out.append("    return %s(c0, h, 0x%08xu, 0x%xu);" % (name, w, pc))
+            out.append("}")
+            out.append("")
+            return
+        out.append("    c.pc = 0x%x;" % ((pc + 4) & 0x3FFFC))
+        for o in ops:
+            out.append("    c0.gpr[%d] = c.gpr[%d];" % (o, o))
+        for f in STATE_FIELDS:
+            out.append("    c0.%s = c.%s;" % (f, f))
+        out.append("    {")
+        out.append("        bool ok = %s(c0, h, 0x%08xu, 0x%xu);" % (name, w, pc))
+        for o in ops:
+            out.append("        c.gpr[%d] = c0.gpr[%d];" % (o, o))
+        for f in STATE_FIELDS:
+            out.append("        c.%s = c0.%s;" % (f, f))
+        out.append("        if (!ok || c.pc != 0x%x) {" % ((pc + 4) & 0x3FFFC))
+        for r2 in writes:
+            out.append("            c0.gpr[%d] = c.gpr[%d];" % (r2, r2))
+        out.append("            return ok;")
+        out.append("        }")
+        out.append("    }")
+    out.append("    c.pc = 0x%x;" % ((lsa + n * 4) & 0x3FFFC))
+    flush()
+    for f in STATE_FIELDS:
+        out.append("    c0.%s = c.%s;" % (f, f))
+    out.append("    return true;")
+    out.append("}")
+    out.append("")
+
+
 def emit_block(table, idx, lsa, raw, out):
     if not os.environ.get("GOWA_SPU_NO_LOCAL") and is_pure(table, raw):
         emit_pure_block(table, idx, lsa, raw, out)
+        return
+    if os.environ.get("GOWA_SPU_LOCAL_IMPURE"):
+        emit_local_block(table, idx, lsa, raw, out)
         return
     out.append("bool b%d(Context& c, Host& h) {" % idx)
     out.append("    (void)h;")
