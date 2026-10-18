@@ -292,7 +292,7 @@ void init() {
     else load_names("../docs/re/symbols.txt");
     std::string combined = std::getenv("GOWA_HOOK") ? std::getenv("GOWA_HOOK") : "";
     const char* bb = std::getenv("GOWA_BLACKBOX");
-    if (!bb) bb = "52bd7c:panic,3a2adc:ring,3a2690:ring,3a12a0:ring,3a0000:ring:p9b26ac*=0x40,39f3c4:ring,39f06c:ring";
+    if (!bb) bb = "52bd7c:panic,3a2adc:ring,3a2690:ring,3a12a0:ring,3a0000:ring:p9b26ac*=0x40,39f3c4:ring,39f06c:ring,39b6f4:ring:d3=0x40";
     if (*bb && std::string(bb) != "0") combined += (combined.empty() ? "" : ",") + std::string(bb);
     const char* spec = combined.c_str();
     if (!*spec) return;

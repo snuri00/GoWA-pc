@@ -1,3 +1,4 @@
+#include "runtime/hooks.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
 #include "runtime/thread.h"
@@ -225,6 +226,7 @@ LONG WINAPI handler(EXCEPTION_POINTERS* ep) {
                   static_cast<unsigned long long>(c.gpr[1]), static_cast<unsigned long long>(c.gpr[2]), static_cast<unsigned long long>(c.gpr[3]),
                   static_cast<unsigned long long>(c.gpr[4]), static_cast<unsigned long long>(c.gpr[5]));
     }
+    if (!std::getenv("GOWA_CRASH_NO_BLACKBOX")) hooks::capture("crash");
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

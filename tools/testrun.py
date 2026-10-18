@@ -102,7 +102,7 @@ def supervise(env, duration):
         if now >= duration:
             break
         flip = last_flip(log_path, state)
-        if not requested and flip is not None and now > 40 and now - flip > 20:
+        if not requested and flip is not None and now > 40 and now - flip > 45:
             requested = True
             open(os.path.join(RUN_DIR, "blackbox.req"), "w").close()
             print("no flips for %.0fs, requesting blackbox capture" % (now - flip))
