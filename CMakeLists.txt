@@ -10,6 +10,7 @@ endforeach()
 
 set(GOWA_GENERATED_DIR "${CMAKE_SOURCE_DIR}/out/ppu" CACHE PATH "Directory with generated PPU sources")
 set(GOWA_GENERATED_OPT "-O2" CACHE STRING "Optimization level for generated code")
+set(GOWA_SPU_OPT "-O2" CACHE STRING "Optimization level for generated SPU code")
 
 set(GOWA_ARCH_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing)
 
@@ -53,7 +54,7 @@ file(GLOB GOWA_SPU_SOURCES CONFIGURE_DEPENDS "${GOWA_SPU_GENERATED_DIR}/spu_*.cp
 add_library(gowa_spu STATIC ${GOWA_SPU_SOURCES})
 target_include_directories(gowa_spu PRIVATE runtime/include runtime/src/spu)
 target_link_libraries(gowa_spu PUBLIC gowa_ppu_ops)
-target_compile_options(gowa_spu PRIVATE ${GOWA_ARCH_FLAGS} /clang:-O2 /clang:-frounding-math /GR- /EHs-c-)
+target_compile_options(gowa_spu PRIVATE ${GOWA_ARCH_FLAGS} /clang:${GOWA_SPU_OPT} /clang:-frounding-math /GR- /EHs-c-)
 
 add_executable(gowa runtime/src/main.cpp $<TARGET_OBJECTS:gowa_runtime> $<TARGET_OBJECTS:gowa_volk>)
 target_link_libraries(gowa PRIVATE gowa_ppu gowa_spu gowa_ppu_ops dbghelp winmm glslang SPIRV glslang-default-resource-limits)

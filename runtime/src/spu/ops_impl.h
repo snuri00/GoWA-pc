@@ -413,8 +413,8 @@ SPU_INLINE uint32_t sfx_from_double(double v) {
 }
 
 SPU_INLINE __m128i sfx_special(__m128 r) {
-    __m128i mag = _mm_and_si128(_mm_castps_si128(r), _mm_set1_epi32(0x7FFFFFFF));
-    return _mm_cmpgt_epi32(mag, _mm_set1_epi32(0x7F7FFFFE));
+    __m128 mag = _mm_and_ps(r, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
+    return _mm_castps_si128(_mm_cmp_ps(mag, _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF)), _CMP_NLT_UQ));
 }
 
 SPU_INLINE __m128i sfx_exp255(__m128 a) {

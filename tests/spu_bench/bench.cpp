@@ -272,7 +272,8 @@ Result run(State& s, const Capture& cap, bool regions) {
     Replay host(s, cap);
     std::vector<Slot> cache(spu::LS_SIZE / 4);
     uint64_t n = 0;
-    uint64_t t0 = __rdtsc();
+    ULONG64 t0 = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &t0);
     while (n < cap.insns && !s.c.halted) {
         Slot& slot = cache[s.c.pc >> 2];
         const spu::CompiledBlock* b = slot.b;
@@ -312,7 +313,9 @@ Result run(State& s, const Capture& cap, bool regions) {
         if (!ok) break;
         if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value == n) host.next(5, 0, uint32_t(n), true);
     }
-    r.cycles = __rdtsc() - t0;
+    ULONG64 t1 = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &t1);
+    r.cycles = t1 - t0;
     r.insns = n;
     r.error = host.error;
     if (r.error.empty() && host.pos != cap.events.size()) r.error = "consumed " + std::to_string(host.pos) + " of " + std::to_string(cap.events.size()) + " events";

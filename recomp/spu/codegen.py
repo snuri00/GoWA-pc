@@ -46,6 +46,18 @@ def decode_table():
     return table
 
 
+def op_fields(table, w):
+    name = table[w >> 21]
+    bits = OP_BITS.get(name, 11)
+    if bits == 4:
+        return [(w >> 7) & 0x7F, (w >> 14) & 0x7F, w & 0x7F, (w >> 21) & 0x7F]
+    if bits == 11:
+        return [w & 0x7F, (w >> 7) & 0x7F, (w >> 14) & 0x7F]
+    if bits in (8, 10):
+        return [w & 0x7F, (w >> 7) & 0x7F]
+    return [w & 0x7F]
+
+
 def reg_sets(table, raw):
     reads, writes = set(), set()
     for r in raw:
@@ -109,14 +121,22 @@ def emit_pure_block(table, idx, lsa, raw, out):
     out.append("    c.interrupts_enabled = c0.interrupts_enabled;")
     out.append("    c.irq_check = c0.irq_check;")
     out.append("    c.halted = c0.halted;")
-    for r in reads:
-        out.append("    c.gpr[%d] = c0.gpr[%d];" % (r, r))
+    lazy = os.environ.get("GOWA_SPU_LOCAL") == "lazy"
+    if not lazy:
+        for r in reads:
+            out.append("    c.gpr[%d] = c0.gpr[%d];" % (r, r))
+    loaded = set()
     n = len(raw)
     last_branch = False
     for k, r in enumerate(raw):
         w = struct.unpack(">I", struct.pack("<I", r))[0]
         pc = (lsa + k * 4) & 0x3FFFC
         name = table[w >> 21]
+        if lazy:
+            for f in op_fields(table, w):
+                if f not in loaded:
+                    loaded.add(f)
+                    out.append("    c.gpr[%d] = c0.gpr[%d];" % (f, f))
         if name in CONTROL:
             out.append("    c.pc = 0x%x;" % ((pc + 4) & 0x3FFFC))
             out.append("    %s(c, h, 0x%08xu, 0x%xu);" % (name, w, pc))
@@ -496,7 +516,7 @@ def main():
             out.append("extern const uint32_t w%d[];" % i)
         out.append("")
         for k in range(f * per_file, min(len(regions), (f + 1) * per_file)):
-            if os.environ.get("GOWA_SPU_LOCAL"):
+            if os.environ.get("GOWA_SPU_LOCAL") == "1":
                 emit_region(table, k, regions[k], blocks, out)
             else:
                 emit_region_direct(table, k, regions[k], blocks, out, "r")
