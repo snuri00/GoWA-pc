@@ -18,7 +18,8 @@ struct Function {
 
 void register_function(const Function& f);
 const Function* lookup(const uint8_t* ls, uint32_t pc);
-bool any_at(uint32_t pc);
+extern uint16_t g_first[LS_SIZE / 4];
+inline bool any_at(uint32_t pc) { return g_first[(pc & PC_MASK) >> 2] != 0; }
 void install_builtin();
 
 }
