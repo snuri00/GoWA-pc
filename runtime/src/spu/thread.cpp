@@ -187,6 +187,15 @@ uint32_t SpuThread::pop_out_mbox() {
 }
 
 uint32_t SpuThread::channel_count(uint32_t ch) {
+    switch (ch) {
+    case 21: return 16;
+    case 23: return 1;
+    case 24: return tag_stat_count;
+    case 25: return stall_stat_count;
+    case 27: return atomic_stat_count;
+    case 9: return 0;
+    default: break;
+    }
     std::lock_guard lk(m);
     switch (ch) {
     case 0: collect_events(); return event_count ? 1 : 0;
@@ -206,6 +215,25 @@ uint32_t SpuThread::channel_count(uint32_t ch) {
 }
 
 uint32_t SpuThread::read_channel(uint32_t ch) {
+    switch (ch) {
+    case 8: return dec_now();
+    case 12: return tag_mask;
+    case 13: return ctx.interrupts_enabled ? 1 : 0;
+    case 15: return ctx.srr0;
+    case 24:
+        if (tag_stat_count) {
+            tag_stat_count = false;
+            return tag_stat;
+        }
+        break;
+    case 27:
+        if (atomic_stat_count) {
+            atomic_stat_count = false;
+            return atomic_stat;
+        }
+        break;
+    default: break;
+    }
     std::unique_lock lk(m);
     switch (ch) {
     case 0: {
@@ -286,6 +314,13 @@ void SpuThread::write_channel(uint32_t ch, uint32_t value) {
     case 18: mfc_eal = value; return;
     case 19: mfc_size = value > 0xFFFF ? 0xFFFF : value; return;
     case 20: mfc_tag = value & 0x1F; return;
+    case 21: process_mfc(value & 0xFF); return;
+    case 22: tag_mask = value; return;
+    case 23:
+        tag_stat = tag_mask;
+        if (value == 1 && tag_mask == 0) return;
+        tag_stat_count = true;
+        return;
     default: break;
     }
     std::unique_lock lk(m);
@@ -766,20 +801,8 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
             return;
         }
         bool snap = put_merge_enabled() && size >= 16;
-        uint32_t done = 0;
-        alignas(16) uint8_t line[128];
         uint32_t dirty_lo = 0xFFFFFFFFu, dirty_hi = 0;
-        (void)line;
-        while (done < size) {
-            uint32_t a = ea + done;
-            uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
-            if (rsv::copy_if_changed(a, ls + lsa + done, chunk)) {
-                dirty_lo = (std::min)(dirty_lo, lsa + done);
-                dirty_hi = (std::max)(dirty_hi, lsa + done + chunk);
-            }
-            done += chunk;
-        }
-        if (dirty_hi) mark_ls(dirty_lo, dirty_hi - dirty_lo);
+        if (rsv::copy_range_if_changed(ea, ls + lsa, size, dirty_lo, dirty_hi)) mark_ls(lsa + dirty_lo, dirty_hi - dirty_lo);
         if (snap) remember_get(ea, size, lsa);
         else forget_ls(lsa, size);
         for (uint32_t l = lsa >> 7; l <= ((lsa + size - 1) >> 7) && l < 0x40000 / 128; l++) line_src[l] = ea;
@@ -850,15 +873,18 @@ void SpuThread::process_mfc(uint32_t cmd) {
         break;
     case 0xD0: {
         uint32_t line = ea & ~127u;
-        std::lock_guard lk(m);
-        if (raddr && raddr != line && rsv::lost(raddr, rtime, rdata)) set_events(EV_LR);
+        bool lost_lr = raddr && raddr != line && rsv::lost(raddr, rtime, rdata);
         uint8_t snap[128];
         uint64_t ver = rsv::snapshot(line, snap);
         if (job_stats) {
             g_getllar.fetch_add(1, std::memory_order_relaxed);
             if (raddr == line && std::memcmp(snap, rdata, 128) == 0) g_getllar_same.fetch_add(1, std::memory_order_relaxed);
         }
-        if (raddr == line && ver != rtime && std::memcmp(snap, rdata, 128) == 0) set_events(EV_LR);
+        if (raddr == line && ver != rtime && std::memcmp(snap, rdata, 128) == 0) lost_lr = true;
+        if (lost_lr) {
+            std::lock_guard lk(m);
+            set_events(EV_LR);
+        }
         raddr = line;
         rtime = ver;
         std::memcpy(rdata, snap, 128);
@@ -872,10 +898,12 @@ void SpuThread::process_mfc(uint32_t cmd) {
     }
     case 0xB4: {
         uint32_t line = ea & ~127u;
-        std::lock_guard lk(m);
         bool ok = raddr == line && rsv::commit_if(line, rtime, rdata, ls + (lsa & 0x3FF80), 0, 128);
         if (ok && trace::on(trace::ATOMIC)) trace::emit(trace::T_ATOMIC, slot | (0xB4u << 16), line, lsa & 0x3FF80, 128, ctx.pc, id);
-        if (!ok) set_events(EV_LR);
+        if (!ok) {
+            std::lock_guard lk(m);
+            set_events(EV_LR);
+        }
         if (job_stats) (ok ? g_putllc_ok : g_putllc_fail).fetch_add(1, std::memory_order_relaxed);
         raddr = 0;
         atomic_stat = ok ? 0 : 1;
@@ -888,7 +916,6 @@ void SpuThread::process_mfc(uint32_t cmd) {
         rsv::store_unconditional(line, ls + (lsa & 0x3FF80));
         if (trace::on(trace::ATOMIC)) trace::emit(trace::T_ATOMIC, slot | (cmd << 16), line, lsa & 0x3FF80, 128, ctx.pc, id);
         if (cmd == 0xB0) {
-            std::lock_guard lk(m);
             atomic_stat = 2;
             atomic_stat_count = true;
         }

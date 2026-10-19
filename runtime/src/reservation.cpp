@@ -3,6 +3,7 @@
 
 #include "runtime/log.h"
 
+#include <algorithm>
 #include <chrono>
 #include <immintrin.h>
 #include <cstdio>
@@ -24,12 +25,27 @@ namespace {
 
 struct alignas(64) Entry {
     std::atomic<uint64_t> ver{0};
-    std::mutex lock;
 };
 
 Entry g_table[65536];
 
 Entry& entry(uint32_t addr) { return g_table[(addr >> 7) & 0xFFFF]; }
+
+uint64_t lock_line(Entry& e) {
+    uint32_t spins = 0;
+    for (;;) {
+        uint64_t v = e.ver.load(std::memory_order_relaxed);
+        if (!(v & 64) && e.ver.compare_exchange_weak(v, v + 64, std::memory_order_acq_rel, std::memory_order_relaxed)) return v;
+        if (++spins < 2000) {
+            _mm_pause();
+        } else {
+            spins = 0;
+            std::this_thread::yield();
+        }
+    }
+}
+
+void unlock_line(Entry& e, uint64_t v, bool wrote) { e.ver.store(wrote ? v + 128 : v, std::memory_order_release); }
 
 }
 
@@ -84,12 +100,18 @@ void log_change(uint32_t line, uint32_t offset, const uint8_t* data, uint32_t si
 
 bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uint8_t* data, uint32_t offset, uint32_t size, bool data_only) {
     Entry& e = entry(line);
-    std::lock_guard lk(e.lock);
     static const bool strict = std::getenv("GOWA_RSV_STRICT") != nullptr;
     if ((strict || !data_only) && e.ver.load(std::memory_order_acquire) != rtime) return false;
-    if (std::memcmp(vm::ptr(line + offset), expected, size) != 0) return false;
+    uint64_t v0 = lock_line(e);
+    if ((strict || !data_only) && v0 != rtime) {
+        unlock_line(e, v0, false);
+        return false;
+    }
+    if (std::memcmp(vm::ptr(line + offset), expected, size) != 0) {
+        unlock_line(e, v0, false);
+        return false;
+    }
     log_change(line, offset, data, size, size == 128 ? "putllc" : "stcx");
-    e.ver.fetch_add(64, std::memory_order_acq_rel);
     uint8_t* dst = vm::ptr(line + offset);
     for (uint32_t i = 0; i < size; i += 8) {
         uint64_t want, was;
@@ -100,41 +122,38 @@ bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uin
             if (data[i + b] != expected[i + b]) dst[i + b] = data[i + b];
         }
     }
-    e.ver.fetch_add(64, std::memory_order_release);
+    unlock_line(e, v0, true);
     if (sleepers()) e.ver.notify_all();
     return true;
 }
 
 void store_unconditional(uint32_t line, const uint8_t* data) {
     Entry& e = entry(line);
-    std::lock_guard lk(e.lock);
+    uint64_t v0 = lock_line(e);
     log_change(line, 0, data, 128, "putlluc");
-    e.ver.fetch_add(64, std::memory_order_acq_rel);
     std::memcpy(vm::ptr(line), data, 128);
-    e.ver.fetch_add(64, std::memory_order_release);
+    unlock_line(e, v0, true);
     if (sleepers()) e.ver.notify_all();
 }
 
 void store_locked(uint32_t addr, const void* data, uint32_t size) {
     Entry& e = entry(addr & ~127u);
-    std::lock_guard lk(e.lock);
+    uint64_t v0 = lock_line(e);
     log_change(addr & ~127u, addr & 127u, static_cast<const uint8_t*>(data), size, "store");
-    e.ver.fetch_add(64, std::memory_order_acq_rel);
     std::memcpy(vm::ptr(addr), data, size);
-    e.ver.fetch_add(64, std::memory_order_release);
+    unlock_line(e, v0, true);
     if (sleepers()) e.ver.notify_all();
 }
 
 void merge_bits(uint32_t addr, const uint8_t* data, const uint8_t* base, uint32_t size) {
     Entry& e = entry(addr & ~127u);
-    std::lock_guard lk(e.lock);
-    e.ver.fetch_add(64, std::memory_order_acq_rel);
+    uint64_t v0 = lock_line(e);
     uint8_t* dst = vm::ptr(addr);
     for (uint32_t i = 0; i < size; i++) {
         uint8_t changed = data[i] ^ base[i];
         if (changed) dst[i] = static_cast<uint8_t>((dst[i] & ~changed) | (data[i] & changed));
     }
-    e.ver.fetch_add(64, std::memory_order_release);
+    unlock_line(e, v0, true);
     if (sleepers()) e.ver.notify_all();
 }
 
@@ -158,6 +177,14 @@ bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size) {
             continue;
         }
         uint32_t i = 0;
+        for (; i + 32 <= size; i += 32) {
+            __m256i s = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+            __m256i d = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i));
+            if (static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(s, d))) != 0xFFFFFFFFu) {
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), s);
+                changed = true;
+            }
+        }
         for (; i + 16 <= size; i += 16) {
             __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
             __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst + i));
@@ -175,6 +202,52 @@ bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size) {
         std::atomic_thread_fence(std::memory_order_acquire);
         if (e.ver.load(std::memory_order_acquire) == v1) return changed;
     }
+}
+
+bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi) {
+    const uint8_t* src = vm::ptr(addr);
+    bool any = false;
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t a = addr + done;
+        uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+        Entry& e = entry(a & ~127u);
+        for (;;) {
+            uint64_t v1 = e.ver.load(std::memory_order_acquire);
+            if (v1 & 64) {
+                _mm_pause();
+                continue;
+            }
+            bool changed = false;
+            const uint8_t* s = src + done;
+            uint8_t* d = dst + done;
+            uint32_t i = 0;
+            for (; i + 32 <= chunk; i += 32) {
+                __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+                __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d + i));
+                if (static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y))) != 0xFFFFFFFFu) {
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i), x);
+                    changed = true;
+                }
+            }
+            for (; i < chunk; i++) {
+                if (d[i] != s[i]) {
+                    d[i] = s[i];
+                    changed = true;
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (e.ver.load(std::memory_order_acquire) != v1) continue;
+            if (changed) {
+                any = true;
+                dirty_lo = (std::min)(dirty_lo, done);
+                dirty_hi = (std::max)(dirty_hi, done + chunk);
+            }
+            break;
+        }
+        done += chunk;
+    }
+    return any;
 }
 
 bool lost(uint32_t line, uint64_t rtime, const uint8_t* rdata) {

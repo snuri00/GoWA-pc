@@ -1,13 +1,17 @@
 #include "spu/thread.h"
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
+#include "ppu/ops.h"
+#include "ppu/context.h"
 
 #include <intrin.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <functional>
+#include <thread>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -50,13 +54,87 @@ void tagwait(spu::Host& h, uint32_t mask) {
     g_sink += h.read_channel(24);
 }
 
+int stress(uint32_t base, int iters) {
+    const uint32_t counter = base + 0xC00000;
+    const uint32_t shared = base + 0xC10000;
+    const uint32_t ppu_word = base + 0xC20000;
+    vm::write32(counter, 0);
+    vm::write32(ppu_word, 0);
+    for (uint32_t i = 0; i < 0x800; i++) vm::ptr(shared)[i] = 0;
+    std::atomic<uint64_t> torn{0}, failed{0}, retries{0};
+    std::vector<std::thread> ts;
+    const int atomic_threads = 4, copy_threads = 4;
+    for (int k = 0; k < atomic_threads; k++)
+        ts.emplace_back([&, k] {
+            auto t = std::make_shared<spu::SpuThread>();
+            spu::Host& h = *t;
+            for (int i = 0; i < iters; i++) {
+                for (;;) {
+                    mfc(h, 0xD0, 0x80, counter, 0x80, 0);
+                    h.read_channel(27);
+                    uint32_t v;
+                    std::memcpy(&v, t->ls + 0x80, 4);
+                    v = __builtin_bswap32(__builtin_bswap32(v) + 1);
+                    std::memcpy(t->ls + 0x80, &v, 4);
+                    mfc(h, 0xB4, 0x80, counter, 0x80, 0);
+                    if (h.read_channel(27) == 0) break;
+                    retries++;
+                }
+                ppu::Context pc{};
+                for (;;) {
+                    uint32_t v = ppu::lwarx(pc, vm::g_base, ppu_word);
+                    if (ppu::stwcx(pc, vm::g_base, ppu_word, v + 1)) break;
+                    retries++;
+                }
+            }
+        });
+    for (int k = 0; k < copy_threads; k++)
+        ts.emplace_back([&, k] {
+            auto t = std::make_shared<spu::SpuThread>();
+            spu::Host& h = *t;
+            for (int i = 0; i < iters; i++) {
+                uint8_t fill = uint8_t(k * 64 + (i & 63));
+                std::memset(t->ls + 0x10000, fill, 0x800);
+                uint32_t off = (i * 0x80) & 0x780;
+                if (i & 1) mfc(h, 0x20, 0x10000, shared, 0x800, 1);
+                else if (i & 2) mfc(h, 0x20, 0x10000 + off, shared + off, 0x80, 1);
+                else {
+                    mfc(h, 0xD0, 0x20000, shared + off, 0x80, 0);
+                    h.read_channel(27);
+                    std::memset(t->ls + 0x20000, fill, 0x80);
+                    mfc(h, 0xB0, 0x20000, shared + off, 0x80, 0);
+                    h.read_channel(27);
+                }
+                mfc(h, 0x40, 0x18000, shared, 0x800, 2);
+                for (uint32_t l = 0; l < 0x800; l += 0x80) {
+                    const uint8_t* p = t->ls + 0x18000 + l;
+                    for (int b = 1; b < 128; b++)
+                        if (p[b] != p[0]) {
+                            torn++;
+                            break;
+                        }
+                }
+            }
+        });
+    for (auto& t : ts) t.join();
+    uint32_t got = vm::read32(counter), want = uint32_t(atomic_threads * iters);
+    uint32_t pgot = vm::read32(ppu_word);
+    std::printf("stress: putllc counter %u/%u, ppu stwcx counter %u/%u, retries %llu, torn lines %llu\n", got, want, pgot, want, (unsigned long long)retries.load(), (unsigned long long)torn.load());
+    return got == want && pgot == want && torn == 0 ? 0 : 1;
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     vm::init();
     const uint32_t base = 0x30000000;
     vm::map(base, 0x01000000);
     for (uint32_t i = 0; i < 0x01000000; i += 4) vm::write32(base + i, i * 2654435761u);
+    if (argc > 1 && std::string(argv[1]) == "stress") {
+        int r = stress(base, argc > 2 ? std::atoi(argv[2]) : 200000);
+        std::fflush(stdout);
+        std::_Exit(r);
+    }
     auto t = std::make_shared<spu::SpuThread>();
     spu::SpuThread& th = *t;
     spu::Host& h = th;

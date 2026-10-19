@@ -17,5 +17,6 @@ bool wait_lost(uint32_t line, uint64_t rtime, const uint8_t* rdata, uint32_t mic
 bool sleepers();
 void wake(uint32_t addr);
 bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size);
+bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi);
 
 }
