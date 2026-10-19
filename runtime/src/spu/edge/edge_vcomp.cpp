@@ -285,6 +285,8 @@ bool compress_vertexes(uint8_t* ls, uint32_t ctx, int overlay, uint32_t r3out[4]
         for (int i = 0; i < fm->nfields; i++) {
             uint64_t t = table_of(ls, ctx, fm->f[i].attr);
             if ((t & 15) || t < 0x10c80 || t + 16ull * n2 + 16 > limit) return false;
+            uint64_t oe = o + uint64_t(2 * fm->rec) * (n2 / 2) + 16 * fm->nq + 32;
+            if (t < oe && o < t + 16ull * n2 + 16) return false;
         }
     }
     r3out[0] = w88;

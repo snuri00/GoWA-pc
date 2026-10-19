@@ -290,9 +290,21 @@ bool skin_vertexes(uint8_t* lsp, uint32_t ctx, uint32_t matrices, uint32_t num_m
         auto okr = [&](uint32_t a, uint64_t len) { return (a & 15) == 0 && a >= 0x10c80 && uint64_t(a) + len <= limit; };
         uint32_t tmp0 = ls.w(ctx + 16 + 4 * (cfg[0] & 15));
         uint32_t w96 = ls.w(ctx + 96);
-        uint64_t tl = 16ull * ((nv + 7) & ~7u) + 64;
-        if (!okr(matrices, 64ull * num_matrices) || (weights & 7) || weights < 0x10c80 || uint64_t(weights) + 8ull * total + 16 > limit || !okr(pos, tl) || !okr(tmp0, 48ull * total + 64)) return false;
+        uint64_t tl = 16ull * ((nv + 7) & ~7u) + 16;
+        uint64_t bt0 = (uint64_t(total) * 0xAAAAAAABull >> 33) & ~3ull;
+        if (!okr(matrices, 64ull * num_matrices) || (weights & 15) || weights < 0x10c80 || uint64_t(weights) + 8ull * total + 16 > limit || !okr(pos, tl) || !okr(tmp0, 48ull * (bt0 ? bt0 : total) + 16)) return false;
         if ((t100 && !okr(t100, tl)) || (t104 && !okr(t104, tl)) || (w96 && !okr(w96, tl))) return false;
+        auto ov = [](uint64_t a, uint64_t al, uint64_t b, uint64_t bl) { return a < b + bl && b < a + al; };
+        uint64_t te = 16ull * ((nv + 7) & ~7u);
+        uint64_t bt = (uint64_t(total) * 0xAAAAAAABull >> 33) & ~3ull;
+        uint64_t ins[2][2] = {{matrices, 64ull * num_matrices}, {weights, 8ull * total}};
+        uint64_t outsr[5][2] = {{pos, te}, {tmp0, 48ull * (bt ? bt : total)}, {t100, t100 ? te : 0}, {t104, t104 ? te : 0}, {w96, w96 ? te : 0}};
+        for (auto& i : ins)
+            for (auto& o : outsr)
+                if (o[1] && ov(i[0], i[1], o[0], o[1])) return false;
+        for (int x = 0; x < 5; x++)
+            for (int y = x + 1; y < 5; y++)
+                if (outsr[x][1] && outsr[y][1] && ov(outsr[x][0], outsr[x][1], outsr[y][0], outsr[y][1])) return false;
     }
     if (fmt == 2) convert_matrices(ls, matrices, num_matrices);
     uint32_t tables[2];

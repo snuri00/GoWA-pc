@@ -128,10 +128,15 @@ int cmd_robust(const std::vector<std::string>& args) {
                 put32(s.ls.data() + a + 4 * (rnd() % 4), v);
             }
         }
+        if (const char* only = std::getenv("ROBUST_ONLY"); only && std::atoi(only) != it) continue;
         std::memcpy(g.ls, s.ls.data(), spu::LS_SIZE + 16 > s.ls.size() ? s.ls.size() : spu::LS_SIZE + 16);
         spu::Context nc = s.regs;
         nc.ls = g.ls;
         nc.line_epoch = nullptr;
+        if (std::getenv("ROBUST_TRACE")) {
+            std::printf("case %d base job %d:%s\n", it, b.job, desc.c_str());
+            std::fflush(stdout);
+        }
         RunResult rr = guarded_call(nat, g.ls, nc);
         if (rr.faulted) {
             faults++;
@@ -142,7 +147,7 @@ int cmd_robust(const std::vector<std::string>& args) {
         if (std::getenv("ROBUST_NOSPU")) continue;
         handled++;
         edgeunit::Snapshot iso = s;
-        edgeunit::IsoResult r = edgeunit::run_isolated(iso, b.ret, b.sp, 20000000);
+        edgeunit::IsoResult r = edgeunit::run_isolated(iso, b.ret, b.sp, 5000000);
         if (!r.ok) {
             spu_fail++;
             continue;
@@ -152,6 +157,18 @@ int cmd_robust(const std::vector<std::string>& args) {
         bool r3ok = std::memcmp(&nc.gpr[3], &iso.regs.gpr[3], 16) == 0;
         if (d.bytes || !r3ok) {
             bad++;
+            if (std::getenv("ROBUST_ONLY")) {
+                std::printf("regs r3 %08x r4 %08x r5 %08x r6 %08x sp %08x\n", s.regs.gpr[3].u32[3], s.regs.gpr[4].u32[3], s.regs.gpr[5].u32[3], s.regs.gpr[6].u32[3], s.regs.gpr[1].u32[3]);
+                for (uint32_t a = d.first & ~15u; a < (d.first & ~15u) + 64; a += 16) {
+                    std::printf("%05x nat", a);
+                    for (int k = 0; k < 16; k++) std::printf(" %02x", g.ls[a + k]);
+                    std::printf("\n      spu");
+                    for (int k = 0; k < 16; k++) std::printf(" %02x", iso.ls[a + k]);
+                    std::printf("\n      bef");
+                    for (int k = 0; k < 16; k++) std::printf(" %02x", s.ls[a + k]);
+                    std::printf("\n");
+                }
+            }
             if (bad <= 10) std::printf("MISMATCH case %d base job %d:%s ls_diff %zu [%05x..%05x] r3 %s\n", it, b.job, desc.c_str(), d.bytes, d.first, d.last, r3ok ? "ok" : "DIFF");
         }
     }
