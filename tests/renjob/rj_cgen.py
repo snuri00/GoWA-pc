@@ -12,8 +12,30 @@ IMG_EA = 0x705680
 IMG_LS = 0x4000
 IMG_SIZE = 0x13580
 
+CODE_END = 0x17300
+ENTRY_ROOTS = (0x14ae0, 0x14cf8)
+INLINE_EXCEPT = (0x14f40,)
+OPS_INCLUDE = "renjob_ops.h"
+BASE_NS = "renjob::xo"
+OPS_NS = "renjob::opz"
+ROOTS_MACRO = "RJ_ROOTS"
+ICALLS = {}
+RECURSION_LIMIT = 0
+LOOP_BUDGET = False
+REC_EDGES = set()
+PC_COUNTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pc_counts.txt")
+
 data = open(ELF, "rb").read()
 img = data[IMG_EA - 0x10000:IMG_EA - 0x10000 + IMG_SIZE]
+
+
+def configure(**kw):
+    global img
+    g = globals()
+    for k, v in kw.items():
+        assert k in g, k
+        g[k] = v
+    img = data[IMG_EA - 0x10000:IMG_EA - 0x10000 + IMG_SIZE]
 
 
 def word(pc):
@@ -123,6 +145,10 @@ def discover(entry, known_entries, stops=frozenset(), entries=None):
                 t = (pc + d["imm"] * 4) & 0x3FFFC
                 if t != nxt and t not in NOCALL:
                     f.calls.add(t)
+            if op == "bisl" and pc in ICALLS and d["rb"] & 0x30 == 0:
+                for t in ICALLS[pc]:
+                    if t not in NOCALL:
+                        f.calls.add(t)
             if op == "bi" and d["ra"] != 0 and d["rb"] & 0x30 == 0 and jump_table(pc):
                 f.switches = getattr(f, "switches", {})
                 f.switches[pc] = jump_table(pc)
@@ -287,8 +313,8 @@ def pc_counts():
     global PC_COUNTS
     if PC_COUNTS is None:
         PC_COUNTS = {}
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pc_counts.txt")
-        if HINTS and os.path.exists(path):
+        path = PC_COUNTS_PATH
+        if HINTS and path and os.path.exists(path):
             for line in open(path):
                 a, b = line.split()
                 PC_COUNTS[int(a, 16)] = int(b)
@@ -445,6 +471,9 @@ def emit_func(f, out):
             if pc in f.loops and BUDGET:
                 f.has_fail = True
                 out.append("    if (--ctl.budget == 0) FAIL(0x%05x);" % pc)
+            elif pc in f.loops and LOOP_BUDGET and r0_dead(pc):
+                wb = " ".join("R[%d] = r%d;" % (r, r) for r in promo[pc][2]) if pc in promo else ""
+                out.append("    if (__builtin_expect(--ctl.budget == 0, 0)) { %s EXIT(0x%05x); }" % (wb, pc))
         d = f.insns[pc]
         op = d["op"]
         rt = d.get("rt")
@@ -520,6 +549,9 @@ def emit_func(f, out):
                 s = "FAIL(@PC@);"
             else:
                 s = "R[%d] = pref_only(0x%x); @CALL%05x@" % (rt, pc + 4, t)
+        elif op == "bisl" and pc in ICALLS and d["rb"] & 0x30 == 0 and [t for t in ICALLS[pc] if t not in NOCALL]:
+            cases = " ".join("case 0x%05x: R[%d] = pref_only(0x%x); @CALL%05x@ break;" % (t, rt, pc + 4, t) for t in sorted(set(ICALLS[pc])) if t not in NOCALL)
+            s = "switch (pref(R[%d]) & 0x3fffc) { %s default: FAIL(@PC@); }" % (ra, cases)
         elif op in ("bisl", "bra", "brasl"):
             s = "FAIL(@PC@);"
         elif op == "bi" and pc in getattr(f, "switches", {}):
@@ -552,7 +584,7 @@ def emit_func(f, out):
                 out.append("    }")
                 continue
         s = s.replace("@RET@", "{ " + spill + " return; }")
-        s = re.sub(r"@CALL([0-9a-f]+)@", lambda m: "{ " + call_spill(int(m.group(1), 16), False) + " f_" + m.group(1) + "(R, ls, ctl); if (ctl.out) return; " + call_fill(int(m.group(1), 16)) + " }", s)
+        s = re.sub(r"@CALL([0-9a-f]+)@", lambda m: rec_call(f, pc, rt, m.group(1)) if (f.entry, int(m.group(1), 16)) in REC_EDGES and rt == 0 else "{ " + call_spill(int(m.group(1), 16), False) + " f_" + m.group(1) + "(R, ls, ctl); if (ctl.out) return; " + call_fill(int(m.group(1), 16)) + " }", s)
         s = re.sub(r"@TAIL([0-9a-f]+)@", lambda m: "{ " + call_spill(int(m.group(1), 16), True) + " f_" + m.group(1) + "(R, ls, ctl); return; }", s)
         out.append("    %s" % s)
     for x in sorted(f.exits):
@@ -570,9 +602,30 @@ def emit_func(f, out):
             out[i] = re.sub(r"EXIT\((0x[0-9a-f]+)\)", lambda m: "{ " + allsp + " R[0] = pref_only(" + m.group(1) + "); ctl.out = true; return; }", out[i])
 
 
+def rec_call(f, pc, rt, callee):
+    return "{ if (rj_depth >= %d) %s; ++rj_depth; f_%s(R, ls, ctl); --rj_depth; if (ctl.out) return; }" % (RECURSION_LIMIT, xf(f, pc), callee)
+
+
+def rec_edges(funcs):
+    out = set()
+    for e, f in funcs.items():
+        for c in f.calls | f.tails:
+            seen = set()
+            work = [c]
+            while work:
+                x = work.pop()
+                if x in seen or x not in funcs:
+                    continue
+                seen.add(x)
+                work.extend(funcs[x].calls | funcs[x].tails)
+            if e in seen:
+                out.add((e, c))
+    return out
+
+
 def all_entries():
-    roots = set([0x14ae0, 0x14cf8])
-    for pc in range(IMG_LS + 0x30, 0x17300, 4):
+    roots = set(ENTRY_ROOTS)
+    for pc in range(IMG_LS + 0x30, CODE_END, 4):
         d = decode(pc)
         if d["op"] == "brsl" and d["rt"] == 0:
             t = (pc + d["imm"] * 4) & 0x3FFFC
@@ -583,7 +636,7 @@ def all_entries():
 
 def ops_mode(outp, hdr):
     seen = {}
-    for pc in range(IMG_LS + 0x30, 0x17300, 4):
+    for pc in range(IMG_LS + 0x30, CODE_END, 4):
         d = decode(pc)
         op = d["op"]
         if op in SKIP or op in FAILOPS or op in HALTS or op.startswith("b") and op not in ("bg", "bgx") or op in ("brsl", "bra", "brasl", "iret"):
@@ -597,7 +650,7 @@ def ops_mode(outp, hdr):
         f.insns[pc] = decode(pc)
         f.insns[pc + 4] = dict(op="bi", rt=0, ra=0, rb=0, w=0)
         funcs.append(f)
-    out = ['#include "%s"' % os.path.basename(hdr), "", "namespace renjob::opz {", "", "#define FAIL(pc) do { ctl.fail = true; ctl.out = true; ctl.fail_pc = pc; return; } while (0)", "#define EXIT(pc) do { R[0] = pref_only(pc); ctl.out = true; return; } while (0)", ""]
+    out = ['#include "%s"' % os.path.basename(hdr), "", "namespace %s {" % OPS_NS, "", "#define FAIL(pc) do { ctl.fail = true; ctl.out = true; ctl.fail_pc = pc; return; } while (0)", "#define EXIT(pc) do { R[0] = pref_only(pc); ctl.out = true; return; } while (0)", ""]
     for f in funcs:
         TU[f.entry] = set()
         TD[f.entry] = set()
@@ -606,7 +659,7 @@ def ops_mode(outp, hdr):
         out += lines
     out += ["#undef FAIL", "#undef EXIT", "", "}"]
     open(outp, "w", newline="\n").write("\n".join(out) + "\n")
-    h = ["#pragma once", "", '#include "renjob_ops.h"', "", "namespace renjob::opz {", "", "using namespace renjob::xo;", ""]
+    h = ["#pragma once", "", '#include "%s"' % OPS_INCLUDE, "", "namespace %s {" % OPS_NS, "", "using namespace %s;" % BASE_NS, ""]
     for f in funcs:
         h.append("void f_%05x(V* R, uint8_t* ls, Ctl& ctl);" % f.entry)
     h.append("struct OpEntry { uint32_t lsa; const char* name; void (*fn)(V*, uint8_t*, Ctl&); };")
@@ -642,6 +695,8 @@ def generate(dry):
     if spec.startswith("@"):
         spec = open(spec[1:]).read().strip()
     for tok in spec.split(","):
+        if not tok:
+            continue
         if ":" in tok:
             a, b = tok.split(":")
             regions[int(a, 16)] = frozenset(int(x, 16) for x in b.split("/") if x)
@@ -649,7 +704,7 @@ def generate(dry):
             froots.append(int(tok, 16))
     outp = sys.argv[2]
     hdr = sys.argv[3]
-    ns = sys.argv[4] if len(sys.argv) > 4 else "renjob::xo"
+    ns = sys.argv[4] if len(sys.argv) > 4 else BASE_NS
     table = len(sys.argv) > 5
     global BUDGET
     BUDGET = table
@@ -689,12 +744,17 @@ def generate(dry):
     out = ['#include "%s"' % base] + (['#include "rj_prof.h"'] if PROF else []) + ["", "namespace %s {" % ns, "", "#define FAIL(pc) do { ctl.fail = true; ctl.out = true; ctl.fail_pc = pc; return; } while (0)", "#define EXIT(pc) do { R[0] = pref_only(pc); ctl.out = true; return; } while (0)", ""]
     inline_max = int(os.environ.get("RJ_INLINE_MAX", "120"))
     for e in sorted(funcs):
-        if e not in froots and not table and len(funcs[e].insns) <= inline_max and not (funcs[e].calls & set(funcs)) - set([0x14f40]):
+        if e not in froots and not table and len(funcs[e].insns) <= inline_max and not (funcs[e].calls & set(funcs)) - set(INLINE_EXCEPT):
             SPEC[e] = "static inline __attribute__((always_inline)) "
     for e in sorted(funcs):
         out.append("%svoid f_%05x(V* R, uint8_t* ls, Ctl& ctl);" % (SPEC.get(e, ""), e))
     out.append("")
     closure(funcs)
+    REC_EDGES.clear()
+    if RECURSION_LIMIT:
+        REC_EDGES.update(rec_edges(funcs))
+        out.append("inline thread_local uint32_t rj_depth = 0;")
+        out.append("")
     for e in sorted(funcs):
         emit_func(funcs[e], out)
     done = set()
@@ -726,7 +786,7 @@ def generate(dry):
     out.append("")
     out.append("}")
     open(outp, "w", newline="\n").write("\n".join(out) + "\n")
-    h = ["#pragma once", "", '#include "renjob_ops.h"', "", "namespace %s {" % ns, "", "using namespace renjob::xo;", ""]
+    h = ["#pragma once", "", '#include "%s"' % OPS_INCLUDE, "", "namespace %s {" % ns, "", "using namespace %s;" % BASE_NS, ""]
     for e in sorted(froots if not table else funcs):
         h.append("void f_%05x(V* R, uint8_t* ls, Ctl& ctl);" % e)
     for e in sorted(regs):
@@ -753,7 +813,7 @@ def generate(dry):
 
     def root_fails(e):
         return closure_fails(regs[e] if e in regs else funcs[e])
-    h.append("#define RJ_ROOTS(X) " + " ".join("X(%05x, %s_%05x, %d)" % (e, "g" if e in regs else "f", e, 1 if root_fails(e) else 0) for e in allroots))
+    h.append("#define %s(X) " % ROOTS_MACRO + " ".join("X(%05x, %s_%05x, %d)" % (e, "g" if e in regs else "f", e, 1 if root_fails(e) else 0) for e in allroots))
     if table:
         h.append("")
         h.append("struct GenEntry { uint32_t lsa; void (RJ_ABI *fn)(V*, uint8_t*, Ctl&); };")

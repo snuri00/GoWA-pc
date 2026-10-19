@@ -108,7 +108,8 @@ def plan(fn, impure):
             b -= 4
         if b != x and cg["r0_dead"](b):
             extra.add(b)
-    stops |= extra
+    if os.environ.get("RJ_PLAN_NOEXTRA") != "1":
+        stops |= extra
     return sorted(starts), sorted(stops)
 
 
