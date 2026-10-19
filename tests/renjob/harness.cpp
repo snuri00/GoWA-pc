@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "renjob_adapters.h"
+#include "rj_prof.h"
 #include "spu_decode.h"
 #include "unit.h"
 
@@ -19,6 +20,7 @@
 
 int rj_fuzz(const std::vector<uint8_t>& image, const std::vector<std::string>& args);
 int rj_opfuzz(const std::vector<uint8_t>& image, const std::vector<std::string>& args);
+int rj_hbench(const std::vector<uint8_t>& image, const std::vector<std::string>& args, const std::vector<std::string>& caps);
 
 namespace {
 
@@ -686,6 +688,7 @@ int cmd_e2e(const std::vector<std::string>& args) {
                 }
             }
         }
+        rjprof::dump();
         std::printf("%s: puts ref %zu got %zu (in-image pc %zu) mismatching %zu hooked %llu declined %llu skipped-insns %llu native %.1f ms %s\n", path.c_str(), ref.size(), got.size(), rj_puts, mism, (unsigned long long)hooked, (unsigned long long)declined, (unsigned long long)skipped, nat_sec * 1e3, err.c_str());
         for (auto& [pc, n] : mism_pc) std::printf("    mismatches at pc %05x: %zu\n", pc, n);
         if (mism || ref.size() != got.size() || !err.empty()) bad++;
@@ -765,6 +768,7 @@ int main(int argc, char** argv) {
     if (cmd == "bench") return cmd_bench(args);
     if (cmd == "fuzz") return rj_fuzz(g_image, args);
     if (cmd == "opfuzz") return rj_opfuzz(g_image, args);
+    if (cmd == "hbench") return rj_hbench(g_image, args, cap_list(args, 3));
     std::fprintf(stderr, "unknown command\n");
     return 2;
 }

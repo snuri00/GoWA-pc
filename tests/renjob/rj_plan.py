@@ -46,15 +46,41 @@ def walk(fn):
     return seen
 
 
+EXITING = {}
+
+
+def exiting(fn, depth=0):
+    if fn in EXITING:
+        return EXITING[fn]
+    EXITING[fn] = False
+    r = False
+    for pc, d in walk(fn).items():
+        op = d["op"]
+        if op in ("rdch", "wrch", "rchcnt", "stop", "stopd", "bisl"):
+            r = True
+        elif op == "bi" and d["ra"] != 0 and d["rb"] & 0x30:
+            r = True
+        elif op == "brsl" and d["rt"] == 0:
+            t = (pc + d["imm"] * 4) & 0x3FFFC
+            if t != pc + 4 and depth < 12 and exiting(t, depth + 1):
+                r = True
+    EXITING[fn] = r
+    return r
+
+
 def plan(fn, impure):
     insns = walk(fn)
     stops = set()
     starts = {fn}
+    nostop = os.environ.get("RJ_PLAN_NOSTOP") == "1"
     for pc, d in sorted(insns.items()):
         op = d["op"]
         if op == "brsl" and d["rt"] == 0:
             t = (pc + d["imm"] * 4) & 0x3FFFC
-            if t in impure:
+            if nostop:
+                if t != pc + 4 and t in impure:
+                    starts.add(pc + 4)
+            elif t in impure:
                 stops.add(pc)
                 starts.add(pc + 4)
         elif op in ("rdch", "wrch", "rchcnt", "stop", "stopd", "bisl"):

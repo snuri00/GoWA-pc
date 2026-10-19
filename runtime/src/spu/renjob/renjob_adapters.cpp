@@ -16,11 +16,13 @@ uint32_t rbe32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1
 thread_local uint32_t t_decline_pc = 0;
 
 xo::Ctl& thread_ctl() {
+    thread_local xo::JournalStore store;
     thread_local xo::Ctl ctl;
+    if (!ctl.journal) store.attach(ctl);
     return ctl;
 }
 
-using GenFn = void (*)(xo::V*, uint8_t*, xo::Ctl&);
+using GenFn = void (RJ_ABI *)(xo::V*, uint8_t*, xo::Ctl&);
 
 struct CsrScope {
     static constexpr unsigned kWant = 0x6000u | 0x8040u;
@@ -33,25 +35,30 @@ struct CsrScope {
     }
 };
 
-template <GenFn F>
+template <GenFn F, bool J>
 bool run_gen(uint8_t* ls, spu::Context& c) {
     static_assert(sizeof(c.gpr) == 128 * sizeof(xo::V));
     CsrScope csr;
-    xo::Ctl& ctl = thread_ctl();
-    ctl.reset();
-    alignas(16) xo::V backup[128];
-    std::memcpy(backup, c.gpr, sizeof backup);
-    F(reinterpret_cast<xo::V*>(c.gpr), ls, ctl);
-    if (ctl.fail) {
-        t_decline_pc = ctl.fail_pc;
-        ctl.rollback(ls);
-        std::memcpy(c.gpr, backup, sizeof backup);
-        return false;
+    if constexpr (J) {
+        xo::Ctl& ctl = thread_ctl();
+        ctl.reset();
+        alignas(16) xo::V backup[128];
+        std::memcpy(backup, c.gpr, sizeof backup);
+        F(reinterpret_cast<xo::V*>(c.gpr), ls, ctl);
+        if (ctl.fail) {
+            t_decline_pc = ctl.fail_pc;
+            ctl.rollback(ls);
+            std::memcpy(c.gpr, backup, sizeof backup);
+            return false;
+        }
+    } else {
+        xo::Ctl ctl;
+        F(reinterpret_cast<xo::V*>(c.gpr), ls, ctl);
     }
     return true;
 }
 
-#define RJ_GEN(addr, fn) {0x##addr, 16, xo::kSig##addr, run_gen<xo::fn>, "RenJob." #fn},
+#define RJ_GEN(addr, fn, j) {0x##addr, 16, xo::kSig##addr, run_gen<xo::fn, j != 0>, "RenJob." #fn},
 
 const Adapter kAdapters[] = {RJ_ROOTS(RJ_GEN)};
 

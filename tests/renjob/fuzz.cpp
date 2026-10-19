@@ -3,6 +3,7 @@
 #include "unit.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -14,9 +15,10 @@ int rj_fuzz(const std::vector<uint8_t>& image, const std::vector<std::string>& a
     uint32_t seed = args.size() > 3 ? std::stoul(args[3]) : 1;
     std::mt19937 rng(seed);
     int bad_total = 0;
+    renjob::xo::JournalStore js;
     for (const auto& e : renjob::fz::kAllGen) {
         if (only && e.lsa != only) continue;
-        int ran = 0, declined = 0, bad = 0, iso_fail = 0, smc = 0;
+        int ran = 0, declined = 0, bad = 0, iso_fail = 0, smc = 0, exits = 0;
         for (int it = 0; it < iters; it++) {
             edgeunit::Snapshot s;
             s.ls.assign(spu::LS_SIZE + 16, 0);
@@ -44,29 +46,15 @@ int rj_fuzz(const std::vector<uint8_t>& image, const std::vector<std::string>& a
             for (int k = 0; k < 4; k++) s.regs.gpr[1].u32[k] = k == 3 ? sp : rng();
             s.regs.gpr[0].u32[3] = 0x100;
             s.regs.pc = e.lsa;
-            edgeunit::Snapshot iso = s;
-            edgeunit::IsoResult r = edgeunit::run_isolated(iso, 0x100, sp, 400000);
             edgeunit::Snapshot nat = s;
             alignas(16) renjob::xo::V R[128];
             std::memcpy(R, nat.regs.gpr, sizeof R);
             renjob::xo::Ctl ctl;
+            js.attach(ctl);
             ctl.reset(400000);
             {
                 spuf::CsrGuard g;
                 e.fn(R, nat.ls.data(), ctl);
-            }
-            if (!r.ok) {
-                iso_fail++;
-                if (ctl.fail) {
-                    ctl.rollback(nat.ls.data());
-                    if (nat.ls != s.ls) bad++;
-                }
-                continue;
-            }
-            if (std::memcmp(iso.ls.data() + 0x4000, image.data(), image.size()) != 0) {
-                smc++;
-                if (ctl.fail) ctl.rollback(nat.ls.data());
-                continue;
             }
             if (ctl.fail) {
                 declined++;
@@ -77,21 +65,42 @@ int rj_fuzz(const std::vector<uint8_t>& image, const std::vector<std::string>& a
                 }
                 continue;
             }
+            ctl.clear_dirty();
+            uint32_t exit_pc = 0x100, exit_sp = sp;
+            uint32_t r0v, r1v;
+            std::memcpy(&r0v, reinterpret_cast<const uint8_t*>(&R[0]) + 12, 4);
+            std::memcpy(&r1v, reinterpret_cast<const uint8_t*>(&R[1]) + 12, 4);
+            if (ctl.out) {
+                exit_pc = r0v & 0x3fffc;
+                exit_sp = r1v;
+                exits++;
+                if (std::getenv("RJ_FZDBG")) std::printf("    it %d exit pc %05x budget %llu\n", it, exit_pc, (unsigned long long)ctl.budget);
+            }
+            edgeunit::Snapshot iso = s;
+            edgeunit::IsoResult r = edgeunit::run_isolated(iso, exit_pc, exit_sp, 400000);
+            if (!r.ok) {
+                iso_fail++;
+                continue;
+            }
+            if (std::memcmp(iso.ls.data() + 0x4000, image.data(), image.size()) != 0) {
+                smc++;
+                continue;
+            }
             ran++;
             std::memcpy(nat.regs.gpr, R, sizeof R);
             edgeunit::LsDiff d = edgeunit::diff_ls(nat.ls.data(), iso.ls.data(), 0, 0);
             int rd = -1;
-            for (int k = 0; k < 128; k++)
+            for (int k = ctl.out ? 1 : 0; k < 128; k++)
                 if (std::memcmp(&nat.regs.gpr[k], &iso.regs.gpr[k], 16) != 0) {
                     rd = k;
                     break;
                 }
             if (d.bytes || rd >= 0) {
                 bad++;
-                if (bad <= 3) std::printf("  %05x it %d: ls diff %zu [%05x..%05x] reg r%d\n", e.lsa, it, d.bytes, d.first, d.last, rd);
+                if (bad <= 3) std::printf("  %05x it %d: ls diff %zu [%05x..%05x] reg r%d exit %d pc %05x sp %05x iso-insns %llu\n", e.lsa, it, d.bytes, d.first, d.last, rd, int(ctl.out), exit_pc, exit_sp, (unsigned long long)r.insns);
             }
         }
-        std::printf("fuzz %05x: ran %d declined %d iso-fail %d self-modified %d bad %d\n", e.lsa, ran, declined, iso_fail, smc, bad);
+        std::printf("fuzz %05x: ran %d (exits %d) declined %d iso-fail %d self-modified %d bad %d\n", e.lsa, ran, exits, declined, iso_fail, smc, bad);
         bad_total += bad;
     }
     return bad_total ? 1 : 0;

@@ -86,6 +86,7 @@ class Func:
         self.tails = set()
         self.exits = set()
         self.multi = None
+        self.has_fail = False
 
 
 def discover(entry, known_entries, stops=frozenset(), entries=None):
@@ -120,7 +121,7 @@ def discover(entry, known_entries, stops=frozenset(), entries=None):
                 work.append(t)
             if op == "brsl":
                 t = (pc + d["imm"] * 4) & 0x3FFFC
-                if t != nxt:
+                if t != nxt and t not in NOCALL:
                     f.calls.add(t)
             if op == "bi" and d["ra"] != 0 and d["rb"] & 0x30 == 0 and jump_table(pc):
                 f.switches = getattr(f, "switches", {})
@@ -244,6 +245,13 @@ TU = {}
 TD = {}
 SPEC = {}
 DIRECT = os.environ.get("RJ_DIRECT", "1") == "1"
+EXITS = os.environ.get("RJ_EXITS", "1") == "1"
+PROF = os.environ.get("RJ_PROF", "0") == "1"
+PROMOTE = os.environ.get("RJ_PROMOTE", "1") == "1"
+LEAF_LOCALS = os.environ.get("RJ_LEAF_LOCALS", "0") == "1"
+HINTS = os.environ.get("RJ_HINTS", "1") == "1"
+BUDGET = False
+NOCALL = set()
 
 
 def closure(funcs):
@@ -265,6 +273,105 @@ def closure(funcs):
                 changed = True
 
 
+ABI_RE = re.compile(r"^((?:static )?(?:inline __attribute__\(\(always_inline\)\) )?)void ([fgm]_[0-9a-f]{5}\()")
+
+
+def abi(line):
+    return ABI_RE.sub(r"\1RJ_ABI void \2", line)
+
+
+PC_COUNTS = None
+
+
+def pc_counts():
+    global PC_COUNTS
+    if PC_COUNTS is None:
+        PC_COUNTS = {}
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pc_counts.txt")
+        if HINTS and os.path.exists(path):
+            for line in open(path):
+                a, b = line.split()
+                PC_COUNTS[int(a, 16)] = int(b)
+    return PC_COUNTS
+
+
+def branch_hint(f, pc):
+    cnt = pc_counts()
+    ex = cnt.get(pc, 0)
+    if ex < 64 or (pc + 4) in f.labels:
+        return None
+    fall = min(cnt.get(pc + 4, 0), ex)
+    taken = ex - fall
+    if taken * 20 <= ex:
+        return 0
+    if fall * 20 <= ex:
+        return 1
+    return None
+
+
+def find_promotable(f):
+    cands = {}
+    for p0, d0 in f.insns.items():
+        if d0["op"] in ("br", "brz", "brnz", "brhz", "brhnz"):
+            t0 = (p0 + d0["imm"] * 4) & 0x3FFFC
+            if t0 <= p0 and t0 in f.insns:
+                cands[t0] = max(cands.get(t0, 0), p0)
+    res = {}
+    for h in sorted(cands):
+        hi = cands[h]
+        ok = True
+        regs = set()
+        for q in range(h, hi + 4, 4):
+            d = f.insns.get(q)
+            if d is None:
+                ok = False
+                break
+            op = d["op"]
+            if op in ("brsl", "bi", "bisl", "biz", "binz", "bihz", "bihnz", "bra", "brasl", "iret") or op in FAILOPS or op in HALTS or op == "invalid":
+                ok = False
+                break
+            if q in KERNELS and q != h:
+                ok = False
+                break
+            if op not in SKIP:
+                regs |= regs_of(d)
+        if not ok:
+            continue
+        for p0, d0 in f.insns.items():
+            if h <= p0 <= hi:
+                continue
+            if d0["op"] in ("br", "brz", "brnz", "brhz", "brhnz"):
+                t0 = (p0 + d0["imm"] * 4) & 0x3FFFC
+                if h < t0 <= hi:
+                    ok = False
+                    break
+        for sw in getattr(f, "switches", {}).values():
+            if any(h <= t <= hi for t in sw):
+                ok = False
+        if f.multi and any(h < e <= hi for e in f.multi):
+            ok = False
+        if any(h < x <= hi for x in f.exits):
+            ok = False
+        if not ok:
+            continue
+        if any(not (hi < lo2 or h > hi2) for lo2, (lo2b, hi2, _) in [(k, v) for k, v in res.items()]):
+            continue
+        if f.insns[hi]["op"] != "br":
+            if hi + 4 in f.insns:
+                f.labels.add(hi + 4)
+            elif hi + 4 not in f.exits:
+                continue
+        res[h] = (h, hi, sorted(regs))
+    return res
+
+
+def xf(f, pc):
+    if EXITS and r0_dead(pc):
+        return "EXIT(0x%05x)" % pc
+    f.has_fail = True
+    return "FAIL(0x%05x)" % pc
+
+
 def emit_func(f, out):
     sig_index = len(out)
     out.append("%svoid f_%05x(V* __restrict R, uint8_t* __restrict ls, Ctl& ctl) {" % (SPEC.get(f.entry, ""), f.entry))
@@ -272,7 +379,8 @@ def emit_func(f, out):
     used_set = own_used(f) | ({0} if f.exits else set())
     used = sorted(used_set)
     defs = sorted(own_def(f))
-    direct = DIRECT
+    direct = DIRECT and not (LEAF_LOCALS and not (f.calls | f.tails))
+    f.direct = direct
     spill = "" if direct else " ".join("R[%d] = r%d;" % (r, r) for r in defs)
 
     def call_spill(c, tail):
@@ -285,13 +393,15 @@ def emit_func(f, out):
         if direct:
             return ""
         return " ".join("r%d = R[%d];" % (r, r) for r in sorted(TD[c] & used_set))
+    if PROF:
+        out.append("    rjprof::Scope rj_prof_scope(0x%05x);" % f.entry)
     if direct:
         out.append("    " + " ".join("V& r%d = R[%d];" % (r, r) for r in used))
     else:
         out.append("    " + " ".join("V r%d = R[%d];" % (r, r) for r in used))
     if f.multi:
         out[sig_index] = out[sig_index].replace("Ctl& ctl) {", "Ctl& ctl, uint32_t entry) {")
-        out.append("    switch (entry) { %s default: FAIL(entry); }" % " ".join("case 0x%05x: goto L_%05x;" % (e, e) for e in f.multi))
+        out.append("    switch (entry) { %s default: __builtin_unreachable(); }" % " ".join("case 0x%05x: goto L_%05x;" % (e, e) for e in f.multi))
     elif pcs[0] != f.entry:
         out.append("    goto L_%05x;" % f.entry)
         f.labels.add(f.entry)
@@ -301,6 +411,11 @@ def emit_func(f, out):
             t0 = (p0 + d0["imm"] * 4) & 0x3FFFC
             if t0 <= p0 and t0 in f.insns:
                 f.loops.add(t0)
+    promo = find_promotable(f) if PROMOTE and direct else {}
+    in_loop = {}
+    for h, (lo, hi, regs) in promo.items():
+        for q in range(lo, hi + 4, 4):
+            in_loop[q] = h
     prev = None
     body = []
     for pc in pcs:
@@ -316,15 +431,20 @@ def emit_func(f, out):
             if pc in f.insns or pc in f.exits:
                 out.append("    goto L_%05x;" % pc)
             else:
-                out.append("    FAIL(0x%05x);" % pc)
+                out.append("    %s;" % xf(f, pc))
             continue
         if pc in f.labels:
             out.append("L_%05x:" % pc)
             if pc in KERNELS:
                 out.append("    " + KERNELS[pc])
+            if pc in promo:
+                out.append("    {")
+                out.append("    " + " ".join("V r%d = R[%d];" % (r, r) for r in promo[pc][2]))
+            if pc in KERNELS or pc in promo:
                 out.append("L_%05x_b:" % pc)
-            if pc in f.loops:
-                out.append("    if (--ctl.budget == 0 || ctl.fail) FAIL(0x%05x);" % pc)
+            if pc in f.loops and BUDGET:
+                f.has_fail = True
+                out.append("    if (--ctl.budget == 0) FAIL(0x%05x);" % pc)
         d = f.insns[pc]
         op = d["op"]
         rt = d.get("rt")
@@ -384,15 +504,20 @@ def emit_func(f, out):
             if t in f.tails:
                 s = "@TAIL%05x@" % t
             else:
-                s = "goto L_%05x%s;" % (t, "_b" if t in KERNELS and t <= pc else "")
+                s = "goto L_%05x%s;" % (t, "_b" if (t in KERNELS or t in promo) and t <= pc and (t not in promo or pc in in_loop and in_loop[pc] == t) else "")
         elif op in ("brz", "brnz", "brhz", "brhnz"):
             t = (pc + imm * 4) & 0x3FFFC
             cond = {"brz": "pref(R[%d]) == 0", "brnz": "pref(R[%d]) != 0", "brhz": "hw6(R[%d]) == 0", "brhnz": "hw6(R[%d]) != 0"}[op] % rt
-            s = "if (%s) goto L_%05x%s;" % (cond, t, "_b" if t in KERNELS and t <= pc else "")
+            hint = branch_hint(f, pc)
+            if hint is not None:
+                cond = "__builtin_expect(!!(%s), %d)" % (cond, hint)
+            s = "if (%s) goto L_%05x%s;" % (cond, t, "_b" if (t in KERNELS or t in promo) and t <= pc and (t not in promo or pc in in_loop and in_loop[pc] == t) else "")
         elif op == "brsl":
             t = (pc + imm * 4) & 0x3FFFC
             if t == pc + 4:
                 s = "R[%d] = pref_only(0x%x);" % (rt, pc + 4)
+            elif t in NOCALL:
+                s = "FAIL(@PC@);"
             else:
                 s = "R[%d] = pref_only(0x%x); @CALL%05x@" % (rt, pc + 4, t)
         elif op in ("bisl", "bra", "brasl"):
@@ -406,22 +531,43 @@ def emit_func(f, out):
             s = "if (%s) %s" % (cond, "@RET@" if ra == 0 and d["rb"] & 0x30 == 0 else "FAIL(@PC@);")
         else:
             raise Exception("unhandled %s at %05x" % (op, pc))
-        s = s.replace("@PC@", "0x%05x" % pc)
+        if "FAIL(@PC@)" in s:
+            s = s.replace("FAIL(@PC@)", xf(f, pc))
         s = re.sub(r"R\[(\d+)\]", lambda m: "r" + m.group(1), s)
+        if pc in in_loop:
+            h = in_loop[pc]
+            lo, hi, regs = promo[h]
+            wb = " ".join("R[%d] = r%d;" % (r, r) for r in regs)
+
+            def fix_goto(m):
+                t = int(m.group(1), 16)
+                if m.group(2) or lo <= t <= hi:
+                    return m.group(0)
+                return "{ " + wb + " goto L_%05x; }" % t
+            s = re.sub(r"goto L_([0-9a-f]{5})(_b)?;", fix_goto, s)
+            if pc == hi:
+                out.append("    %s" % s)
+                if f.insns[pc]["op"] not in ("br",):
+                    out.append("    { " + wb + " goto L_%05x; }" % (pc + 4))
+                out.append("    }")
+                continue
         s = s.replace("@RET@", "{ " + spill + " return; }")
-        s = re.sub(r"@CALL([0-9a-f]+)@", lambda m: "{ " + call_spill(int(m.group(1), 16), False) + " f_" + m.group(1) + "(R, ls, ctl); if (ctl.fail) return; " + call_fill(int(m.group(1), 16)) + " }", s)
+        s = re.sub(r"@CALL([0-9a-f]+)@", lambda m: "{ " + call_spill(int(m.group(1), 16), False) + " f_" + m.group(1) + "(R, ls, ctl); if (ctl.out) return; " + call_fill(int(m.group(1), 16)) + " }", s)
         s = re.sub(r"@TAIL([0-9a-f]+)@", lambda m: "{ " + call_spill(int(m.group(1), 16), True) + " f_" + m.group(1) + "(R, ls, ctl); return; }", s)
         out.append("    %s" % s)
     for x in sorted(f.exits):
         out.append("L_%05x:" % x)
         if r0_dead(x):
-            out.append("    r0 = pref_only(0x%05x);" % x)
-            out.append("    { " + ("" if DIRECT else " ".join("R[%d] = r%d;" % (r, r) for r in sorted(set(defs) | {0}))) + " return; }")
+            out.append("    EXIT(0x%05x);" % x)
         else:
-            out.append("    FAIL(0x%05x);" % x)
+            out.append("    %s;" % xf(f, x))
             print("warning: r0 live at exit %05x" % x, file=sys.stderr)
     out.append("}")
     out.append("")
+    if not direct:
+        allsp = " ".join("R[%d] = r%d;" % (r, r) for r in defs)
+        for i in range(sig_index, len(out)):
+            out[i] = re.sub(r"EXIT\((0x[0-9a-f]+)\)", lambda m: "{ " + allsp + " R[0] = pref_only(" + m.group(1) + "); ctl.out = true; return; }", out[i])
 
 
 def all_entries():
@@ -451,14 +597,14 @@ def ops_mode(outp, hdr):
         f.insns[pc] = decode(pc)
         f.insns[pc + 4] = dict(op="bi", rt=0, ra=0, rb=0, w=0)
         funcs.append(f)
-    out = ['#include "%s"' % os.path.basename(hdr), "", "namespace renjob::opz {", "", "#define FAIL(pc) do { ctl.fail = true; ctl.fail_pc = pc; return; } while (0)", ""]
+    out = ['#include "%s"' % os.path.basename(hdr), "", "namespace renjob::opz {", "", "#define FAIL(pc) do { ctl.fail = true; ctl.out = true; ctl.fail_pc = pc; return; } while (0)", "#define EXIT(pc) do { R[0] = pref_only(pc); ctl.out = true; return; } while (0)", ""]
     for f in funcs:
         TU[f.entry] = set()
         TD[f.entry] = set()
         lines = []
         emit_func(f, lines)
         out += lines
-    out += ["#undef FAIL", "", "}"]
+    out += ["#undef FAIL", "#undef EXIT", "", "}"]
     open(outp, "w", newline="\n").write("\n".join(out) + "\n")
     h = ["#pragma once", "", '#include "renjob_ops.h"', "", "namespace renjob::opz {", "", "using namespace renjob::xo;", ""]
     for f in funcs:
@@ -471,6 +617,22 @@ def ops_mode(outp, hdr):
 
 
 def main():
+    if sys.argv[1] == "ops":
+        ops_mode(sys.argv[2], sys.argv[3])
+        return
+    if EXITS and os.environ.get("RJ_NOCALL", "1") == "1":
+        while True:
+            found = generate(dry=True)
+            if not (found - NOCALL):
+                break
+            NOCALL.update(found)
+    generate(dry=False)
+
+
+def generate(dry):
+    TU.clear()
+    TD.clear()
+    SPEC.clear()
     if sys.argv[1] == "ops":
         ops_mode(sys.argv[2], sys.argv[3])
         return
@@ -489,6 +651,8 @@ def main():
     hdr = sys.argv[3]
     ns = sys.argv[4] if len(sys.argv) > 4 else "renjob::xo"
     table = len(sys.argv) > 5
+    global BUDGET
+    BUDGET = table
     if froots == [0]:
         froots = all_entries()
     froots = [r for r in froots if r not in regions]
@@ -522,7 +686,7 @@ def main():
         if changed:
             funcs = {}
     base = os.path.basename(hdr)
-    out = ['#include "%s"' % base, "", "namespace %s {" % ns, "", "#define FAIL(pc) do { ctl.fail = true; ctl.fail_pc = pc; return; } while (0)", ""]
+    out = ['#include "%s"' % base] + (['#include "rj_prof.h"'] if PROF else []) + ["", "namespace %s {" % ns, "", "#define FAIL(pc) do { ctl.fail = true; ctl.out = true; ctl.fail_pc = pc; return; } while (0)", "#define EXIT(pc) do { R[0] = pref_only(pc); ctl.out = true; return; } while (0)", ""]
     inline_max = int(os.environ.get("RJ_INLINE_MAX", "120"))
     for e in sorted(funcs):
         if e not in froots and not table and len(funcs[e].insns) <= inline_max and not (funcs[e].calls & set(funcs)) - set([0x14f40]):
@@ -551,7 +715,14 @@ def main():
             out.append("")
         else:
             out += lines
+    if dry:
+        return {e for e, fn in funcs.items() if fn.has_fail}
+    if not table:
+        out = [re.sub(r"(?<![A-Za-z0-9_])st\(ls,", "stp(ls,", l) for l in out]
+        out = [re.sub(r"(?<![A-Za-z0-9_])st32\(ls,", "st32p(ls,", l) for l in out]
+    out = [abi(l) for l in out]
     out.append("#undef FAIL")
+    out.append("#undef EXIT")
     out.append("")
     out.append("}")
     open(outp, "w", newline="\n").write("\n".join(out) + "\n")
@@ -565,17 +736,35 @@ def main():
     for e in allroots:
         h.append("inline constexpr uint32_t kSig%05x[16] = {%s};" % (e, ", ".join("0x%08xu" % word(e + 4 * i) for i in range(16))))
     h.append("")
-    h.append("#define RJ_ROOTS(X) " + " ".join("X(%05x, %s_%05x)" % (e, "g" if e in regs else "f", e) for e in allroots))
+    def closure_fails(g):
+        seen = set()
+        work = [g]
+        while work:
+            x = work.pop()
+            if id(x) in seen:
+                continue
+            seen.add(id(x))
+            if x.has_fail:
+                return True
+            for c in x.calls | x.tails:
+                if c in funcs:
+                    work.append(funcs[c])
+        return False
+
+    def root_fails(e):
+        return closure_fails(regs[e] if e in regs else funcs[e])
+    h.append("#define RJ_ROOTS(X) " + " ".join("X(%05x, %s_%05x, %d)" % (e, "g" if e in regs else "f", e, 1 if root_fails(e) else 0) for e in allroots))
     if table:
         h.append("")
-        h.append("struct GenEntry { uint32_t lsa; void (*fn)(V*, uint8_t*, Ctl&); };")
+        h.append("struct GenEntry { uint32_t lsa; void (RJ_ABI *fn)(V*, uint8_t*, Ctl&); };")
         h.append("inline constexpr GenEntry kAllGen[] = {%s};" % ", ".join("{0x%05x, f_%05x}" % (e, e) for e in sorted(funcs)))
     h += ["", "}"]
+    h = [abi(l) for l in h]
     open(hdr, "w", newline="\n").write("\n".join(h) + "\n")
     for e in sorted(funcs):
         print("%05x insns %d calls %s tails %s" % (e, len(funcs[e].insns), sorted("%05x" % c for c in funcs[e].calls), sorted("%05x" % c for c in funcs[e].tails)))
     for e in sorted(regs):
-        print("region %05x insns %d exits %s family %s" % (e, len(regs[e].insns), sorted("%05x" % c for c in regs[e].exits), "%05x" % regs[e].entry))
+        print("region %05x insns %d exits %s family %s journal %d" % (e, len(regs[e].insns), sorted("%05x" % c for c in regs[e].exits), "%05x" % regs[e].entry, 1 if root_fails(e) else 0))
 
 
 if __name__ == "__main__":
