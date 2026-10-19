@@ -213,6 +213,16 @@ bool decompress_indexes_supported(const uint8_t* ls, uint32_t src) {
     return w < 16 && (n != 0 || w == 0) && (src & 15) == 0;
 }
 
+bool decompress_indexes_safe(const uint8_t* ls, uint32_t ctx, uint32_t src, uint32_t limit) {
+    if (ctx < 0x10000 || ctx + 0x200 > 0x40000 || src < 0x10c80 || src >= 0x40000 || !decompress_indexes_supported(ls, src)) return false;
+    uint64_t ntri = (be16(ls + ctx + 400) * 0xaaabu) & 0xffff;
+    uint64_t n_explicit = be16(ls + src), flag_bytes = be16(ls + src + 4);
+    uint64_t code_bytes = (2 * ntri + 7) >> 3;
+    uint64_t sgroups = (8 * flag_bytes + 15) >> 4;
+    uint64_t span = 64 + 8 + flag_bytes + code_bytes + 4 * 16 * ((n_explicit + 31) >> 5) + 64 * ((n_explicit + 31) >> 5) + 96 * ((ntri + 7) >> 3) + 64 * (sgroups + 1) + 2 * (code_bytes + 32) + 6 * 16 * (sgroups + 1);
+    return src + span + 64 <= limit;
+}
+
 uint32_t decompress_indexes(uint8_t* ls, uint32_t ctx, uint32_t src, Outputs* outs) {
     static const bool no_fast = std::getenv("EDGE_IDX_SLOW") != nullptr;
     uint32_t fend = 0;

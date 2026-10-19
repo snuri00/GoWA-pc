@@ -588,9 +588,10 @@ int32_t cull_triangles(uint8_t* ls, const CullIn& in) {
     uint32_t nv = spuf::ld16(ls + ctx + 8);
     if (!nv) return -1;
     if (spuf::ld32(in.r5) != 0) return -1;
-    if (ctx + 512 > 0x40000) return cull_triangles_ref(ls, in);
+    if (ctx + 512 > 0x40000) return -1;
 
     uint32_t sp = spuf::ld32(in.r1);
+    if ((sp & 15) || sp < 0x400 || sp > 0x3ffc0) return -1;
     uint32_t spp = sp - 144;
     uint32_t tab = ld32(ls, ctx + 16 + 4 * (ls[ctx] & 15));
     uint32_t pos = ld32(ls, ctx + 92);
@@ -600,12 +601,15 @@ int32_t cull_triangles(uint8_t* ls, const CullIn& in) {
     uint32_t ntri = uint32_t((uint64_t(ni) * 0xaaaaaaabull) >> 33) & 0xffff;
     uint32_t idx = ld32(ls, ctx + 80);
     uint32_t groups = (ntri + 3) >> 2;
+    if ((pos & 15) || (tab & 15) || (idx & 1) || pos >= 0x40000 || tab < 0x10c80 || tab >= 0x40000 || idx < 0x10c80 || idx >= 0x40000) return -1;
     uint32_t end = idx + ((6 * ntri + 15) & ~15u);
     uint32_t vspan = 64 * (vgroups + 1);
-    uint32_t wlo = idx & ~15u, whi = (end > idx + 24 * groups ? end : idx + 24 * groups) + 64;
-    if ((pos & 15) || (tab & 15) || pos + vspan > 0x40000 || tab + vspan > 0x40000 || overlaps(pos, vspan, tab, vspan) || whi > 0x40000 || idx > 0x40000 || overlaps(tab, vspan, wlo, whi - wlo) ||
-        overlaps(tab, vspan, spp - 80, 240) || overlaps(pos, vspan, spp - 80, 240) || overlaps(wlo, whi - wlo, ctx, 512) || overlaps(tab, vspan, ctx, 512) || spp < 0x100 || sp + 32 > 0x40000)
-        return cull_triangles_ref(ls, in);
+    uint64_t whi64 = uint64_t(end > idx + 24 * groups ? end : idx + 24 * groups) + 64;
+    if (uint64_t(pos) + vspan > 0x40000 || uint64_t(tab) + vspan > 0x40000 || whi64 > 0x40000) return -1;
+    uint32_t wlo = idx & ~15u, whi = uint32_t(whi64);
+    if (overlaps(pos, vspan, tab, vspan) || overlaps(tab, vspan, wlo, whi - wlo) || overlaps(tab, vspan, spp - 80, 240) || overlaps(pos, vspan, spp - 80, 240) || overlaps(wlo, whi - wlo, ctx, 512) ||
+        overlaps(tab, vspan, ctx, 512) || overlaps(wlo, whi - wlo, spp - 80, 240))
+        return -1;
     spuf::CsrGuard csr;
 
     uint8_t r1p[16], r126p[16];
@@ -744,7 +748,7 @@ int32_t cull_triangles(uint8_t* ls, const CullIn& in) {
                 _mm256_store_si256(reinterpret_cast<__m256i*>(ia[v]), x);
             }
             if (!_mm256_testz_si256(oorv, oorv)) {
-                if (!group_exact(k) || !group_exact(k + 1)) return cull_triangles_ref(ls, in);
+                if (!group_exact(k) || !group_exact(k + 1)) return -1;
                 continue;
             }
             __m256 xA, yA, xB, yB, xC, yC;
@@ -774,7 +778,7 @@ int32_t cull_triangles(uint8_t* ls, const CullIn& in) {
     }
 
     for (; k < groups; k++)
-        if (!group_exact(k)) return cull_triangles_ref(ls, in);
+        if (!group_exact(k)) return -1;
 
     uint32_t P = idx;
     uint32_t surv = 0;

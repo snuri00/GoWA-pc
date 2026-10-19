@@ -233,8 +233,8 @@ void compress_fmt(uint8_t* ls, uint32_t ctx, uint32_t nv, uint32_t out, const Fo
     uint32_t n2 = (nv + 1) & ~1u;
     uint32_t pairs = n2 / 2;
     uint32_t pr = 2 * fm.rec;
-    bool fast = out + pr * pairs + 16 * fm.nq + 16 <= 0x40000;
-    for (int i = 0; i < fm.nfields && fast; i++) fast = (tabs[i] & 15) == 0 && tabs[i] + 16 * n2 <= 0x40000;
+    bool fast = uint64_t(out) + uint64_t(pr) * pairs + 16 * fm.nq + 16 <= 0x40000;
+    for (int i = 0; i < fm.nfields && fast; i++) fast = (tabs[i] & 15) == 0 && uint64_t(tabs[i]) + 16ull * n2 <= 0x40000;
     if (fast && pairs) {
         encode_columns(ls, fm, tabs, n2, ls + out);
         uint32_t A = out + pr * (pairs - 1);
@@ -261,7 +261,7 @@ void compress_fmt(uint8_t* ls, uint32_t ctx, uint32_t nv, uint32_t out, const Fo
 
 }
 
-bool compress_vertexes(uint8_t* ls, uint32_t ctx, int overlay, uint32_t r3out[4], Outputs* outs, bool* called) {
+bool compress_vertexes(uint8_t* ls, uint32_t ctx, int overlay, uint32_t r3out[4], Outputs* outs, bool* called, uint32_t limit) {
     spuf::CsrGuard csr;
     if (called) *called = false;
     uint32_t w80 = rd32(ls, ctx + 80), w84 = rd32(ls, ctx + 84), w88 = rd32(ls, ctx + 88), w92 = rd32(ls, ctx + 92);
@@ -277,6 +277,16 @@ bool compress_vertexes(uint8_t* ls, uint32_t ctx, int overlay, uint32_t r3out[4]
     for (const Format& f : kFormats)
         if (f.id == overlay) fm = &f;
     if (nv && cb && !fm) return false;
+    if (ctx < 0x10000 || ctx + 0x200 > 0x40000) return false;
+    if (nv && cb) {
+        uint32_t n2 = (nv + 1) & ~1u;
+        uint64_t o = w88;
+        if (o < 0x10c80 || o + uint64_t(2 * fm->rec) * (n2 / 2) + 16 * fm->nq + 32 > limit) return false;
+        for (int i = 0; i < fm->nfields; i++) {
+            uint64_t t = table_of(ls, ctx, fm->f[i].attr);
+            if ((t & 15) || t < 0x10c80 || t + 16ull * n2 + 16 > limit) return false;
+        }
+    }
     r3out[0] = w88;
     r3out[1] = w92;
     r3out[2] = w80;

@@ -529,7 +529,29 @@ bool vdecomp_run(uint8_t* ls, int overlay, uint32_t ctx, uint32_t verts, uint32_
     if (sp + 64 > kLs || sp < 0x400) return false;
     if (overlay != 0 && overlay != 1 && overlay != 3 && overlay != 9 && overlay != 10 && overlay != 11 && overlay != 12) return false;
     ctx &= 0x3fff0;
-    if (ctx + 368 > kLs) return false;
+    if (ctx + 368 > kLs || ctx < 0x10000) return false;
+    {
+        uint32_t stride = overlay == 10 || overlay == 12 ? 12 : overlay == 9 || overlay == 11 ? 9 : overlay == 0 ? 15 : 18;
+        uint32_t n2 = (nv + 1) & ~1u;
+        uint64_t lim = sp > 0x1000 ? sp - 0x1000 : 0;
+        if (!n2 || verts < 0x10c80 || uint64_t(verts) + uint64_t(stride) * n2 + 16 > lim) return false;
+        if (overlay != 0 && overlay != 1 && overlay != 3 && ((desc & 15) || desc < 0x10000 || uint64_t(desc) + 0x40 > lim)) return false;
+        int need = overlay == 12 || overlay == 3 ? 3 : overlay == 11 ? 2 : 1;
+        uint8_t fl[16];
+        std::memcpy(fl, ls + ctx + 352, 16);
+        for (int a = 0; a < need; a++) {
+            uint32_t k = 16;
+            for (uint32_t i = 0; i < 16; i++)
+                if (fl[i] == 0) {
+                    k = i;
+                    break;
+                }
+            if (k == 16) return false;
+            fl[k] = 1;
+            uint32_t t = rd32(ls, ctx + 16 + 4 * k);
+            if ((t & 15) || t < 0x10c80 || uint64_t(t) + 16ull * n2 + 32 > lim) return false;
+        }
+    }
     PosFmt pf;
     if (overlay != 0 && overlay != 1 && overlay != 3) {
         pf.load(ls, desc);

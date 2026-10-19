@@ -268,7 +268,7 @@ uint32_t skin_test_rsq(uint32_t seed, uint32_t n) {
     return bad;
 }
 
-bool skin_vertexes(uint8_t* lsp, uint32_t ctx, uint32_t matrices, uint32_t num_matrices, uint32_t weights) {
+bool skin_vertexes(uint8_t* lsp, uint32_t ctx, uint32_t matrices, uint32_t num_matrices, uint32_t weights, uint32_t limit) {
     spuf::CsrGuard guard;
     Ls ls{lsp};
     const uint8_t* cfg = lsp + ctx;
@@ -282,10 +282,19 @@ bool skin_vertexes(uint8_t* lsp, uint32_t ctx, uint32_t matrices, uint32_t num_m
     uint32_t nv = spuf::ld16(cfg + 8);
     uint32_t total = (nv + 3) & ~3u;
     if (total <= 11) return false;
-    if (fmt == 2) convert_matrices(ls, matrices, num_matrices);
+    if (num_matrices > 256 || ctx < 0x10000 || ctx + 0x200 > 0x40000) return false;
     uint32_t pos = ls.w(ctx + 92);
     uint32_t t100 = ls.w(ctx + 100);
     uint32_t t104 = ls.w(ctx + 104);
+    {
+        auto okr = [&](uint32_t a, uint64_t len) { return (a & 15) == 0 && a >= 0x10c80 && uint64_t(a) + len <= limit; };
+        uint32_t tmp0 = ls.w(ctx + 16 + 4 * (cfg[0] & 15));
+        uint32_t w96 = ls.w(ctx + 96);
+        uint64_t tl = 16ull * ((nv + 7) & ~7u) + 64;
+        if (!okr(matrices, 64ull * num_matrices) || (weights & 7) || weights < 0x10c80 || uint64_t(weights) + 8ull * total + 16 > limit || !okr(pos, tl) || !okr(tmp0, 48ull * total + 64)) return false;
+        if ((t100 && !okr(t100, tl)) || (t104 && !okr(t104, tl)) || (w96 && !okr(w96, tl))) return false;
+    }
+    if (fmt == 2) convert_matrices(ls, matrices, num_matrices);
     uint32_t tables[2];
     uint32_t ntab = 0;
     if (t100) tables[ntab++] = t100;
