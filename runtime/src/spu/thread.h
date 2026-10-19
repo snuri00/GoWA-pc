@@ -64,7 +64,7 @@ struct SpuThread : Host {
     }
     void wake_rsv_waiter() {
         uint32_t r = raddr;
-        if (r) rsv::version(r).notify_all();
+        if (r) rsv::wake(r);
     }
     void mark_all_ls() {
         if (cap_on.load(std::memory_order_relaxed)) note_cap_write(0, 0x40000);

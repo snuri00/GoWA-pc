@@ -101,7 +101,7 @@ bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uin
         }
     }
     e.ver.fetch_add(64, std::memory_order_release);
-    e.ver.notify_all();
+    if (sleepers()) e.ver.notify_all();
     return true;
 }
 
@@ -112,7 +112,7 @@ void store_unconditional(uint32_t line, const uint8_t* data) {
     e.ver.fetch_add(64, std::memory_order_acq_rel);
     std::memcpy(vm::ptr(line), data, 128);
     e.ver.fetch_add(64, std::memory_order_release);
-    e.ver.notify_all();
+    if (sleepers()) e.ver.notify_all();
 }
 
 void store_locked(uint32_t addr, const void* data, uint32_t size) {
@@ -122,7 +122,7 @@ void store_locked(uint32_t addr, const void* data, uint32_t size) {
     e.ver.fetch_add(64, std::memory_order_acq_rel);
     std::memcpy(vm::ptr(addr), data, size);
     e.ver.fetch_add(64, std::memory_order_release);
-    e.ver.notify_all();
+    if (sleepers()) e.ver.notify_all();
 }
 
 void merge_bits(uint32_t addr, const uint8_t* data, const uint8_t* base, uint32_t size) {
@@ -135,7 +135,46 @@ void merge_bits(uint32_t addr, const uint8_t* data, const uint8_t* base, uint32_
         if (changed) dst[i] = static_cast<uint8_t>((dst[i] & ~changed) | (data[i] & changed));
     }
     e.ver.fetch_add(64, std::memory_order_release);
-    e.ver.notify_all();
+    if (sleepers()) e.ver.notify_all();
+}
+
+bool sleepers() {
+    static const bool on = std::getenv("GOWA_RSV_SLEEP_US") != nullptr;
+    return on;
+}
+
+void wake(uint32_t addr) {
+    if (sleepers()) entry(addr).ver.notify_all();
+}
+
+bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size) {
+    Entry& e = entry(addr & ~127u);
+    const uint8_t* src = vm::ptr(addr);
+    bool changed = false;
+    for (;;) {
+        uint64_t v1 = e.ver.load(std::memory_order_acquire);
+        if (v1 & 64) {
+            _mm_pause();
+            continue;
+        }
+        uint32_t i = 0;
+        for (; i + 16 <= size; i += 16) {
+            __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+            __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst + i));
+            if (_mm_movemask_epi8(_mm_cmpeq_epi8(s, d)) != 0xFFFF) {
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), s);
+                changed = true;
+            }
+        }
+        for (; i < size; i++) {
+            if (dst[i] != src[i]) {
+                dst[i] = src[i];
+                changed = true;
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (e.ver.load(std::memory_order_acquire) == v1) return changed;
+    }
 }
 
 bool lost(uint32_t line, uint64_t rtime, const uint8_t* rdata) {

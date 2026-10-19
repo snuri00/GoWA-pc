@@ -14,5 +14,8 @@ void merge_bits(uint32_t addr, const uint8_t* data, const uint8_t* base, uint32_
 bool lost(uint32_t line, uint64_t rtime, const uint8_t* rdata);
 void wait_change(uint32_t line, uint64_t rtime, uint32_t micros);
 bool wait_lost(uint32_t line, uint64_t rtime, const uint8_t* rdata, uint32_t micros);
+bool sleepers();
+void wake(uint32_t addr);
+bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size);
 
 }

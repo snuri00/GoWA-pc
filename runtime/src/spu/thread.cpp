@@ -750,12 +750,11 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         uint32_t done = 0;
         alignas(16) uint8_t line[128];
         uint32_t dirty_lo = 0xFFFFFFFFu, dirty_hi = 0;
+        (void)line;
         while (done < size) {
             uint32_t a = ea + done;
             uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
-            rsv::snapshot(a & ~127u, line);
-            if (std::memcmp(ls + lsa + done, line + (a & 127), chunk) != 0) {
-                std::memcpy(ls + lsa + done, line + (a & 127), chunk);
+            if (rsv::copy_if_changed(a, ls + lsa + done, chunk)) {
                 dirty_lo = (std::min)(dirty_lo, lsa + done);
                 dirty_hi = (std::max)(dirty_hi, lsa + done + chunk);
             }

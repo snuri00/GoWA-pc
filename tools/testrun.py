@@ -11,7 +11,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN_DIR = os.path.join(ROOT, "run")
 RUNS = os.path.join(ROOT, "out", "runs")
-EXE = os.path.join(ROOT, "build", "gowa.exe")
+EXE = os.environ.get("GOWA_TESTRUN_EXE") or os.path.join(ROOT, "build", "gowa.exe")
 KEEP = 15
 
 
