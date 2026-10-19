@@ -580,9 +580,22 @@ void note_job(uint32_t id, uint32_t wid, uint32_t src, uint32_t pc, int mode, ui
     if (mode >= 2) LOG_INFO("spujob", "thread 0x%x enters code %08x wid %u pc 0x%05x", id, src, wid, pc);
 }
 
+void SpuThread::clear_snap(uint32_t k) {
+    DmaSnap& d = dma_snaps[k];
+    if (!d.size) return;
+    for (uint32_t l = d.lsa >> 7, last = (d.lsa + d.size - 1) >> 7; l <= last && l < snap_line.size(); l++) snap_line[l] &= ~(uint64_t(1) << k);
+    d.size = 0;
+}
+
 void SpuThread::forget_ls(uint32_t lsa, uint32_t size) {
-    for (DmaSnap& d : dma_snaps) {
-        if (d.size && d.lsa < lsa + size && lsa < d.lsa + d.size) d.size = 0;
+    if (!size) return;
+    uint64_t cand = 0;
+    for (uint32_t l = lsa >> 7, last = (lsa + size - 1) >> 7; l <= last && l < snap_line.size(); l++) cand |= snap_line[l];
+    while (cand) {
+        uint32_t k = static_cast<uint32_t>(__builtin_ctzll(cand));
+        cand &= cand - 1;
+        DmaSnap& d = dma_snaps[k];
+        if (d.size && d.lsa < lsa + size && lsa < d.lsa + d.size) clear_snap(k);
     }
 }
 
@@ -597,6 +610,7 @@ void SpuThread::remember_get(uint32_t ea, uint32_t size, uint32_t lsa) {
         }
     }
     if (!slot_ptr) {
+        clear_snap(dma_snap_next);
         slot_ptr = &dma_snaps[dma_snap_next];
         dma_snap_next = (dma_snap_next + 1) % dma_snaps.size();
     }
@@ -604,10 +618,15 @@ void SpuThread::remember_get(uint32_t ea, uint32_t size, uint32_t lsa) {
     slot_ptr->size = size;
     slot_ptr->lsa = lsa;
     slot_ptr->data.assign(ls + lsa, ls + lsa + size);
+    uint64_t bit = uint64_t(1) << (slot_ptr - dma_snaps.data());
+    for (uint32_t l = lsa >> 7, last = (lsa + size - 1) >> 7; l <= last && l < snap_line.size(); l++) snap_line[l] |= bit;
 }
 
 bool SpuThread::merge_put(uint32_t ea, uint32_t size, uint32_t lsa) {
-    for (DmaSnap& d : dma_snaps) {
+    uint64_t cand = (lsa >> 7) < snap_line.size() ? snap_line[lsa >> 7] : 0;
+    while (cand) {
+        DmaSnap& d = dma_snaps[__builtin_ctzll(cand)];
+        cand &= cand - 1;
         if (!d.size || ea < d.ea || ea + size > d.ea + d.size || d.lsa + (ea - d.ea) != lsa) continue;
         uint8_t* base = d.data.data() + (ea - d.ea);
         const uint8_t* src = ls + lsa;

@@ -34,6 +34,8 @@ struct SpuThread : Host {
         std::vector<uint8_t> data;
     };
     std::array<DmaSnap, 64> dma_snaps{};
+    std::array<uint64_t, 0x40000 / 128> snap_line{};
+    void clear_snap(uint32_t k);
     std::unique_ptr<uint32_t[]> line_src{new uint32_t[0x40000 / 128]()};
     uint32_t cur_src = 0;
     uint64_t src_insn_mark = 0;
