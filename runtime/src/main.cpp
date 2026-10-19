@@ -189,6 +189,7 @@ int main(int argc, char** argv) {
     static const int census = std::getenv("GOWA_THREAD_CPU") ? std::atoi(std::getenv("GOWA_THREAD_CPU")) : 0;
     for (int tick = 0;; tick++) {
         if (census > 0 && tick % census == 0) thread_census(census);
+        hooks::tick_patches();
         if (watch_delay && tick == watch_delay) crash::arm_watch();
         else if (tick > watch_delay) crash::rearm_watch();
         if (tick == memdump_at) trace::dump_memory("memdump.bin");

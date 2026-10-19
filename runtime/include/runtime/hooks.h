@@ -8,5 +8,6 @@ namespace hooks {
 void init();
 const std::string& name_of(uint32_t addr);
 void capture(const char* reason);
+void tick_patches();
 
 }

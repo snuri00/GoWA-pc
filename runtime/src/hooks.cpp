@@ -2,6 +2,7 @@
 #include "runtime/hooks.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
+#include "runtime/reservation.h"
 #include "runtime/trace.h"
 
 #include <atomic>
@@ -326,6 +327,74 @@ bool wait_previous_edge_list_started(ppu::Context& ctx) {
         LOG_WARN("patch", "waited %.3f ms for edge list %u to pass its MeshPrep barrier", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), prev);
     }
     return false;
+}
+
+void tick_patches() {
+    static const bool off = [] {
+        const char* e = std::getenv("GOWA_GAME_PATCHES");
+        return e && std::string(e) == "0";
+    }();
+    struct Boost {
+        uint32_t wid;
+        uint8_t prio[8];
+        bool done;
+    };
+    static std::vector<Boost> boosts = [] {
+        std::vector<Boost> v;
+        std::string spec = std::getenv("GOWA_SPURS_PRIO") ? std::getenv("GOWA_SPURS_PRIO") : "";
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(';', pos);
+            if (end == std::string::npos) end = spec.size();
+            std::string item = spec.substr(pos, end - pos);
+            size_t colon = item.find(':');
+            if (colon != std::string::npos) {
+                Boost b{static_cast<uint32_t>(std::atoi(item.substr(0, colon).c_str())), {}, false};
+                std::string rest = item.substr(colon + 1);
+                size_t q = 0;
+                for (int i = 0; i < 8 && q <= rest.size(); i++) {
+                    size_t c = rest.find(',', q);
+                    if (c == std::string::npos) c = rest.size();
+                    b.prio[i] = static_cast<uint8_t>(std::atoi(rest.substr(q, c - q).c_str()));
+                    q = c + 1;
+                }
+                v.push_back(b);
+            }
+            pos = end + 1;
+        }
+        return v;
+    }();
+    if (off) return;
+    const uint32_t spurs = 0x3001ad00;
+    if (!vm::range_mapped(spurs, 0x1100)) return;
+    bool changed = false;
+    for (Boost& b : boosts) {
+        if (b.done || b.wid >= 32) continue;
+        if ((vm::read32(spurs + 0xB0) & (0x80000000u >> b.wid)) == 0) continue;
+        uint32_t info = spurs + (b.wid < 16 ? 0xB00 : 0x1000) + (b.wid & 15) * 0x20;
+        if (!vm::read32(info + 4)) continue;
+        uint64_t prio = vm::read64(info + 0x18);
+        if (!prio) continue;
+        uint8_t old[8];
+        for (int i = 0; i < 8; i++) old[i] = uint8_t(prio >> (56 - 8 * i));
+        bool ok = true;
+        for (int i = 0; i < 8; i++) {
+            if ((old[i] == 0) != (b.prio[i] == 0)) ok = false;
+        }
+        b.done = true;
+        if (!ok) {
+            LOG_WARN("patch", "SPURS workload %u priority layout differs, not changed", b.wid);
+            continue;
+        }
+        rsv::store_locked(info + 0x18, b.prio, 8);
+        changed = true;
+        LOG_WARN("patch", "SPURS workload %u priority %u,%u,%u,%u,%u,%u -> %u,%u,%u,%u,%u,%u", b.wid, old[0], old[1], old[2], old[3], old[4], old[5], b.prio[0], b.prio[1], b.prio[2], b.prio[3], b.prio[4], b.prio[5]);
+    }
+    if (changed) {
+        uint8_t ff = 0xFF;
+        rsv::store_locked(spurs + 0xBD, &ff, 1);
+        rsv::store_locked(spurs + 0x72, &ff, 1);
+    }
 }
 
 void install_patches() {
