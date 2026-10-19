@@ -236,6 +236,7 @@ bool init() {
     std::mutex wm;
     std::condition_variable wcv;
     std::thread([&] {
+        SetThreadDescription(GetCurrentThread(), L"Window");
         WNDCLASSW wc{};
         wc.lpfnWndProc = wnd_proc;
         wc.hInstance = GetModuleHandleW(nullptr);

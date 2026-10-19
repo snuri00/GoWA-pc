@@ -27,6 +27,9 @@ void rsx_status();
 #include <string>
 #include <thread>
 #include <vector>
+#include <map>
+#include <algorithm>
+#include <tlhelp32.h>
 
 namespace {
 
@@ -52,6 +55,68 @@ namespace crash {
 void install();
 void arm_watch();
 void rearm_watch();
+}
+
+
+namespace {
+
+void thread_census(int period) {
+    static std::map<DWORD, std::pair<uint64_t, uint64_t>> prev;
+    static auto prev_wall = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    double wall = std::chrono::duration<double>(now - prev_wall).count();
+    prev_wall = now;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{sizeof te};
+    DWORD pid = GetCurrentProcessId();
+    struct Row {
+        double user, kernel;
+        std::string name;
+        DWORD tid;
+    };
+    std::vector<Row> rows;
+    std::map<DWORD, std::pair<uint64_t, uint64_t>> cur;
+    double total = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        FILETIME c, e, k, u;
+        if (GetThreadTimes(h, &c, &e, &k, &u)) {
+            uint64_t ku = (uint64_t(k.dwHighDateTime) << 32) | k.dwLowDateTime, uu = (uint64_t(u.dwHighDateTime) << 32) | u.dwLowDateTime;
+            cur[te.th32ThreadID] = {uu, ku};
+            auto it = prev.find(te.th32ThreadID);
+            if (it != prev.end() && wall > 0) {
+                Row r;
+                r.user = (uu - it->second.first) / 1e7 / wall * 100.0;
+                r.kernel = (ku - it->second.second) / 1e7 / wall * 100.0;
+                r.tid = te.th32ThreadID;
+                PWSTR desc = nullptr;
+                if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc) {
+                    char b[128] = {};
+                    WideCharToMultiByte(CP_UTF8, 0, desc, -1, b, sizeof b - 1, nullptr, nullptr);
+                    r.name = b;
+                    LocalFree(desc);
+                }
+                total += r.user + r.kernel;
+                if (r.user + r.kernel >= 1.0) rows.push_back(r);
+            }
+        }
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    prev.swap(cur);
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.user + a.kernel > b.user + b.kernel; });
+    std::string line;
+    char b[160];
+    for (const Row& r : rows) {
+        std::snprintf(b, sizeof b, " [%s#%lu %.0f%%u %.0f%%k]", r.name.empty() ? "?" : r.name.c_str(), static_cast<unsigned long>(r.tid), r.user, r.kernel);
+        line += b;
+    }
+    LOG_INFO("census", "process cpu %.0f%% of one core over %ds:%s", total, period, line.c_str());
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -120,7 +185,10 @@ int main(int argc, char** argv) {
     guest::start(main_thread);
     bool status = std::getenv("GOWA_STATUS") != nullptr;
     int memdump_at = std::getenv("GOWA_MEMDUMP_AT") ? std::atoi(std::getenv("GOWA_MEMDUMP_AT")) : -1;
+    SetThreadDescription(GetCurrentThread(), L"Host main");
+    static const int census = std::getenv("GOWA_THREAD_CPU") ? std::atoi(std::getenv("GOWA_THREAD_CPU")) : 0;
     for (int tick = 0;; tick++) {
+        if (census > 0 && tick % census == 0) thread_census(census);
         if (watch_delay && tick == watch_delay) crash::arm_watch();
         else if (tick > watch_delay) crash::rearm_watch();
         if (tick == memdump_at) trace::dump_memory("memdump.bin");

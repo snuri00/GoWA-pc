@@ -423,7 +423,8 @@ SPU_INLINE __m128i sfx_exp255(__m128 a) {
 }
 
 SPU_INLINE __m128 sfx_pos_zero(__m128 r) {
-    return _mm_andnot_ps(_mm_cmpeq_ps(r, _mm_setzero_ps()), r);
+    __m128i ri = _mm_castps_si128(r);
+    return _mm_castsi128_ps(_mm_andnot_si128(_mm_cmpeq_epi32(ri, _mm_set1_epi32(int(0x80000000u))), ri));
 }
 
 template <class F>

@@ -3,6 +3,10 @@
 
 #include <thread>
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
 namespace lv2 {
 
 namespace {
@@ -25,6 +29,7 @@ bool g_thread_started = false;
 uint64_t now_us() { return ppu::timebase() / 80; }
 
 void timer_thread() {
+    SetThreadDescription(GetCurrentThread(), L"LV2 Timer");
     std::unique_lock lk(g_lock);
     for (;;) {
         uint64_t now = now_us();
