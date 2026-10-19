@@ -684,17 +684,105 @@ VkImageView make_view(VkImage image, VkFormat format, VkImageViewType type, VkIm
     return v;
 }
 
+struct MemBlock {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint32_t type = 0;
+    VkDeviceSize size = 0;
+    std::map<VkDeviceSize, VkDeviceSize> free;
+};
+
+struct SubAlloc {
+    MemBlock* block;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+};
+
+std::vector<std::unique_ptr<MemBlock>> g_mem_blocks;
+std::unordered_map<VkImage, SubAlloc> g_suballocs;
+constexpr VkDeviceSize kBlockSize = VkDeviceSize(128) << 20;
+
+bool suballocate(MemBlock& b, VkDeviceSize size, VkDeviceSize align, VkDeviceSize& out) {
+    for (auto it = b.free.begin(); it != b.free.end(); ++it) {
+        VkDeviceSize o = (it->first + align - 1) & ~(align - 1);
+        VkDeviceSize end = it->first + it->second;
+        if (o + size > end) continue;
+        VkDeviceSize start = it->first;
+        b.free.erase(it);
+        if (o > start) b.free[start] = o - start;
+        if (o + size < end) b.free[o + size] = end - (o + size);
+        out = o;
+        return true;
+    }
+    return false;
+}
+
+void release_range(MemBlock& b, VkDeviceSize offset, VkDeviceSize size) {
+    auto it = b.free.emplace(offset, size).first;
+    auto next = std::next(it);
+    if (next != b.free.end() && it->first + it->second == next->first) {
+        it->second += next->second;
+        b.free.erase(next);
+    }
+    if (it != b.free.begin()) {
+        auto prev = std::prev(it);
+        if (prev->first + prev->second == it->first) {
+            prev->second += it->second;
+            b.free.erase(it);
+        }
+    }
+}
+
 bool allocate_image(const VkImageCreateInfo& ii, VkImage& image, VkDeviceMemory& memory) {
     const VkCtx& c = vk();
     if (vkCreateImage(c.device, &ii, nullptr, &image) != VK_SUCCESS) return false;
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(c.device, image, &req);
+    uint32_t type = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (req.size <= kBlockSize / 4) {
+        VkDeviceSize align = std::max<VkDeviceSize>(req.alignment, 256);
+        for (auto& b : g_mem_blocks) {
+            VkDeviceSize off;
+            if (b->type != type || !suballocate(*b, req.size, align, off)) continue;
+            vkBindImageMemory(c.device, image, b->memory, off);
+            memory = b->memory;
+            g_suballocs[image] = {b.get(), off, req.size};
+            return true;
+        }
+        auto b = std::make_unique<MemBlock>();
+        VkMemoryAllocateInfo bi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        bi.allocationSize = kBlockSize;
+        bi.memoryTypeIndex = type;
+        if (vkAllocateMemory(c.device, &bi, nullptr, &b->memory) == VK_SUCCESS) {
+            b->type = type;
+            b->size = kBlockSize;
+            b->free[0] = kBlockSize;
+            VkDeviceSize off = 0;
+            suballocate(*b, req.size, align, off);
+            vkBindImageMemory(c.device, image, b->memory, off);
+            memory = b->memory;
+            g_suballocs[image] = {b.get(), off, req.size};
+            g_mem_blocks.push_back(std::move(b));
+            return true;
+        }
+    }
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
-    ai.memoryTypeIndex = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    ai.memoryTypeIndex = type;
     if (vkAllocateMemory(c.device, &ai, nullptr, &memory) != VK_SUCCESS) return false;
     vkBindImageMemory(c.device, image, memory, 0);
     return true;
+}
+
+void free_image(VkImage image, VkDeviceMemory memory) {
+    const VkCtx& c = vk();
+    vkDestroyImage(c.device, image, nullptr);
+    auto it = g_suballocs.find(image);
+    if (it != g_suballocs.end()) {
+        release_range(*it->second.block, it->second.offset, it->second.size);
+        g_suballocs.erase(it);
+        return;
+    }
+    vkFreeMemory(c.device, memory, nullptr);
 }
 
 void end_pass();
@@ -766,15 +854,13 @@ void destroy_surface(Surface* s) {
     const VkCtx& c = vk();
     for (auto& [k, v] : s->sample_views) vkDestroyImageView(c.device, v, nullptr);
     vkDestroyImageView(c.device, s->view, nullptr);
-    vkDestroyImage(c.device, s->image, nullptr);
-    vkFreeMemory(c.device, s->memory, nullptr);
+    free_image(s->image, s->memory);
 }
 
 void destroy_temp(TempImage* t) {
     const VkCtx& c = vk();
     for (auto& [k, v] : t->views) vkDestroyImageView(c.device, v, nullptr);
-    vkDestroyImage(c.device, t->image, nullptr);
-    vkFreeMemory(c.device, t->memory, nullptr);
+    free_image(t->image, t->memory);
 }
 
 void collect_garbage() {
@@ -800,8 +886,7 @@ void collect_garbage() {
                 pool.push_back({it->second->image, it->second->memory, req.size});
                 g_pool_bytes += req.size;
             } else {
-                vkDestroyImage(c.device, it->second->image, nullptr);
-                vkFreeMemory(c.device, it->second->memory, nullptr);
+                free_image(it->second->image, it->second->memory);
             }
             it = g_retired_textures.erase(it);
         } else {
