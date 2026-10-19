@@ -1547,7 +1547,7 @@ void occupancy_sampler() {
         std::vector<std::pair<std::pair<uint32_t, uint32_t>, uint64_t>> v(by_job.begin(), by_job.end());
         std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
         std::string line;
-        for (size_t i = 0; i < v.size() && i < 14; i++) {
+        for (size_t i = 0; i < v.size() && i < 40; i++) {
             char b[64];
             if (v[i].first.first == 0xFFFFFFFFu) std::snprintf(b, sizeof b, " [kernel %.2f]", double(v[i].second) / samples);
             else std::snprintf(b, sizeof b, " [wid %u %08x %.2f]", v[i].first.first, v[i].first.second, double(v[i].second) / samples);
