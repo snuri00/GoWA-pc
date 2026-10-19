@@ -1908,10 +1908,14 @@ bool draw() {
     VkPrimitiveTopology topo = expand(g_prim, raw, indices, restart);
     if (topo == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM || indices.empty()) return skip(__LINE__);
     uint32_t vmin = ~0u, vmax = 0;
-    for (uint32_t v : indices) {
-        if (v == RESTART) continue;
-        vmin = std::min(vmin, v);
-        vmax = std::max(vmax, v);
+    {
+        const uint32_t* ip = indices.data();
+        size_t n = indices.size();
+        for (size_t i = 0; i < n; i++) {
+            uint32_t v = ip[i];
+            vmin = std::min(vmin, v);
+            vmax = std::max(vmax, v == RESTART ? 0u : v);
+        }
     }
     if (vmin > vmax || vmax - vmin > (1u << 20)) return skip(__LINE__);
     uint32_t vcount = vmax - vmin + 1;
@@ -2087,7 +2091,7 @@ bool draw() {
     RingAlloc ib;
     if (!ring_alloc(indices.size() * 4, 16, ib)) return skip(__LINE__);
     uint32_t* idx_out = reinterpret_cast<uint32_t*>(ib.ptr);
-    for (size_t i = 0; i < indices.size(); i++) idx_out[i] = indices[i] == RESTART ? RESTART : indices[i] - vmin;
+    std::memcpy(idx_out, indices.data(), indices.size() * 4);
     static const char* geom_dir = std::getenv("GOWA_DUMP_GEOM");
     if (g_trace && geom_dir && vdata[0]) {
         char fn[512];
@@ -2267,7 +2271,7 @@ bool draw() {
     uint32_t draw_index = g_frame_draw++;
     static const bool skip_color_only = std::getenv("GOWA_SKIP_COLOR_ONLY") != nullptr;
     bool skip_draw = g_skip_init && draw_index >= g_skip_lo && draw_index <= g_skip_hi && (!skip_color_only || k.write_masks != 0);
-    if (!(g_experiment & 1) && !skip_draw) vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    if (!(g_experiment & 1) && !skip_draw) vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, -static_cast<int32_t>(vmin), 0);
     if (query) {
         vkCmdEndQuery(cmd, g_qpool, qidx);
         g_counter_queries.push_back(qidx);
