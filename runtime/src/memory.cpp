@@ -134,20 +134,30 @@ void watch_reset(uint32_t addr, uint64_t size) {
 
 uint64_t watch_range(uint32_t addr, uint32_t size, bool& ok) {
     ok = true;
-    uint64_t sum = 0;
-    for (uint64_t a = addr & ~0xFFFull; a < uint64_t(addr) + size && a < 0x100000000ull; a += 0x1000) {
-        uint32_t page = uint32_t(a >> 12);
-        if (!g_page_watched[page].load(std::memory_order_acquire)) {
-            AcquireSRWLockExclusive(&watch_lock(page));
-            if (!g_page_watched[page].load(std::memory_order_relaxed)) {
-                DWORD old;
-                if (VirtualProtect(g_base + a, 0x1000, PAGE_READONLY, &old)) g_page_watched[page].store(1, std::memory_order_release);
+    uint64_t end = std::min<uint64_t>(uint64_t(addr) + size, 0x100000000ull);
+    uint32_t first = addr >> 12, last = uint32_t((end + 0xFFF) >> 12);
+    for (uint32_t page = first; page < last;) {
+        if (g_page_watched[page].load(std::memory_order_acquire)) {
+            page++;
+            continue;
+        }
+        uint32_t run = page;
+        while (run < last && run - page < 1024 && !g_page_watched[run].load(std::memory_order_acquire)) run++;
+        for (uint32_t q = page; q < run; q++) AcquireSRWLockExclusive(&watch_lock(q));
+        DWORD old;
+        if (VirtualProtect(g_base + (uint64_t(page) << 12), uint64_t(run - page) << 12, PAGE_READONLY, &old)) {
+            for (uint32_t q = page; q < run; q++) g_page_watched[q].store(1, std::memory_order_release);
+        } else {
+            for (uint32_t q = page; q < run; q++) {
+                if (VirtualProtect(g_base + (uint64_t(q) << 12), 0x1000, PAGE_READONLY, &old)) g_page_watched[q].store(1, std::memory_order_release);
                 else ok = false;
             }
-            ReleaseSRWLockExclusive(&watch_lock(page));
         }
-        sum += g_page_epoch[page].load(std::memory_order_acquire);
+        for (uint32_t q = page; q < run; q++) ReleaseSRWLockExclusive(&watch_lock(q));
+        page = run;
     }
+    uint64_t sum = 0;
+    for (uint32_t page = first; page < last; page++) sum += g_page_epoch[page].load(std::memory_order_acquire);
     return sum;
 }
 

@@ -167,7 +167,10 @@ struct Texture {
 struct PooledImage {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize size = 0;
 };
+
+VkDeviceSize g_pool_bytes = 0;
 
 struct VpEntry {
     bool ok = false;
@@ -734,8 +737,11 @@ void collect_garbage() {
     for (auto it = g_retired_textures.begin(); it != g_retired_textures.end();) {
         if (serial > it->first + 4) {
             std::vector<PooledImage>& pool = g_image_pool[it->second->pool_key];
-            if (pool.size() < 32) {
-                pool.push_back({it->second->image, it->second->memory});
+            VkMemoryRequirements req{};
+            vkGetImageMemoryRequirements(c.device, it->second->image, &req);
+            if (g_pool_bytes + req.size <= (VkDeviceSize(512) << 20)) {
+                pool.push_back({it->second->image, it->second->memory, req.size});
+                g_pool_bytes += req.size;
             } else {
                 vkDestroyImage(c.device, it->second->image, nullptr);
                 vkFreeMemory(c.device, it->second->memory, nullptr);
@@ -1033,6 +1039,7 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
         if (pit != g_image_pool.end() && !pit->second.empty()) {
             n->image = pit->second.back().image;
             n->memory = pit->second.back().memory;
+            g_pool_bytes -= pit->second.back().size;
             pit->second.pop_back();
             g_stats.pool_hits++;
         } else {
