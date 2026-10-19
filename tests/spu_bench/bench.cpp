@@ -149,6 +149,13 @@ std::string g_state_out;
 uint64_t g_hle_calls = 0;
 uint64_t g_hle_insns = 0;
 bool g_hle_strict = false;
+bool g_hle_profile = false;
+struct HleStat {
+    uint64_t cycles = 0;
+    uint64_t insns = 0;
+    uint64_t calls = 0;
+};
+std::map<std::string, HleStat> g_hle_stats;
 spu::Context g_iso;
 std::vector<uint8_t> g_iso_ls;
 std::vector<uint64_t> g_counts;
@@ -340,13 +347,12 @@ public:
     void halt(uint32_t, uint32_t) override { failed = true; }
 };
 
-bool iso_count(const State& s, uint64_t& k) {
+bool iso_count(const State& s, uint64_t& k, uint32_t ret, uint32_t sp) {
     g_iso_ls.assign(s.ls, s.ls + spu::LS_SIZE + 16);
     g_iso = s.c;
     g_iso.ls = g_iso_ls.data();
     g_iso.line_epoch = nullptr;
     g_iso.halted = false;
-    uint32_t ret = s.c.gpr[0].u32[3] & spu::PC_MASK, sp = s.c.gpr[1].u32[3];
     IsoHost host;
     for (k = 0; k < 50000000;) {
         spu::step(g_iso, host);
@@ -371,30 +377,50 @@ Result run(State& s, const Capture& cap, bool regions) {
         if (g_hle && spu::hle::any_at(s.c.pc)) {
             if (const spu::hle::Function* f = spu::hle::lookup(s.ls, s.c.pc)) {
                 ULONG64 x0 = 0, x1 = 0;
-                QueryThreadCycleTime(GetCurrentThread(), &x0);
+                if (!g_have_counts) QueryThreadCycleTime(GetCurrentThread(), &x0);
                 uint64_t k = 0;
                 bool iso_ok;
+                uint32_t exit_pc = 0;
                 if (g_have_counts) {
                     k = g_count_pos < g_counts.size() ? g_counts[g_count_pos++] : UINT64_MAX;
                     iso_ok = k != UINT64_MAX;
                 } else {
-                    iso_ok = iso_count(s, k);
+                    static std::vector<uint8_t> probe_ls;
+                    probe_ls.assign(s.ls, s.ls + spu::LS_SIZE + 16);
+                    spu::Context probe = s.c;
+                    probe.ls = probe_ls.data();
+                    probe.line_epoch = nullptr;
+                    iso_ok = f->handler(probe);
+                    exit_pc = probe.gpr[0].u32[3] & spu::PC_MASK;
+                    if (iso_ok) iso_ok = iso_count(s, k, exit_pc, probe.gpr[1].u32[3]);
                     g_counts.push_back(iso_ok && n + k < cap.insns ? k : UINT64_MAX);
                 }
-                QueryThreadCycleTime(GetCurrentThread(), &x1);
+                if (!g_have_counts) QueryThreadCycleTime(GetCurrentThread(), &x1);
                 excluded += x1 - x0;
                 if (iso_ok && n + k < cap.insns) {
-                    spu::Context before = s.c;
                     uint64_t h0 = __rdtsc();
                     bool handled = f->handler(s.c);
-                    if (g_have_counts) g_hle_tsc += __rdtsc() - h0;
+                    uint64_t hdt = __rdtsc() - h0;
+                    if (g_have_counts) {
+                        g_hle_tsc += hdt;
+                        if (g_hle_profile && handled) {
+                            HleStat& hs = g_hle_stats[f->name];
+                            hs.cycles += hdt;
+                            hs.insns += k;
+                            hs.calls++;
+                        }
+                    }
                     if (handled) {
                         if (!g_hle_strict && !g_have_counts) {
                             spu::v128 r3 = s.c.gpr[3];
                             std::memcpy(s.c.gpr, g_iso.gpr, sizeof s.c.gpr);
-                            if (std::memcmp(&r3, &g_iso.gpr[3], 16) != 0 && host.error.empty()) host.error = "hle r3 differs";
+                            if (std::memcmp(&r3, &g_iso.gpr[3], 16) != 0 && host.error.empty()) {
+                                char b[160];
+                                std::snprintf(b, sizeof b, "hle r3 differs in %s (native %08x %08x %08x %08x, spu %08x %08x %08x %08x)", f->name, r3.u32[3], r3.u32[2], r3.u32[1], r3.u32[0], g_iso.gpr[3].u32[3], g_iso.gpr[3].u32[2], g_iso.gpr[3].u32[1], g_iso.gpr[3].u32[0]);
+                                host.error = b;
+                            }
                         }
-                        s.c.pc = before.gpr[0].u32[3] & spu::PC_MASK;
+                        s.c.pc = g_have_counts ? s.c.gpr[0].u32[3] & spu::PC_MASK : exit_pc;
                         uint64_t target = n + k;
                         while (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value <= target) host.apply_lines(cap.events[host.pos++]);
                         n = target;
@@ -425,7 +451,7 @@ Result run(State& s, const Capture& cap, bool regions) {
         uint32_t ran = b->words;
         bool ok;
         uint64_t b0 = g_profile ? __rdtsc() : 0;
-        if (regions && b->region) {
+        if (regions && b->region && (to_last || cap.insns - n > 1000000)) {
             s.c.executed = 0;
             ok = b->region(s.c, host);
             if (s.c.executed) ran = s.c.executed;
@@ -501,6 +527,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-skip-same") g_skip_same = false;
         else if (a == "--hle") g_hle = true;
         else if (a == "--hle-strict") g_hle = g_hle_strict = true;
+        else if (a == "--hle-profile") g_hle = g_hle_profile = true;
         else if (a == "--to-last-event") g_to_last_event = true;
         else if (a == "--state-out" && i + 1 < argc) g_state_out = argv[++i];
         else if (a == "--dma-log" && i + 1 < argc) g_dma_log = std::fopen(argv[++i], "w");
@@ -557,6 +584,13 @@ int main(int argc, char** argv) {
         total_insns += best.insns;
     }
     if (g_hle) std::printf("hle: %llu native calls replaced %llu SPU insns (all reps), %llu TSC cycles in handlers (timing reps)\n", static_cast<unsigned long long>(g_hle_calls), static_cast<unsigned long long>(g_hle_insns), static_cast<unsigned long long>(g_hle_tsc));
+    if (g_hle_profile) {
+        std::vector<std::pair<std::string, HleStat>> v(g_hle_stats.begin(), g_hle_stats.end());
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.cycles > b.second.cycles; });
+        for (auto& [name, st] : v)
+            std::printf("  %-28s calls %8llu insns %10llu cycles %11llu  %6.2f cycles/insn %8.0f cycles/call\n", name.c_str(), static_cast<unsigned long long>(st.calls), static_cast<unsigned long long>(st.insns),
+                        static_cast<unsigned long long>(st.cycles), st.insns ? double(st.cycles) / st.insns : 0.0, st.calls ? double(st.cycles) / st.calls : 0.0);
+    }
     if (g_sample) {
         g_sampling = false;
         sampler_thread.join();
