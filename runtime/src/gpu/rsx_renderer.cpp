@@ -1539,45 +1539,73 @@ void decode_attribute(uint32_t type, uint32_t size, const uint8_t* p, float* out
     }
 }
 
+#define SPU_VDEC_INLINE inline __attribute__((always_inline))
+template <uint32_t Bytes>
+SPU_VDEC_INLINE __m128i load_attr(const uint8_t* p) {
+    if constexpr (Bytes == 16) return _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    else if constexpr (Bytes == 8) return _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+    else if constexpr (Bytes == 4) {
+        int32_t v;
+        std::memcpy(&v, p, 4);
+        return _mm_cvtsi32_si128(v);
+    } else {
+        alignas(16) uint8_t t[16] = {};
+        std::memcpy(t, p, Bytes);
+        return _mm_load_si128(reinterpret_cast<const __m128i*>(t));
+    }
+}
+
+template <uint32_t Size>
+SPU_VDEC_INLINE __m128 keep_lanes(__m128 v) {
+    const __m128 def = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
+    if constexpr (Size >= 4) return v;
+    else return _mm_blend_ps(def, v, (1 << Size) - 1);
+}
+
+template <uint32_t Type, uint32_t Size>
+void decode_run(const uint8_t* p, uint32_t stride, uint32_t count, float* out) {
+    const __m128i swap32 = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    const __m128i swap16 = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    for (uint32_t v = 0; v < count; v++, p += stride, out += 4) {
+        __m128 f;
+        if constexpr (Type == 2) {
+            __m128i x = load_attr<Size * 4>(p);
+            f = _mm_castsi128_ps(_mm_shuffle_epi8(x, swap32));
+        } else if constexpr (Type == 1) {
+            __m128i x = _mm_cvtepi16_epi32(_mm_shuffle_epi8(load_attr<Size * 2>(p), swap16));
+            f = _mm_div_ps(_mm_add_ps(_mm_cvtepi32_ps(x), _mm_set1_ps(0.5f)), _mm_set1_ps(32767.5f));
+        } else if constexpr (Type == 3) {
+            f = _mm_cvtph_ps(_mm_shuffle_epi8(load_attr<Size * 2>(p), swap16));
+        } else {
+            __m128i x = _mm_cvtepu8_epi32(load_attr<Size>(p));
+            f = _mm_div_ps(_mm_cvtepi32_ps(x), _mm_set1_ps(255.0f));
+        }
+        _mm_storeu_ps(out, keep_lanes<Size>(f));
+    }
+}
+
+template <uint32_t Type>
+bool decode_typed(uint32_t size, const uint8_t* p, uint32_t stride, uint32_t count, float* out) {
+    switch (size) {
+    case 1: decode_run<Type, 1>(p, stride, count, out); return true;
+    case 2: decode_run<Type, 2>(p, stride, count, out); return true;
+    case 3: decode_run<Type, 3>(p, stride, count, out); return true;
+    case 4: decode_run<Type, 4>(p, stride, count, out); return true;
+    default: return false;
+    }
+}
+
 void decode_vertices(uint32_t type, uint32_t size, const uint8_t* p, uint32_t stride, uint32_t count, float* out) {
-    if (type == 2 && size >= 1 && size <= 4) {
-        const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
-        const __m128 def = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
-        const __m128 keep = _mm_castsi128_ps(_mm_cmplt_epi32(_mm_setr_epi32(0, 1, 2, 3), _mm_set1_epi32(int(size))));
-        for (uint32_t v = 0; v < count; v++, p += stride, out += 4) {
-            alignas(16) uint8_t tmp[16];
-            std::memcpy(tmp, p, size * 4);
-            __m128 f = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_load_si128(reinterpret_cast<const __m128i*>(tmp)), swap));
-            _mm_storeu_ps(out, _mm_blendv_ps(def, f, keep));
-        }
-        return;
-    }
+    bool done = false;
     switch (type) {
-    case 1:
-        for (uint32_t v = 0; v < count; v++, p += stride, out += 4) {
-            out[0] = out[1] = out[2] = 0.0f;
-            out[3] = 1.0f;
-            for (uint32_t i = 0; i < size; i++) out[i] = (int16_t((p[i * 2] << 8) | p[i * 2 + 1]) + 0.5f) / 32767.5f;
-        }
-        return;
-    case 3:
-        for (uint32_t v = 0; v < count; v++, p += stride, out += 4) {
-            out[0] = out[1] = out[2] = 0.0f;
-            out[3] = 1.0f;
-            for (uint32_t i = 0; i < size; i++) out[i] = half_to_float(uint16_t((p[i * 2] << 8) | p[i * 2 + 1]));
-        }
-        return;
-    case 4:
-        for (uint32_t v = 0; v < count; v++, p += stride, out += 4) {
-            out[0] = out[1] = out[2] = 0.0f;
-            out[3] = 1.0f;
-            for (uint32_t i = 0; i < size; i++) out[i] = p[i] / 255.0f;
-        }
-        return;
-    default:
-        for (uint32_t v = 0; v < count; v++, p += stride, out += 4) decode_attribute(type, size, p, out);
-        return;
+    case 1: done = decode_typed<1>(size, p, stride, count, out); break;
+    case 2: done = decode_typed<2>(size, p, stride, count, out); break;
+    case 3: done = decode_typed<3>(size, p, stride, count, out); break;
+    case 4: done = decode_typed<4>(size, p, stride, count, out); break;
+    default: break;
     }
+    if (done) return;
+    for (uint32_t v = 0; v < count; v++, p += stride, out += 4) decode_attribute(type, size, p, out);
 }
 
 uint32_t attribute_bytes(uint32_t type, uint32_t size) {
@@ -2134,6 +2162,13 @@ bool draw() {
             std::memcpy(&stream[i * 4], &v, 4);
         }
     }
+    struct PendingDecode {
+        uint32_t type, size, stride;
+        const uint8_t* src;
+        float* out;
+    };
+    PendingDecode pending[16];
+    uint32_t npending = 0;
     for (uint32_t i = 0; i < 16; i++) {
         uint32_t f = R(VERTEX_ARRAY_FORMAT + i * 4);
         uint32_t type = f & 7, size = (f >> 4) & 0xF, stride = (f >> 8) & 0xFF, freq = f >> 16;
@@ -2170,7 +2205,7 @@ bool draw() {
             uint32_t last = stride == 0 ? 0 : freq > 1 ? ((div_ops >> i) & 1 ? freq - 1 : vmax / freq) : vmax;
             if (!readable(base, uint64_t(last) * stride + attribute_bytes(type, size))) return skip(__LINE__);
             if (stride && freq <= 1) {
-                decode_vertices(type, size, vm::ptr(base + vmin * stride), stride, vcount, out);
+                pending[npending++] = {type, size, stride, vm::ptr(base + vmin * stride), out};
             } else {
                 for (uint32_t v = 0; v < vcount; v++) {
                     uint32_t idx = vmin + v;
@@ -2189,6 +2224,13 @@ bool draw() {
         voffs[i] = a.offset;
         vstrides[i] = 16;
         vdata[i] = out;
+    }
+    for (uint32_t v0 = 0; v0 < vcount; v0 += 256) {
+        uint32_t nv = std::min<uint32_t>(256, vcount - v0);
+        for (uint32_t k = 0; k < npending; k++) {
+            const PendingDecode& d = pending[k];
+            decode_vertices(d.type, d.size, d.src + size_t(v0) * d.stride, d.stride, nv, d.out + size_t(v0) * 4);
+        }
     }
     g_stats.phase[3] += ticks() - ph;
     ph = ticks();
