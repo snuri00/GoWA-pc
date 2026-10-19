@@ -17,6 +17,7 @@ struct Outputs {
     }
 };
 
+bool decompress_indexes_fast(uint8_t* ls, uint32_t ctx, uint32_t src, uint32_t* end_out);
 bool decompress_indexes_supported(const uint8_t* ls, uint32_t src);
 uint32_t decompress_indexes(uint8_t* ls, uint32_t ctx, uint32_t src, Outputs* outs = nullptr);
 

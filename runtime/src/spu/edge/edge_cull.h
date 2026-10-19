@@ -17,5 +17,6 @@ struct CullIn {
 };
 
 int32_t cull_triangles(uint8_t* ls, const CullIn& in);
+int32_t cull_triangles_ref(uint8_t* ls, const CullIn& in);
 
 }

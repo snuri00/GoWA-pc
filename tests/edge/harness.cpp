@@ -350,7 +350,17 @@ std::map<uint32_t, NativeFn>& natives_store() {
 
 std::vector<std::string> cap_list(const std::vector<std::string>& args, size_t from) {
     std::vector<std::string> v;
-    for (size_t i = from; i < args.size(); i++) v.push_back(cap_path(args[i]));
+    for (size_t i = from; i < args.size(); i++) {
+        if (args[i] == "all" || args[i] == "rj" || args[i] == "rj2" || args[i] == "base") {
+            std::vector<std::string> dirs;
+            if (args[i] == "all" || args[i] == "base") dirs.push_back("spucap");
+            if (args[i] == "all" || args[i] == "rj") dirs.push_back("spucap_rj");
+            if (args[i] == "all" || args[i] == "rj2") dirs.push_back("spucap_rj2");
+            for (auto& d : dirs)
+                for (int k = 0; k < 4; k++) v.push_back(std::string(GOWA_ROOT) + "/out/" + d + "/cap_" + std::to_string(k) + ".bin");
+        } else
+            v.push_back(cap_path(args[i]));
+    }
     if (v.empty())
         for (int i = 0; i < 4; i++) v.push_back(cap_path("cap_" + std::to_string(i)));
     return v;
@@ -390,7 +400,7 @@ int cmd_unit(const std::vector<std::string>& args) {
     int maxhits = args.size() > 2 ? std::stoi(args[2]) : 1000000;
     bool verbose = std::getenv("EDGE_VERBOSE") != nullptr;
     NativeFn nat = natives().count(fn) ? natives()[fn] : nullptr;
-    int hits = 0, iso_bad = 0, nat_bad = 0, impure = 0, scratch_hits = 0, stack_hits = 0;
+    int hits = 0, iso_bad = 0, nat_bad = 0, impure = 0, scratch_hits = 0, stack_hits = 0, declined = 0;
     uint64_t scratch_bytes = 0;
     uint64_t spu_insns = 0;
     double nat_sec = 0;
@@ -414,6 +424,10 @@ int cmd_unit(const std::vector<std::string>& args) {
             edge::Outputs outs;
             bool ok = nat(ns.ls.data(), ns.regs, outs);
             nat_sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (!ok) {
+                declined++;
+                return hits < maxhits;
+            }
             edgeunit::LsDiff dfull = edgeunit::diff_ls(ns.ls.data(), h.after.ls.data(), h.sp);
             scratch_bytes += dfull.bytes;
             if (edgeunit::diff_ls(ns.ls.data(), h.after.ls.data(), 0, 0).bytes) stack_hits++;
@@ -454,7 +468,7 @@ int cmd_unit(const std::vector<std::string>& args) {
         return hits < maxhits;
     }, edge_loaded);
     std::printf("fn %05x: hits %d impure %d spu-insns %llu (%.0f/call) iso-mismatch %d", fn, hits, impure, (unsigned long long)spu_insns, hits ? double(spu_insns) / hits : 0.0, iso_bad);
-    if (nat) std::printf(" native-mismatch %d native-time %.3f ms (%.1f us/call) full-ls-diff hits %d bytes %llu incl-stack-diff hits %d", nat_bad, nat_sec * 1e3, hits ? nat_sec * 1e6 / hits : 0.0, scratch_hits, (unsigned long long)scratch_bytes, stack_hits);
+    if (nat) std::printf(" native-mismatch %d native-time %.3f ms (%.1f us/call) full-ls-diff hits %d bytes %llu incl-stack-diff hits %d declined %d", nat_bad, nat_sec * 1e3, hits ? nat_sec * 1e6 / hits : 0.0, scratch_hits, (unsigned long long)scratch_bytes, stack_hits, declined);
     std::printf("\n");
     return (iso_bad || nat_bad) ? 1 : 0;
 }

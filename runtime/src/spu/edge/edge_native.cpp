@@ -1,5 +1,6 @@
 #include "edge_native.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -213,6 +214,16 @@ bool decompress_indexes_supported(const uint8_t* ls, uint32_t src) {
 }
 
 uint32_t decompress_indexes(uint8_t* ls, uint32_t ctx, uint32_t src, Outputs* outs) {
+    static const bool no_fast = std::getenv("EDGE_IDX_SLOW") != nullptr;
+    uint32_t fend = 0;
+    if (!no_fast && decompress_indexes_fast(ls, ctx, src, &fend)) {
+        if (outs) {
+            uint32_t nt = (be16(ls + ctx + 400) * 0xaaabu) & 0xffff;
+            outs->add(src, src + nt * 6);
+            outs->add(ctx + 88, ctx + 92);
+        }
+        return fend;
+    }
     uint32_t num_indexes = be16(ls + ((ctx + 400) & kLsMask));
     uint32_t ntri = (num_indexes * 0xaaabu) & 0xffff;
     uint64_t n_explicit = be16(ls + (src & kLsMask)), flag_bytes = be16(ls + ((src + 4) & kLsMask));

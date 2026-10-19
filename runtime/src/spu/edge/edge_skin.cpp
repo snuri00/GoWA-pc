@@ -47,13 +47,21 @@ struct Fast {
 inline __m256 yzx8(__m256 v) { return _mm256_permute_ps(v, _MM_SHUFFLE(3, 0, 2, 1)); }
 inline __m256 zxy8(__m256 v) { return _mm256_permute_ps(v, _MM_SHUFFLE(3, 1, 0, 2)); }
 
+void cofactor_one(const Ls& ls, uint32_t t, uint32_t a) {
+    __m128 A = ls.q(t), B = ls.q(t + 16), C = ls.q(t + 32), n = ls.q(a);
+    __m128 m0 = spuf::fms(yzx(A), zxy(A), spuf::fm(zxy(C), yzx(B)));
+    __m128 m1 = spuf::fms(zxy(B), yzx(B), spuf::fm(yzx(C), zxy(A)));
+    __m128 m2 = spuf::fms(yzx(C), zxy(C), spuf::fm(zxy(B), yzx(A)));
+    __m128 o = spuf::fma(m2, zxy(n), spuf::fma(m1, yzx(n), spuf::fm(m0, n)));
+    ls.st(a, o);
+}
+
 void convert_matrices(const Ls& ls, uint32_t m, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) {
-        alignas(16) float q[4][4];
-        for (int r = 0; r < 4; r++) _mm_store_ps(q[r], ls.q(m + 64 * i + 16 * r));
-        __m128 o0 = _mm_setr_ps(q[0][0], q[1][1], q[2][2], q[3][0]);
-        __m128 o1 = _mm_setr_ps(q[1][0], q[2][1], q[0][2], q[3][1]);
-        __m128 o2 = _mm_setr_ps(q[2][0], q[0][1], q[1][2], q[3][2]);
+        __m128 q0 = ls.q(m + 64 * i), q1 = ls.q(m + 64 * i + 16), q2 = ls.q(m + 64 * i + 32), q3 = ls.q(m + 64 * i + 48);
+        __m128 o0 = _mm_insert_ps(_mm_blend_ps(_mm_blend_ps(q0, q1, 2), q2, 4), q3, (0 << 6) | (3 << 4));
+        __m128 o1 = _mm_insert_ps(_mm_blend_ps(_mm_blend_ps(q1, q2, 2), q0, 4), q3, (1 << 6) | (3 << 4));
+        __m128 o2 = _mm_insert_ps(_mm_blend_ps(_mm_blend_ps(q2, q0, 2), q1, 4), q3, (2 << 6) | (3 << 4));
         ls.st(m + 48 * i, o0);
         ls.st(m + 48 * i + 16, o1);
         ls.st(m + 48 * i + 32, o2);
@@ -162,33 +170,28 @@ void blend_exact(const Ls& ls, uint32_t matrices, uint32_t wp, uint32_t pp, uint
 
 void blend_pair(const Ls& ls, const float* mc, uint32_t nmat, uint32_t matrices, uint32_t wp, uint32_t pp, uint32_t tp) {
     const uint8_t* b = ls.p;
-    alignas(32) int32_t wv[8];
-    uint32_t ia[4], ib[4];
-    uint64_t wa, wb;
-    if (((wp & 0x3ffff) + 16) <= 0x40000 && ((pp & 0x3ffff) + 32) <= 0x40000) {
-        std::memcpy(&wa, b + (wp & 0x3ffff), 8);
-        std::memcpy(&wb, b + (wp & 0x3ffff) + 8, 8);
-    } else {
+    if (((wp & 0x3ffff) + 16) > 0x40000 || ((pp & 0x3ffff) + 32) > 0x40000) {
         blend_exact(ls, matrices, wp, pp, tp);
         blend_exact(ls, matrices, wp + 8, pp + 16, tp + 48);
         return;
     }
-    for (int k = 0; k < 4; k++) {
-        wv[k] = int32_t((wa >> (16 * k)) & 0xff);
-        ia[k] = uint32_t((wa >> (16 * k + 8)) & 0xff);
-        wv[4 + k] = int32_t((wb >> (16 * k)) & 0xff);
-        ib[k] = uint32_t((wb >> (16 * k + 8)) & 0xff);
-    }
+    __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + (wp & 0x3ffff)));
+    __m128i wsel = _mm_shuffle_epi8(raw, _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1));
+    __m128i isel = _mm_shuffle_epi8(raw, _mm_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1, -1, -1, -1, -1, -1, -1, -1));
     __m256 p = ld8(b, pp, pp + 16);
-    uint32_t mx = ia[0];
-    for (int k = 1; k < 4; k++) mx = mx > ia[k] ? mx : ia[k];
-    for (int k = 0; k < 4; k++) mx = mx > ib[k] ? mx : ib[k];
-    if (mx >= nmat || !small8(p)) {
+    __m128i over = _mm_subs_epu8(isel, _mm_set1_epi8(char(nmat ? nmat - 1 : 0)));
+    if (nmat == 0 || !_mm_testz_si128(over, _mm_setr_epi32(-1, -1, 0, 0)) || !small8(p)) {
         blend_exact(ls, matrices, wp, pp, tp);
         blend_exact(ls, matrices, wp + 8, pp + 16, tp + 48);
         return;
     }
-    __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_load_si256(reinterpret_cast<const __m256i*>(wv))), _mm256_castsi256_ps(_mm256_set1_epi32(0x3b808080)));
+    uint64_t iv = uint64_t(_mm_cvtsi128_si64(isel));
+    uint32_t ia[4], ib[4];
+    for (int k = 0; k < 4; k++) {
+        ia[k] = uint32_t((iv >> (8 * k)) & 0xff);
+        ib[k] = uint32_t((iv >> (8 * k + 32)) & 0xff);
+    }
+    __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(wsel)), _mm256_castsi256_ps(_mm256_set1_epi32(0x3b808080)));
     __m256 w0 = _mm256_permutevar8x32_ps(wf, _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4));
     __m256 w1 = _mm256_permutevar8x32_ps(wf, _mm256_setr_epi32(1, 1, 1, 1, 5, 5, 5, 5));
     __m256 w2 = _mm256_permutevar8x32_ps(wf, _mm256_setr_epi32(2, 2, 2, 2, 6, 6, 6, 6));
@@ -304,10 +307,15 @@ bool skin_vertexes(uint8_t* lsp, uint32_t ctx, uint32_t matrices, uint32_t num_m
         }
     uint32_t wp = weights, pp = pos;
     uint32_t tp[2] = {ntab > 0 ? tables[0] : 0, ntab > 1 ? tables[1] : 0};
+    uint32_t t96p = ls.w(ctx + 96);
     uint32_t remaining = total;
     while (remaining) {
         uint32_t cnt = remaining > batch ? batch : remaining;
         for (uint32_t v = 0; v < cnt; v += 2) blend_pair(ls, cache.data(), nfast, matrices, wp + 8 * v, pp + 16 * v, temp + 48 * v);
+        if (t96p) {
+            for (uint32_t v = 0; v < cnt; v++) cofactor_one(ls, temp + 48 * v, t96p + 16 * v);
+            t96p += 16 * cnt;
+        }
         for (uint32_t v = 0; v < cnt; v += 2)
             for (uint32_t t = 0; t < ntab; t++) transform_pair(ls, temp + 48 * v, tp[t] + 16 * v);
         wp += 8 * cnt;
@@ -318,6 +326,7 @@ bool skin_vertexes(uint8_t* lsp, uint32_t ctx, uint32_t matrices, uint32_t num_m
     }
     if (ntab == 2) normalize(ls, tables[1], nv);
     if (ntab >= 1) normalize(ls, tables[0], nv);
+    if (uint32_t t96 = ls.w(ctx + 96)) normalize(ls, t96, nv);
     uint32_t mn = matrices > weights ? weights : matrices;
     spuf::st32(lsp + ctx + 88, mn);
     return true;

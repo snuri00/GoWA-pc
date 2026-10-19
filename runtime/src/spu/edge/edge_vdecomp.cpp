@@ -27,6 +27,7 @@ const Sig kSigs[] = {
     {9, 0x4e0, 0x8180fc249d088040ull, 0x7d40061941d6ace1ull},
     {11, 0x6d0, 0x8180fc249c088040ull, 0x207e778488a8d7b7ull},
     {0, 0x2b0, 0x8180fc24aa008040ull, 0xf4b3970956625c75ull},
+    {3, 0x610, 0x8180fc2488008040ull, 0x2c6e001d10f9c003ull},
 };
 
 uint64_t hash64(const uint8_t* p, uint32_t n) {
@@ -409,7 +410,14 @@ inline void unit_fast2(uint32_t ga, uint32_t gb, uint32_t gc, uint32_t gd, const
     _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 48), shufb_be(_mm_or_si128(_mm_andnot_si128(sm, r1), _mm_and_si128(sm, ps.pat[s3])), a1, ps.ctl[1][s3]));
 }
 
-bool run_unit(uint8_t* ls, uint32_t ctx, uint32_t verts, uint32_t nv, const PosFmt& pf, const uint8_t* spill, uint32_t stride, int ngroups, const uint32_t* attrs, const uint32_t* slots, Outputs* outs) {
+bool run_unit(uint8_t* ls, uint32_t ctx, uint32_t verts, uint32_t nv, const PosFmt& pf, const uint8_t* spill, uint32_t stride, int ngroups, const uint32_t* attrs, const uint32_t* slots, Outputs* outs, bool raw_pos = false, uint32_t uoff = 6) {
+    auto decode_one = [&](uint32_t a, uint8_t* o) {
+        if (raw_pos) {
+            for (int i = 0; i < 12; i++) o[i] = ls[(a + i) & kMask];
+            spuf::stf(o + 12, 1.0f);
+        } else
+            pf.decode(ls, a, o);
+    };
     uint32_t k1 = alloc_table(ls, ctx, 1);
     uint32_t t0 = rd32(ls, ctx + 16 + 4 * k1);
     uint32_t tg[2] = {};
@@ -432,11 +440,17 @@ bool run_unit(uint8_t* ls, uint32_t ctx, uint32_t verts, uint32_t nv, const PosF
     if (ok) {
         PatSet ps;
         ps.build(pats);
-        decode_pos_fast(ls, verts, stride, n2, pf, ls + t0);
+        if (raw_pos) {
+            for (uint32_t v = 0; v < n2; v++) {
+                std::memcpy(ls + t0 + 16 * v, ls + verts + stride * v, 12);
+                spuf::stf(ls + t0 + 16 * v + 12, 1.0f);
+            }
+        } else
+            decode_pos_fast(ls, verts, stride, n2, pf, ls + t0);
         for (int g = 0; g < ngroups; g++) std::memset(ls + tg[g] + 16 * n2, 0, 32);
         for (int g = 0; g < ngroups; g++) {
             uint8_t* dst = ls + tg[g];
-            const uint8_t* src = ls + verts + 6 + 3 * g;
+            const uint8_t* src = ls + verts + uoff + 3 * g;
             uint32_t v = 0;
             auto g3 = [](const uint8_t* p) { return (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | p[2]; };
             for (; v + 4 <= n2; v += 4) {
@@ -459,10 +473,10 @@ bool run_unit(uint8_t* ls, uint32_t ctx, uint32_t verts, uint32_t nv, const PosF
             if (k < pairs) {
                 uint32_t va = verts + 2 * stride * k, vb = va + stride;
                 uint8_t pa[16], pb[16];
-                pf.decode(ls, va, pa);
-                pf.decode(ls, vb, pb);
+                decode_one(va, pa);
+                decode_one(vb, pb);
                 for (int g = 0; g < ngroups; g++) {
-                    uint32_t ga = g24(va + 6 + 3 * g), gb = g24(vb + 6 + 3 * g);
+                    uint32_t ga = g24(va + uoff + 3 * g), gb = g24(vb + uoff + 3 * g);
                     UnitVec u;
                     unit_pair(ga, gb, u);
                     unit_out(u, pats[ga & 15], false, cur[2 * g]);
@@ -513,11 +527,11 @@ int vdecomp_identify(const uint8_t* ls, uint32_t entry) {
 bool vdecomp_run(uint8_t* ls, int overlay, uint32_t ctx, uint32_t verts, uint32_t nv, uint32_t desc, uint32_t, const VdRegs& regs, Outputs* outs) {
     uint32_t sp = spuf::ld32(regs.r1) & 0x3fff0;
     if (sp + 64 > kLs || sp < 0x400) return false;
-    if (overlay != 0 && overlay != 1 && overlay != 9 && overlay != 10 && overlay != 11 && overlay != 12) return false;
+    if (overlay != 0 && overlay != 1 && overlay != 3 && overlay != 9 && overlay != 10 && overlay != 11 && overlay != 12) return false;
     ctx &= 0x3fff0;
     if (ctx + 368 > kLs) return false;
     PosFmt pf;
-    if (overlay != 0 && overlay != 1) {
+    if (overlay != 0 && overlay != 1 && overlay != 3) {
         pf.load(ls, desc);
         if (!pf.supported()) return false;
     }
@@ -540,6 +554,10 @@ bool vdecomp_run(uint8_t* ls, int overlay, uint32_t ctx, uint32_t verts, uint32_
     if (overlay == 11) {
         const uint32_t attrs[1] = {2}, slots[1] = {96};
         return run_unit(ls, ctx, verts, nv, pf, spill, 9, 1, attrs, slots, outs);
+    }
+    if (overlay == 3) {
+        const uint32_t attrs[2] = {3, 4}, slots[2] = {100, 104};
+        return run_unit(ls, ctx, verts, nv, pf, spill, 18, 2, attrs, slots, outs, true, 12);
     }
     if (overlay == 1) return run_copy(ls, ctx, verts, nv, 18, outs);
     return run_copy(ls, ctx, verts, nv, 15, outs);
