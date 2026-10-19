@@ -145,8 +145,22 @@ struct Surface {
     bool main = false;
     uint32_t pitch = 0;
     bool dirty = false;
+    float scale = 1.0f;
+    uint32_t iw = 0;
+    uint32_t ih = 0;
     bool depth() const { return aspect != VK_IMAGE_ASPECT_COLOR_BIT; }
 };
+
+float res_scale() {
+    static const float s = [] {
+        const char* e = std::getenv("GOWA_RES_SCALE");
+        float v = e ? static_cast<float>(std::atof(e)) : 1.0f;
+        return v >= 1.0f && v <= 4.0f ? v : 1.0f;
+    }();
+    return s;
+}
+
+uint32_t up(uint32_t v, float s) { return std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(double(v) * s))); }
 
 struct Texture {
     VkImage image = VK_NULL_HANDLE;
@@ -228,6 +242,9 @@ struct TempImage {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0;
     uint32_t height = 0;
+    float scale = 1.0f;
+    uint32_t iw = 0;
+    uint32_t ih = 0;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::map<uint64_t, VkImageView> views;
     uint64_t generation = ~0ull;
@@ -664,12 +681,15 @@ Surface* surface(uint32_t offset, VkFormat format, uint32_t w, uint32_t h, bool 
     s->pitch = pitch;
     s->width = nw;
     s->height = nh;
+    s->scale = main ? 1.0f : res_scale();
+    s->iw = up(nw, s->scale);
+    s->ih = up(nh, s->scale);
     s->format = format;
     s->aspect = depth ? (format == VK_FORMAT_D16_UNORM ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = format;
-    ii.extent = {nw, nh, 1};
+    ii.extent = {s->iw, s->ih, 1};
     ii.mipLevels = 1;
     ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -688,7 +708,7 @@ Surface* surface(uint32_t offset, VkFormat format, uint32_t w, uint32_t h, bool 
         VkImageCopy c{};
         c.srcSubresource = {old->aspect, 0, 0, 1};
         c.dstSubresource = {raw->aspect, 0, 0, 1};
-        c.extent = {old->width, old->height, 1};
+        c.extent = {std::min(old->iw, raw->iw), std::min(old->ih, raw->ih), 1};
         vkCmdCopyImage(frame_cmd(), old->image, old->layout, raw->image, raw->layout, 1, &c);
         raw->generation = old->generation + 1;
         raw->dirty = old->dirty;
@@ -759,13 +779,27 @@ void collect_garbage() {
             ++it;
         }
     }
+    uint64_t temp_bytes = 0;
     for (auto it = g_temps.begin(); it != g_temps.end();) {
-        if (serial > it->second->last_used + 120) {
+        if (serial > it->second->last_used + 8) {
             destroy_temp(it->second.get());
             it = g_temps.erase(it);
         } else {
+            temp_bytes += uint64_t(it->second->iw) * it->second->ih * 4;
             ++it;
         }
+    }
+    const uint64_t budget = uint64_t(256ull << 20) * uint64_t(std::ceil(res_scale() * res_scale()));
+    while (temp_bytes > budget) {
+        auto oldest = g_temps.end();
+        for (auto it = g_temps.begin(); it != g_temps.end(); ++it) {
+            if (serial <= it->second->last_used + 4) continue;
+            if (oldest == g_temps.end() || it->second->last_used < oldest->second->last_used) oldest = it;
+        }
+        if (oldest == g_temps.end()) break;
+        temp_bytes -= uint64_t(oldest->second->iw) * oldest->second->ih * 4;
+        destroy_temp(oldest->second.get());
+        g_temps.erase(oldest);
     }
 }
 
@@ -871,7 +905,9 @@ void clear(uint32_t mask) {
     if (atts.empty()) return;
     begin_pass(colors, depth, w, h);
     VkClearRect rect{};
-    rect.rect = {{int32_t(x0), int32_t(y0)}, {x1 - x0, y1 - y0}};
+    float ps = colors.empty() ? depth->scale : colors[0]->scale;
+    uint32_t sx0 = x0 ? up(x0, ps) : 0, sy0 = y0 ? up(y0, ps) : 0;
+    rect.rect = {{int32_t(sx0), int32_t(sy0)}, {up(x1, ps) - sx0, up(y1, ps) - sy0}};
     rect.baseArrayLayer = 0;
     rect.layerCount = 1;
     vkCmdClearAttachments(frame_cmd(), static_cast<uint32_t>(atts.size()), atts.data(), 1, &rect);
@@ -1125,6 +1161,7 @@ bool is_target(Surface* s) {
 struct Binding {
     VkImageView view = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
+    float scale = 1.0f;
 };
 
 const char* g_bind_kind = "";
@@ -1150,7 +1187,7 @@ TempImage* temp_image(Surface* src, VkFormat format, uint32_t w, uint32_t h, boo
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = format;
-    ii.extent = {w, h, 1};
+    ii.extent = {up(w, src->scale), up(h, src->scale), 1};
     ii.mipLevels = 1;
     ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1162,6 +1199,9 @@ TempImage* temp_image(Surface* src, VkFormat format, uint32_t w, uint32_t h, boo
     t->format = format;
     t->width = w;
     t->height = h;
+    t->scale = src->scale;
+    t->iw = ii.extent.width;
+    t->ih = ii.extent.height;
     t->last_used = frame_serial();
     TempImage* raw = t.get();
     g_temps[key] = std::move(t);
@@ -1282,7 +1322,7 @@ void redirect_pass(Surface* s, TempImage* t, uint32_t w, uint32_t h) {
     ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    ri.renderArea = {{0, 0}, {w, h}};
+    ri.renderArea = {{0, 0}, {t->iw, t->ih}};
     ri.layerCount = 1;
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
@@ -1291,8 +1331,8 @@ void redirect_pass(Surface* s, TempImage* t, uint32_t w, uint32_t h) {
     VkDescriptorImageInfo ii{g_point_sampler, depth_view(s), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii, nullptr, nullptr};
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_redirect_layout, 0, 1, &wr);
-    VkViewport viewport{0, 0, float(w), float(h), 0.0f, 1.0f};
-    VkRect2D scissor{{0, 0}, {w, h}};
+    VkViewport viewport{0, 0, float(t->iw), float(t->ih), 0.0f, 1.0f};
+    VkRect2D scissor{{0, 0}, {t->iw, t->ih}};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -1323,11 +1363,11 @@ TempImage* copy_to_temp(Surface* s, uint32_t w, uint32_t h, bool redirect) {
     image_barrier(cmd, t->image, taspect, t->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     if (redirect) {
         RingAlloc staging;
-        if (!ring_alloc(uint64_t(w) * h * 4, 16, staging)) return nullptr;
+        if (!ring_alloc(uint64_t(t->iw) * t->ih * 4, 16, staging)) return nullptr;
         VkBufferImageCopy c{};
         c.bufferOffset = staging.offset;
         c.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-        c.imageExtent = {w, h, 1};
+        c.imageExtent = {std::min(t->iw, s->iw), std::min(t->ih, s->ih), 1};
         vkCmdCopyImageToBuffer(cmd, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.buffer, 1, &c);
         VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1335,7 +1375,7 @@ TempImage* copy_to_temp(Surface* s, uint32_t w, uint32_t h, bool redirect) {
         bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bb.buffer = staging.buffer;
         bb.offset = staging.offset;
-        bb.size = uint64_t(w) * h * 4;
+        bb.size = uint64_t(t->iw) * t->ih * 4;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         vkCmdCopyBufferToImage(cmd, staging.buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
@@ -1343,7 +1383,7 @@ TempImage* copy_to_temp(Surface* s, uint32_t w, uint32_t h, bool redirect) {
         VkImageCopy c{};
         c.srcSubresource = {s->aspect, 0, 0, 1};
         c.dstSubresource = {taspect, 0, 0, 1};
-        c.extent = {std::min(w, s->width), std::min(h, s->height), 1};
+        c.extent = {std::min(t->iw, s->iw), std::min(t->ih, s->ih), 1};
         vkCmdCopyImage(cmd, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     }
     image_barrier(cmd, t->image, taspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -1464,6 +1504,7 @@ Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface
             bool depth_copy = src != redirect && src->depth();
             if (depth_copy) m = VkComponentMapping{};
             b.view = temp_view(tmp, m, !depth_copy && src != redirect && texture_srgb(t));
+            b.scale = tmp->scale;
             uint32_t tzf = (t.address >> 28) & 7;
             b.sampler = sampler(t, 1, depth_copy && tzf != 0 && tzf != 7);
             return b;
@@ -1485,6 +1526,7 @@ Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface
             }
             uint32_t zf = (t.address >> 28) & 7;
             b.view = v;
+            b.scale = best->scale;
             b.sampler = sampler(t, 1, best->depth() && zf != 0 && zf != 7);
             return b;
         }
@@ -1985,7 +2027,8 @@ void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w,
         da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     }
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    ri.renderArea = {{0, 0}, {w, h}};
+    float ps = colors.empty() ? (depth ? depth->scale : 1.0f) : colors[0]->scale;
+    ri.renderArea = {{0, 0}, {up(w, ps), up(h, ps)}};
     ri.layerCount = 1;
     ri.colorAttachmentCount = static_cast<uint32_t>(colors.size());
     ri.pColorAttachments = ca;
@@ -2060,10 +2103,13 @@ bool draw() {
     VkWriteDescriptorSet writes[24]{};
     VkDescriptorImageInfo images[20]{};
     uint32_t nw = 0, ni = 0;
+    float tex_scales[16];
+    for (float& v : tex_scales) v = 1.0f;
     uint64_t bind_start = ticks();
     for (uint32_t u = 0; u < 16; u++) {
         if (!(fp->textures & (1u << u))) continue;
         Binding b = bind_texture(u, (fp->dims >> (u * 2)) & 3, colors, depth);
+        tex_scales[u] = b.scale;
         images[ni] = {b.sampler, b.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         writes[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 32 + u, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &images[ni], nullptr, nullptr};
         nw++;
@@ -2120,7 +2166,10 @@ bool draw() {
         float window[4];
         float fog[4];
         uint32_t flags[4];
+        float texscale[16];
     } fs{};
+    for (uint32_t u = 0; u < 16; u++) fs.texscale[u] = tex_scales[u];
+    fs.fog[2] = colors.empty() ? (depth ? depth->scale : 1.0f) : colors[0]->scale;
     uint32_t win = R(SHADER_WINDOW);
     uint32_t cfmt = R(SURFACE_FORMAT) & 0x1F;
     uint32_t aref = R(ALPHA_REF);
@@ -2362,9 +2411,11 @@ bool draw() {
         if (vp->inputs & (1u << i)) vkCmdBindVertexBuffers2(cmd, i, 1, &vbufs[i], &voffs[i], nullptr, &vstrides[i]);
     }
     vkCmdBindIndexBuffer(cmd, ib.buffer, ib.offset, VK_INDEX_TYPE_UINT32);
-    VkViewport viewport{0, 0, float(w), float(h), 0.0f, 1.0f};
+    float ps = colors.empty() ? (depth ? depth->scale : 1.0f) : colors[0]->scale;
+    VkViewport viewport{0, 0, float(w) * ps, float(h) * ps, 0.0f, 1.0f};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
-    VkRect2D scissor{{int32_t(x0), int32_t(y0)}, {x1 - x0, y1 - y0}};
+    uint32_t scx0 = x0 ? up(x0, ps) : 0, scy0 = y0 ? up(y0, ps) : 0;
+    VkRect2D scissor{{int32_t(scx0), int32_t(scy0)}, {up(x1, ps) - scx0, up(y1, ps) - scy0}};
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     uint32_t lw = R(LINE_WIDTH);
     vkCmdSetLineWidth(cmd, vk().features.wideLines ? std::max(1.0f, (lw >> 3) + (lw & 7) / 8.0f) : 1.0f);
@@ -2685,21 +2736,21 @@ void schedule_dumps() {
         uint32_t bpp = s->depth() ? 4 : format_bytes(s->format);
         if (bpp != 4) continue;
         RingAlloc a;
-        if (!ring_alloc(uint64_t(s->width) * s->height * 4, 16, a)) continue;
+        if (!ring_alloc(uint64_t(s->iw) * s->ih * 4, 16, a)) continue;
         transition(s.get(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy c{};
         c.bufferOffset = a.offset;
         c.imageSubresource = {VkImageAspectFlags(s->depth() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
-        c.imageExtent = {s->width, s->height, 1};
+        c.imageExtent = {s->iw, s->ih, 1};
         vkCmdCopyImageToBuffer(frame_cmd(), s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, a.buffer, 1, &c);
-        g_dumps.push_back({a.ptr, s->offset, s->width, s->height, s->format, s->main});
+        g_dumps.push_back({a.ptr, s->offset, s->iw, s->ih, s->format, s->main});
     }
 }
 
 void schedule_snapshot(Surface* s, uint32_t w, uint32_t h, const std::string& name) {
     if (s->depth() || format_bytes(s->format) != 4) return;
-    w = std::min(w, s->width);
-    h = std::min(h, s->height);
+    w = std::min(up(w, s->scale), s->iw);
+    h = std::min(up(h, s->scale), s->ih);
     RingAlloc a;
     if (!ring_alloc(uint64_t(w) * h * 4, 16, a)) return;
     transition(s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -3087,6 +3138,12 @@ bool present(uint32_t buffer_id) {
         last_faults = faults;
         g_stats.hash_count = g_stats.hash_bytes = g_stats.hash_ticks = g_stats.upload_frame = g_stats.upload_bytes = 0;
         LOG_INFO("rsx", "  texture images: %.1f allocated, %.1f reused, %.1f freed per frame, %zu live", g_stats.image_allocs / 60.0, g_stats.pool_hits / 60.0, g_stats.textures_freed / 60.0, g_textures.size());
+        {
+            uint64_t tb = 0, sb = 0;
+            for (auto& [k, t] : g_temps) tb += uint64_t(t->iw) * t->ih * 4;
+            for (auto& [k, sp] : g_surfaces) sb += uint64_t(sp->iw) * sp->ih * 4;
+            LOG_INFO("rsx", "  temps %zu (%.0f MB), surfaces %zu (%.0f MB), retired %zu", g_temps.size(), tb / 1048576.0, g_surfaces.size(), sb / 1048576.0, g_retired_surfaces.size());
+        }
         g_stats.image_allocs = g_stats.pool_hits = g_stats.textures_freed = 0;
         g_stats.draw_ticks = g_stats.tex_ticks = g_stats.present_ticks = 0;
     }
@@ -3105,7 +3162,7 @@ bool present(uint32_t buffer_id) {
         uint32_t want = static_cast<uint32_t>(std::strtoul(show, nullptr, 0));
         for (auto& [key, s] : g_surfaces) {
             if (s->offset == want && !s->depth()) {
-                present_image(s->image, s->layout, s->width, s->height);
+                present_image(s->image, s->layout, s->iw, s->ih);
                 return true;
             }
         }

@@ -219,10 +219,11 @@ private:
     std::string tex_coord(const std::string& a, uint32_t unit) {
         bool un = (key_.unnormalized >> unit) & 1;
         std::string size = "textureSize(tex" + std::to_string(unit) + ", 0)";
+        std::string ts = "texscale[" + std::to_string(unit >> 2) + "][" + std::to_string(unit & 3) + "]";
         switch (dim(unit)) {
-        case 0: return un ? "(" + a + ".x / float(" + size + "))" : a + ".x";
-        case 1: return un ? "(" + a + ".xy / vec2(" + size + "))" : a + ".xy";
-        default: return un && dim(unit) == 3 ? "(" + a + ".xyz / vec3(" + size + "))" : a + ".xyz";
+        case 0: return un ? "(" + a + ".x / (float(" + size + ") / " + ts + "))" : a + ".x";
+        case 1: return un ? "(" + a + ".xy / (vec2(" + size + ") / " + ts + "))" : a + ".xy";
+        default: return un && dim(unit) == 3 ? "(" + a + ".xyz / (vec3(" + size + ") / " + ts + "))" : a + ".xyz";
         }
     }
 
@@ -413,7 +414,7 @@ private:
         s << "layout(location = 12) in vec4 in_tex8;\nlayout(location = 13) in vec4 in_tex9;\nlayout(location = 14) in vec4 in_bfc0;\nlayout(location = 15) in vec4 in_bfc1;\n";
         uint32_t lits = static_cast<uint32_t>(l_.literal_slots.size());
         s << "layout(std140, set = 0, binding = 2) uniform FragmentConstants { vec4 fc[" << (lits ? lits : 1) << "]; };\n";
-        s << "layout(std140, set = 0, binding = 3) uniform FragmentState { vec4 window; vec4 fog; uvec4 fflags; };\n";
+        s << "layout(std140, set = 0, binding = 3) uniform FragmentState { vec4 window; vec4 fog; uvec4 fflags; vec4 texscale[4]; };\n";
         for (uint32_t u = 0; u < 16; u++) {
             if (!(used_tex_ & (1u << u))) continue;
             static const char* types[4] = {"sampler1D", "sampler2D", "samplerCube", "sampler3D"};
@@ -441,6 +442,7 @@ private:
              "    return r;\n}\n";
         s << "vec4 wpos() {\n"
              "    vec4 f = gl_FragCoord;\n"
+             "    f.xy /= max(fog.z, 1.0);\n"
              "    float y = window.y > 0.5 ? window.x - f.y : f.y;\n"
              "    vec2 p = vec2(f.x, y) - (window.z > 0.5 ? vec2(0.5) : vec2(0.0));\n"
              "    return vec4(p, f.z, f.w);\n}\n";
