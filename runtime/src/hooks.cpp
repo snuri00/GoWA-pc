@@ -403,7 +403,7 @@ void install_patches() {
         uint32_t addr;
         bool (*guard)(ppu::Context&);
     };
-    static const Patch patches[] = {{0x39ea58, skip_repeated_mip_eviction}, {0x41c480, wait_previous_edge_list_started}};
+    static const Patch patches[] = {{0x39ea58, skip_repeated_mip_eviction}, {0x41c480, wait_previous_edge_list_started}, {0x2d0258, fps_unlock_timestep}};
     for (const Patch& p : patches) {
         Hook*& h = g_hooks[p.addr];
         if (!h) {

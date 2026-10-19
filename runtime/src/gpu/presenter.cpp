@@ -3,6 +3,7 @@
 #include "vk_context.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
+#include "runtime/hooks.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -114,6 +115,14 @@ bool create_swapchain() {
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (hooks::fps_unlock_target() > 60.5) {
+        uint32_t pm = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(g.ctx.phys, g.surface, &pm, nullptr);
+        std::vector<VkPresentModeKHR> modes(pm);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(g.ctx.phys, g.surface, &pm, modes.data());
+        if (std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end()) ci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end()) ci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = g.swapchain;
     VkSwapchainKHR sc;

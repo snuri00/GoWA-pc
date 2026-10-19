@@ -5,6 +5,7 @@
 #include "runtime/trace.h"
 #include "ppu/ops.h"
 #include "runtime/reservation.h"
+#include "runtime/hooks.h"
 #include "runtime/hostsleep.h"
 
 #include <atomic>
@@ -122,6 +123,10 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
         uint32_t buffer = (v & 0x80000000u) ? (v & 0xF) : 0;
         if ((v & 0x80000000u) && buffer > 7) buffer = vm::read32(head_addr(head) + 0x14);
         if (!gpu::rsx::present(buffer)) gpu::flip(buffer);
+        if (hooks::fps_unlock_active()) {
+            flip_done(buffer);
+            return CELL_OK;
+        }
         g_rsx.pending_flip = buffer;
         while (g_rsx.pending_flip >= 0 && g_rsx.running) Sleep(0);
         return CELL_OK;
