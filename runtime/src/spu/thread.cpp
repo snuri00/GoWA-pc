@@ -1341,7 +1341,28 @@ void SpuThread::run() {
             }
             if (hle::any_at(ctx.pc)) {
                 if (const hle::Function* f = hle::lookup(ls, ctx.pc)) {
-                    if (f->handler(ctx)) {
+                    if (f->host_handler) {
+                        ctx.executed = 0;
+                        uint32_t pc_before = ctx.pc;
+                        if (f->host_handler(ctx, *host)) {
+                            uint32_t ran = ctx.executed;
+                            n += ran;
+                            if (ctx.halted) break;
+                            if (uint32_t crossed = (n >> 10) - ((n - ran) >> 10)) {
+                                insns.fetch_add(uint64_t(crossed) << 10, std::memory_order_relaxed);
+                                if (stop_flag.load(std::memory_order_relaxed)) break;
+                            }
+                            if (ctx.irq_check || ctx.interrupts_enabled) {
+                                ctx.irq_check = false;
+                                uint32_t before_irq = ctx.pc;
+                                check_interrupt();
+                                if (cap && ctx.pc != before_irq) cap->note_irq(n - cap_n);
+                            }
+                            block_start = true;
+                            continue;
+                        }
+                        ctx.pc = pc_before;
+                    } else if (f->handler(ctx)) {
                         ctx.pc = ctx.gpr[0].u32[3] & PC_MASK;
                         block_start = true;
                         continue;

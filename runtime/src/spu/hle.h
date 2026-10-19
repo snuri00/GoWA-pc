@@ -7,6 +7,7 @@
 namespace spu::hle {
 
 using Handler = bool (*)(Context& c);
+using HostHandler = bool (*)(Context& c, Host& h);
 
 struct Function {
     uint32_t lsa;
@@ -14,6 +15,7 @@ struct Function {
     const uint32_t* signature;
     Handler handler;
     const char* name;
+    HostHandler host_handler = nullptr;
 };
 
 void register_function(const Function& f);

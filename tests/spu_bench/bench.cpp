@@ -150,6 +150,7 @@ uint64_t g_hle_calls = 0;
 uint64_t g_hle_insns = 0;
 bool g_hle_strict = false;
 bool g_hle_profile = false;
+uint64_t g_host_budget = 1ull << 16;
 struct HleStat {
     uint64_t cycles = 0;
     uint64_t insns = 0;
@@ -179,6 +180,194 @@ void watch_hit(const spu::Context& c) {
     }
 }
 uint32_t g_mfc[6] = {};
+
+enum { R_KERNEL, R_PM, R_JOB, R_COUNT };
+enum { CH_READ, CH_WRITE, CH_COUNT_OP, CH_STOP };
+
+struct JobKey {
+    uint8_t img[16];
+    uint32_t pm;
+    uint32_t wid;
+    bool operator<(const JobKey& o) const {
+        int c = std::memcmp(img, o.img, 16);
+        if (c) return c < 0;
+        if (pm != o.pm) return pm < o.pm;
+        return wid < o.wid;
+    }
+};
+
+JobKey job_key(const uint8_t* ls) {
+    JobKey k;
+    std::memcpy(k.img, ls + 0x4000, 16);
+    uint32_t v;
+    std::memcpy(&v, ls + 0xA00, 4);
+    k.pm = __builtin_bswap32(v);
+    std::memcpy(&v, ls + 0x1dc, 4);
+    k.wid = __builtin_bswap32(v);
+    return k;
+}
+
+int region_of(uint32_t pc) { return pc < 0xA00 ? R_KERNEL : pc < 0x4000 ? R_PM : R_JOB; }
+
+struct JobAcc {
+    uint64_t block_cyc[R_COUNT] = {};
+    uint64_t block_insns[R_COUNT] = {};
+    uint64_t blocks[R_COUNT] = {};
+    uint64_t host_cyc[R_COUNT] = {};
+    uint64_t interp_insns[R_COUNT] = {};
+    uint64_t interp_cyc[R_COUNT] = {};
+    uint64_t spin_getllar[R_COUNT] = {};
+    uint64_t chan[R_COUNT][4][32] = {};
+    uint64_t mfc_cmd[R_COUNT][256] = {};
+    uint64_t mfc_bytes[R_COUNT][256] = {};
+    uint64_t hle_cyc = 0, hle_insns = 0, hle_calls = 0;
+    uint64_t disp_cyc = 0, disp = 0;
+    uint64_t entries = 0;
+    void add(const JobAcc& a) {
+        for (int r = 0; r < R_COUNT; r++) {
+            block_cyc[r] += a.block_cyc[r];
+            block_insns[r] += a.block_insns[r];
+            blocks[r] += a.blocks[r];
+            host_cyc[r] += a.host_cyc[r];
+            interp_insns[r] += a.interp_insns[r];
+            interp_cyc[r] += a.interp_cyc[r];
+            spin_getllar[r] += a.spin_getllar[r];
+            for (int k = 0; k < 4; k++)
+                for (int c = 0; c < 32; c++) chan[r][k][c] += a.chan[r][k][c];
+            for (int c = 0; c < 256; c++) {
+                mfc_cmd[r][c] += a.mfc_cmd[r][c];
+                mfc_bytes[r][c] += a.mfc_bytes[r][c];
+            }
+        }
+        hle_cyc += a.hle_cyc;
+        hle_insns += a.hle_insns;
+        hle_calls += a.hle_calls;
+        disp_cyc += a.disp_cyc;
+        disp += a.disp;
+        entries += a.entries;
+    }
+};
+
+struct BlockStatJ {
+    uint64_t cycles = 0;
+    uint64_t insns = 0;
+    uint64_t calls = 0;
+};
+
+using JobBlocks = std::map<std::pair<JobKey, uint32_t>, BlockStatJ>;
+
+bool g_jobprof = false;
+bool g_jobprof_rec = false;
+std::map<JobKey, JobAcc> g_jobs;
+std::map<JobKey, JobAcc> g_jobs_total;
+JobBlocks g_job_blocks;
+JobBlocks g_job_blocks_total;
+JobAcc* g_cur_job = nullptr;
+JobKey g_cur_key{};
+int g_cur_region = R_JOB;
+uint32_t g_last_getllar_ea[R_COUNT] = {};
+uint32_t g_entry_pc = 0;
+
+std::FILE* g_pmtrace = nullptr;
+uint64_t g_pmtrace_lines = 0;
+uint64_t g_pmtrace_max = 3000000;
+bool g_pmtrace_injob = false;
+
+void jobprof_merge(const std::map<JobKey, JobAcc>& jobs, const JobBlocks& blocks) {
+    for (auto& [k, a] : jobs) g_jobs_total[k].add(a);
+    for (auto& [k, b] : blocks) {
+        BlockStatJ& t = g_job_blocks_total[k];
+        t.cycles += b.cycles;
+        t.insns += b.insns;
+        t.calls += b.calls;
+    }
+}
+
+void jobprof_update(const uint8_t* ls) {
+    JobKey k = job_key(ls);
+    if (g_cur_job && std::memcmp(&k, &g_cur_key, sizeof k) == 0) return;
+    g_cur_key = k;
+    g_cur_job = &g_jobs[k];
+    uint32_t marker, entry;
+    std::memcpy(&marker, ls + 0x4020, 4);
+    std::memcpy(&entry, ls + 0x4010, 4);
+    g_entry_pc = __builtin_bswap32(marker) == 0xc0dec0deu ? (0x4000 + __builtin_bswap32(entry)) & spu::PC_MASK : 0xFFFFFFFFu;
+}
+
+uint32_t list_bytes(const uint8_t* ls, uint32_t list, uint32_t size) {
+    uint32_t total = 0, la = list & 0x3FFF8;
+    for (uint32_t i = 0; i + 8 <= size && la + i + 8 <= spu::LS_SIZE; i += 8) total += ((uint32_t(ls[la + i + 2]) << 8) | ls[la + i + 3]) & 0x7FFF;
+    return total;
+}
+
+void jobprof_op(const uint8_t* ls, int kind, uint32_t ch, uint32_t value) {
+    if (!g_cur_job) return;
+    JobAcc& a = *g_cur_job;
+    int r = g_cur_region;
+    a.chan[r][kind][ch & 31]++;
+    if (kind != CH_WRITE || ch != 21) return;
+    uint32_t cmd = value & 0xFF;
+    a.mfc_cmd[r][cmd]++;
+    bool list = (cmd & 0x04) && cmd < 0x50;
+    a.mfc_bytes[r][cmd] += list ? list_bytes(ls, g_mfc[2], g_mfc[3]) : g_mfc[3];
+    uint32_t line = g_mfc[2] & ~127u;
+    if (cmd == 0xD0 && line == g_last_getllar_ea[r]) a.spin_getllar[r]++;
+    g_last_getllar_ea[r] = cmd == 0xD0 ? line : 0;
+}
+
+enum { PH_DISP, PH_KERNEL, PH_PM, PH_JOB, PH_NATIVE, PH_INTERP, PH_HOST_K, PH_HOST_PM, PH_HOST_JOB, PH_IDLE };
+bool g_jobsample = false;
+bool g_js_on = false;
+std::atomic<bool> g_js_active{false};
+std::atomic<bool> g_js_run{false};
+volatile uint32_t g_phase = PH_IDLE;
+std::vector<JobKey> g_js_keys;
+std::map<JobKey, uint32_t> g_js_index;
+uint32_t g_js_cur = 0;
+JobKey g_js_key{};
+bool g_js_have = false;
+std::map<uint32_t, uint64_t> g_js_hist;
+
+uint32_t js_index(const uint8_t* ls) {
+    JobKey k = job_key(ls);
+    if (g_js_have && std::memcmp(&k, &g_js_key, sizeof k) == 0) return g_js_cur;
+    g_js_have = true;
+    g_js_key = k;
+    auto it = g_js_index.find(k);
+    if (it == g_js_index.end()) {
+        it = g_js_index.emplace(k, static_cast<uint32_t>(g_js_keys.size())).first;
+        g_js_keys.push_back(k);
+    }
+    g_js_cur = it->second;
+    return g_js_cur;
+}
+
+void js_sampler(uint64_t interval) {
+    std::map<uint32_t, uint64_t> hist;
+    while (g_js_run.load(std::memory_order_relaxed)) {
+        uint64_t until = __rdtsc() + interval;
+        while (__rdtsc() < until) _mm_pause();
+        if (g_js_active.load(std::memory_order_relaxed)) {
+            uint32_t ph = g_phase;
+            hist[ph]++;
+        }
+    }
+    g_js_hist = std::move(hist);
+}
+
+struct PhaseGuard {
+    uint32_t saved;
+    PhaseGuard() : saved(g_phase) {
+        if (g_js_on) {
+            uint32_t ph = saved & 15;
+            uint32_t h = ph == PH_KERNEL ? PH_HOST_K : ph == PH_PM ? PH_HOST_PM : PH_HOST_JOB;
+            g_phase = (saved & ~15u) | h;
+        }
+    }
+    ~PhaseGuard() {
+        if (g_js_on) g_phase = saved;
+    }
+};
 
 class Replay : public spu::Host {
 public:
@@ -218,11 +407,56 @@ public:
         if (e.halted) s.c.halted = true;
         return &e;
     }
+    struct HostTimer {
+        uint64_t t0;
+        HostTimer() : t0(g_jobprof_rec ? __rdtsc() : 0) {}
+        ~HostTimer() {
+            if (g_jobprof_rec && g_cur_job) g_cur_job->host_cyc[g_cur_region] += __rdtsc() - t0;
+        }
+    };
     uint32_t read_channel(uint32_t ch) override {
+        HostTimer ht;
+        PhaseGuard pg;
+        if (g_jobprof_rec) jobprof_op(s.ls, CH_READ, ch, 0);
+        if (g_pmtrace && g_pmtrace_lines < g_pmtrace_max && pos < cap.events.size()) {
+            g_pmtrace_lines++;
+            std::fprintf(g_pmtrace, "  rdch %u -> %08x\n", ch, cap.events[pos].value);
+        }
         const Event* e = next(0, ch, 0, false);
         return e ? e->value : 0;
     }
     void write_channel(uint32_t ch, uint32_t value) override {
+        HostTimer ht;
+        PhaseGuard pg;
+        if (g_jobprof_rec || g_pmtrace) {
+            if (ch >= 16 && ch <= 20) g_mfc[ch - 16] = value;
+            if (g_jobprof_rec) jobprof_op(s.ls, CH_WRITE, ch, value);
+        }
+        if (g_pmtrace && g_pmtrace_lines < g_pmtrace_max && (ch < 16 || ch > 20)) {
+            g_pmtrace_lines++;
+            if (ch == 21) {
+                uint32_t cmd = value & 0xFF;
+                std::fprintf(g_pmtrace, "  mfc %02x lsa %05x ea %08x size %x tag %u", cmd, g_mfc[0] & 0x3FFFF, g_mfc[2], g_mfc[3], g_mfc[4]);
+                if (cmd == 0xB4 || cmd == 0xB0 || cmd == 0xB8 || ((cmd & 0xF0) == 0x20 && g_mfc[3] <= 0x80 && (g_mfc[0] & 0x3FFFF) + g_mfc[3] <= spu::LS_SIZE)) {
+                    uint32_t n = cmd >= 0xB0 ? 128 : g_mfc[3], l = g_mfc[0] & 0x3FF80;
+                    if (cmd < 0xB0) l = g_mfc[0] & 0x3FFFF;
+                    std::fprintf(g_pmtrace, " data ");
+                    for (uint32_t i = 0; i < n; i++) std::fprintf(g_pmtrace, "%02x", s.ls[l + i]);
+                }
+                if ((cmd & 0x04) && cmd < 0x50) {
+                    uint32_t la = g_mfc[2] & 0x3FFF8;
+                    std::fprintf(g_pmtrace, " list");
+                    for (uint32_t i = 0; i + 8 <= g_mfc[3] && la + i + 8 <= spu::LS_SIZE; i += 8) {
+                        uint32_t sz = ((uint32_t(s.ls[la + i + 2]) << 8) | s.ls[la + i + 3]) & 0x7FFF, ea;
+                        std::memcpy(&ea, s.ls + la + i + 4, 4);
+                        std::fprintf(g_pmtrace, " %08x:%x", __builtin_bswap32(ea), sz);
+                    }
+                }
+                std::fprintf(g_pmtrace, "\n");
+            } else {
+                std::fprintf(g_pmtrace, "  wrch %u %08x\n", ch, value);
+            }
+        }
         if (g_dma_log && ch >= 16 && ch <= 21) {
             g_mfc[ch - 16] = value;
             if (ch == 21) {
@@ -237,6 +471,19 @@ public:
             }
         }
         next(1, ch, value, true);
+        if (g_pmtrace && g_pmtrace_lines < g_pmtrace_max && ch == 21) {
+            uint32_t cmd = value & 0xFF, lsa = g_mfc[0] & 0x3FFFF, size = g_mfc[3];
+            if (cmd == 0xD0) {
+                lsa &= 0x3FF80;
+                size = 128;
+            }
+            if ((cmd == 0xD0 || (cmd & 0xF4) == 0x40) && size <= 0x100 && lsa + size <= spu::LS_SIZE) {
+                g_pmtrace_lines++;
+                std::fprintf(g_pmtrace, "    data ");
+                for (uint32_t i = 0; i < size; i++) std::fprintf(g_pmtrace, "%02x%s", s.ls[lsa + i], (i & 15) == 15 ? " " : "");
+                std::fprintf(g_pmtrace, "\n");
+            }
+        }
         if (g_dma_log && ch == 21) {
             uint32_t cmd = value & 0xFF, lsa = g_mfc[0] & 0x3FFFF, size = g_mfc[3];
             bool get = (cmd & 0xF0) == 0x40;
@@ -248,10 +495,20 @@ public:
         }
     }
     uint32_t channel_count(uint32_t ch) override {
+        HostTimer ht;
+        PhaseGuard pg;
+        if (g_jobprof_rec) jobprof_op(s.ls, CH_COUNT_OP, ch, 0);
+        if (g_pmtrace && g_pmtrace_lines < g_pmtrace_max && pos < cap.events.size()) {
+            g_pmtrace_lines++;
+            std::fprintf(g_pmtrace, "  rchcnt %u -> %u\n", ch, cap.events[pos].value);
+        }
         const Event* e = next(2, ch, 0, false);
         return e ? e->value : 0;
     }
     bool stop_and_signal(uint32_t code) override {
+        HostTimer ht;
+        PhaseGuard pg;
+        if (g_jobprof_rec) jobprof_op(s.ls, CH_STOP, code & 31, 0);
         const Event* e = next(3, code, 0, false);
         return e ? e->result != 0 : false;
     }
@@ -373,9 +630,87 @@ Result run(State& s, const Capture& cap, bool regions) {
     QueryThreadCycleTime(GetCurrentThread(), &t0);
     bool to_last = g_to_last_event;
     uint64_t excluded = 0;
+    g_jobprof_rec = g_jobprof && (!g_hle || g_have_counts);
+    g_cur_job = nullptr;
+    uint64_t jp_top = 0;
+    g_js_on = g_jobsample && (!g_hle || g_have_counts);
+    uint32_t js_base = 0;
+    if (g_js_on) {
+        g_js_have = false;
+        g_js_active.store(true);
+    }
     while (!s.c.halted && (to_last ? host.pos < cap.events.size() : n < cap.insns)) {
+        if (g_pmtrace && g_pmtrace_lines < g_pmtrace_max && (!g_hle || g_have_counts)) {
+            bool injob = s.c.pc >= 0x4000 && s.c.pc < 0x3FE00;
+            if (!injob) {
+                g_pmtrace_lines++;
+                uint32_t w;
+                std::memcpy(&w, s.ls + 0x1dc, 4);
+                std::fprintf(g_pmtrace, "B %05x r0 %05x r3 %08x r4 %08x r5 %08x\n", s.c.pc, s.c.gpr[0].u32[3], s.c.gpr[3].u32[3], s.c.gpr[4].u32[3], s.c.gpr[5].u32[3]);
+            } else if (!g_pmtrace_injob) {
+                g_pmtrace_lines++;
+                std::fprintf(g_pmtrace, "J %05x r0 %05x r3 %08x r4 %08x r5 %08x n %llu\n", s.c.pc, s.c.gpr[0].u32[3], s.c.gpr[3].u32[3], s.c.gpr[4].u32[3], s.c.gpr[5].u32[3], (unsigned long long)n);
+            }
+            g_pmtrace_injob = injob;
+        }
+        if (g_js_on) {
+            js_base = js_index(s.ls) << 4;
+            g_phase = js_base | PH_DISP;
+        }
+        if (g_jobprof_rec) {
+            jobprof_update(s.ls);
+            g_cur_region = region_of(s.c.pc);
+            if (s.c.pc == g_entry_pc) g_cur_job->entries++;
+            g_cur_job->disp++;
+            jp_top = __rdtsc();
+        }
         if (g_hle && spu::hle::any_at(s.c.pc)) {
-            if (const spu::hle::Function* f = spu::hle::lookup(s.ls, s.c.pc)) {
+            const spu::hle::Function* f = spu::hle::lookup(s.ls, s.c.pc);
+            if (f && f->host_handler) {
+                if (cap.insns - n > g_host_budget + 200000) {
+                    uint32_t pc0 = s.c.pc;
+                    s.c.executed = uint32_t(g_host_budget);
+                    if (g_js_on) g_phase = js_base | PH_NATIVE;
+                    uint64_t h0 = __rdtsc();
+                    bool handled = f->host_handler(s.c, host);
+                    uint64_t hdt = __rdtsc() - h0;
+                    if (g_js_on) g_phase = js_base | PH_DISP;
+                    if (handled) {
+                        uint64_t k = s.c.executed;
+                        uint64_t target = n + k;
+                        if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value < target && host.error.empty()) {
+                            char b[160];
+                            std::snprintf(b, sizeof b, "%s at 0x%05x ran past irq event at insn %u (native ended at %llu)", f->name, pc0, cap.events[host.pos].value, (unsigned long long)target);
+                            host.error = b;
+                            s.c.halted = true;
+                        }
+                        n = target;
+                        if (g_have_counts || !g_hle) {
+                            if (g_jobprof_rec) {
+                                g_cur_job->hle_cyc += hdt;
+                                g_cur_job->hle_insns += k;
+                                g_cur_job->hle_calls++;
+                                g_cur_job->disp_cyc += h0 - jp_top;
+                            }
+                            g_hle_tsc += hdt;
+                            if (g_hle_profile) {
+                                HleStat& hs = g_hle_stats[f->name];
+                                hs.cycles += hdt;
+                                hs.insns += k;
+                                hs.calls++;
+                            }
+                        }
+                        g_hle_calls++;
+                        g_hle_insns += k;
+                        s.c.irq_check = false;
+                        if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value == n) host.next(5, 0, uint32_t(n), true);
+                        continue;
+                    }
+                    s.c.pc = pc0;
+                }
+                f = nullptr;
+            }
+            if (f) {
                 ULONG64 x0 = 0, x1 = 0;
                 if (!g_have_counts) QueryThreadCycleTime(GetCurrentThread(), &x0);
                 uint64_t k = 0;
@@ -398,10 +733,18 @@ Result run(State& s, const Capture& cap, bool regions) {
                 if (!g_have_counts) QueryThreadCycleTime(GetCurrentThread(), &x1);
                 excluded += x1 - x0;
                 if (iso_ok && n + k < cap.insns) {
+                    if (g_js_on) g_phase = js_base | PH_NATIVE;
                     uint64_t h0 = __rdtsc();
                     bool handled = f->handler(s.c);
+                    if (g_js_on) g_phase = js_base | PH_DISP;
                     uint64_t hdt = __rdtsc() - h0;
                     if (g_have_counts) {
+                        if (g_jobprof_rec && handled) {
+                            g_cur_job->hle_cyc += hdt;
+                            g_cur_job->hle_insns += k;
+                            g_cur_job->hle_calls++;
+                            g_cur_job->disp_cyc += h0 - jp_top;
+                        }
                         g_hle_tsc += hdt;
                         if (g_hle_profile && handled) {
                             HleStat& hs = g_hle_stats[f->name];
@@ -442,7 +785,15 @@ Result run(State& s, const Capture& cap, bool regions) {
         }
         r.dispatches++;
         if (!b) {
+            uint64_t i0 = g_jobprof_rec ? __rdtsc() : 0;
+            if (g_jobprof_rec) g_cur_job->disp_cyc += i0 - jp_top;
+            if (g_js_on) g_phase = js_base | (PH_KERNEL + region_of(s.c.pc));
             spu::step(s.c, host);
+            if (g_js_on) g_phase = js_base | PH_DISP;
+            if (g_jobprof_rec) {
+                g_cur_job->interp_cyc[g_cur_region] += __rdtsc() - i0;
+                g_cur_job->interp_insns[g_cur_region]++;
+            }
             n++;
             r.interpreted++;
             if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value == n) host.next(5, 0, uint32_t(n), true);
@@ -450,7 +801,13 @@ Result run(State& s, const Capture& cap, bool regions) {
         }
         uint32_t ran = b->words;
         bool ok;
-        uint64_t b0 = g_profile ? __rdtsc() : 0;
+        uint64_t b0 = g_profile || g_jobprof_rec ? __rdtsc() : 0;
+        uint64_t host0 = 0;
+        if (g_jobprof_rec) {
+            g_cur_job->disp_cyc += b0 - jp_top;
+            host0 = g_cur_job->host_cyc[g_cur_region];
+        }
+        if (g_js_on) g_phase = js_base | (PH_KERNEL + region_of(s.c.pc));
         if (regions && b->region && (to_last || cap.insns - n > 1000000)) {
             s.c.executed = 0;
             ok = b->region(s.c, host);
@@ -460,6 +817,19 @@ Result run(State& s, const Capture& cap, bool regions) {
             ok = b->fn(s.c, host);
         }
         n += ran;
+        if (g_js_on) g_phase = js_base | PH_DISP;
+        if (g_jobprof_rec) {
+            uint64_t dt = __rdtsc() - b0;
+            JobAcc& a = *g_cur_job;
+            uint64_t hd = a.host_cyc[g_cur_region] - host0;
+            a.block_cyc[g_cur_region] += dt > hd ? dt - hd : 0;
+            a.block_insns[g_cur_region] += ran;
+            a.blocks[g_cur_region]++;
+            BlockStatJ& st = g_job_blocks[{g_cur_key, b->lsa}];
+            st.cycles += dt > hd ? dt - hd : 0;
+            st.insns += ran;
+            st.calls++;
+        }
         if (g_profile) {
             BlockStat& st = g_stats[b];
             st.cycles += __rdtsc() - b0;
@@ -472,6 +842,10 @@ Result run(State& s, const Capture& cap, bool regions) {
     }
     ULONG64 t1 = 0;
     QueryThreadCycleTime(GetCurrentThread(), &t1);
+    if (g_js_on) {
+        g_js_active.store(false);
+        g_phase = PH_IDLE;
+    }
     r.cycles = t1 - t0 - excluded;
     r.insns = n;
     r.error = host.error;
@@ -528,6 +902,9 @@ int main(int argc, char** argv) {
         else if (a == "--hle") g_hle = true;
         else if (a == "--hle-strict") g_hle = g_hle_strict = true;
         else if (a == "--hle-profile") g_hle = g_hle_profile = true;
+        else if (a == "--jobprof") g_jobprof = true;
+        else if (a == "--jobsample") g_jobsample = true;
+        else if (a == "--pmtrace" && i + 1 < argc) g_pmtrace = std::fopen(argv[++i], "w");
         else if (a == "--to-last-event") g_to_last_event = true;
         else if (a == "--state-out" && i + 1 < argc) g_state_out = argv[++i];
         else if (a == "--dma-log" && i + 1 < argc) g_dma_log = std::fopen(argv[++i], "w");
@@ -546,6 +923,11 @@ int main(int argc, char** argv) {
     }
     if (g_hle) spu::hle::install_builtin();
     State s;
+    std::thread js_thread;
+    if (g_jobsample) {
+        g_js_run = true;
+        js_thread = std::thread(js_sampler, 100000);
+    }
     std::thread sampler_thread;
     if (g_sample) {
         HANDLE self = nullptr;
@@ -565,9 +947,17 @@ int main(int argc, char** argv) {
         Result best;
         g_counts.clear();
         g_have_counts = false;
+        std::map<JobKey, JobAcc> best_jobs;
+        JobBlocks best_blocks;
         for (int k = 0; k < reps; k++) {
             g_count_pos = 0;
+            g_jobs.clear();
+            g_job_blocks.clear();
             Result r = run(s, cap, regions);
+            if (g_jobprof_rec && (!best.insns || r.cycles < best.cycles)) {
+                best_jobs.swap(g_jobs);
+                best_blocks.swap(g_job_blocks);
+            }
             if (g_hle && k == 0) {
                 std::printf("%-28s hle verify run: %s\n", f.c_str(), r.exact ? "exact" : r.error.c_str());
                 if (!r.exact) failures++;
@@ -580,6 +970,7 @@ int main(int argc, char** argv) {
                     cap.events.size(), best.insns ? double(best.cycles) / best.insns : 0.0, best.dispatches ? double(best.insns) / best.dispatches : 0.0,
                     static_cast<unsigned long long>(best.interpreted), best.exact ? "exact" : best.error.c_str());
         if (!best.exact) failures++;
+        if (g_jobprof) jobprof_merge(best_jobs, best_blocks);
         total_cycles += best.cycles;
         total_insns += best.insns;
     }
@@ -611,6 +1002,47 @@ int main(int argc, char** argv) {
             const BlockStat& st = v[i].second;
             std::printf("  b%-6zu lsa %05x words %3u region %d: %5.1f%% cycles, %6.2f cycles/insn, %7.1f insns/call\n", static_cast<size_t>(v[i].first - all), v[i].first->lsa, v[i].first->words,
                         v[i].first->region ? 1 : 0, 100.0 * st.cycles / tot, double(st.cycles) / st.insns, double(st.insns) / st.calls);
+        }
+    }
+    if (g_jobsample) {
+        g_js_run = false;
+        js_thread.join();
+        if (std::FILE* f = std::fopen("spu_bench_jobsample.txt", "w")) {
+            for (size_t i = 0; i < g_js_keys.size(); i++) {
+                std::fprintf(f, "key %zu ", i);
+                for (int b = 0; b < 16; b++) std::fprintf(f, "%02x", g_js_keys[i].img[b]);
+                std::fprintf(f, " %08x %u\n", g_js_keys[i].pm, g_js_keys[i].wid);
+            }
+            for (auto& [ph, c] : g_js_hist) std::fprintf(f, "hist %u %u %llu\n", ph >> 4, ph & 15, (unsigned long long)c);
+            std::fclose(f);
+        }
+    }
+    if (g_jobprof) {
+        if (std::FILE* f = std::fopen("spu_bench_jobs.txt", "w")) {
+            for (auto& [k, a] : g_jobs_total) {
+                std::fprintf(f, "job ");
+                for (int i = 0; i < 16; i++) std::fprintf(f, "%02x", k.img[i]);
+                std::fprintf(f, " pm %08x wid %u entries %llu disp %llu disp_cyc %llu hle %llu %llu %llu\n", k.pm, k.wid, (unsigned long long)a.entries, (unsigned long long)a.disp, (unsigned long long)a.disp_cyc,
+                             (unsigned long long)a.hle_calls, (unsigned long long)a.hle_insns, (unsigned long long)a.hle_cyc);
+                for (int r = 0; r < R_COUNT; r++) {
+                    std::fprintf(f, "  r%d blocks %llu insns %llu cyc %llu host %llu interp %llu %llu spin %llu", r, (unsigned long long)a.blocks[r], (unsigned long long)a.block_insns[r], (unsigned long long)a.block_cyc[r],
+                                 (unsigned long long)a.host_cyc[r], (unsigned long long)a.interp_insns[r], (unsigned long long)a.interp_cyc[r], (unsigned long long)a.spin_getllar[r]);
+                    std::fprintf(f, " chan");
+                    for (int k = 0; k < 4; k++)
+                        for (int c = 0; c < 32; c++)
+                            if (a.chan[r][k][c]) std::fprintf(f, " %c%d=%llu", "rwcs"[k], c, (unsigned long long)a.chan[r][k][c]);
+                    std::fprintf(f, " mfc");
+                    for (int c = 0; c < 256; c++)
+                        if (a.mfc_cmd[r][c]) std::fprintf(f, " %02x=%llu/%llu", c, (unsigned long long)a.mfc_cmd[r][c], (unsigned long long)a.mfc_bytes[r][c]);
+                    std::fprintf(f, "\n");
+                }
+            }
+            for (auto& [kk, st] : g_job_blocks_total) {
+                std::fprintf(f, "block ");
+                for (int i = 0; i < 16; i++) std::fprintf(f, "%02x", kk.first.img[i]);
+                std::fprintf(f, " %08x %u %05x %llu %llu %llu\n", kk.first.pm, kk.first.wid, kk.second, (unsigned long long)st.calls, (unsigned long long)st.insns, (unsigned long long)st.cycles);
+            }
+            std::fclose(f);
         }
     }
     std::printf("total %.3f cycles/insn over %llu insns, %d mismatching\n", total_insns ? double(total_cycles) / total_insns : 0.0, static_cast<unsigned long long>(total_insns), failures);
