@@ -203,6 +203,20 @@ struct Dummy {
 
 uint32_t g_regs[0x4000];
 std::map<std::tuple<uint32_t, VkFormat, uint32_t>, std::unique_ptr<Surface>> g_surfaces;
+uint64_t g_surfaces_version = 0;
+uint64_t g_surface_index_version = ~0ull;
+std::unordered_map<uint32_t, std::vector<Surface*>> g_surface_index;
+
+const std::vector<Surface*>& surfaces_at(uint32_t offset) {
+    static const std::vector<Surface*> none;
+    if (g_surface_index_version != g_surfaces_version) {
+        g_surface_index.clear();
+        for (auto& [k, sp] : g_surfaces) g_surface_index[sp->offset].push_back(sp.get());
+        g_surface_index_version = g_surfaces_version;
+    }
+    auto it = g_surface_index.find(offset);
+    return it == g_surface_index.end() ? none : it->second;
+}
 std::vector<std::pair<uint64_t, std::unique_ptr<Surface>>> g_retired_surfaces;
 
 struct TempImage {
@@ -218,7 +232,17 @@ struct TempImage {
 };
 
 std::map<std::tuple<Surface*, uint32_t, uint32_t, bool>, std::unique_ptr<TempImage>> g_temps;
-std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<Texture>> g_textures;
+struct TexKeyHash {
+    size_t operator()(const std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>& k) const {
+        uint64_t h = (uint64_t(std::get<0>(k)) << 32) ^ std::get<1>(k);
+        h = (h ^ (h >> 29)) * 0xBF58476D1CE4E5B9ull;
+        h ^= (uint64_t(std::get<2>(k)) << 32) ^ std::get<3>(k);
+        h = (h ^ (h >> 31)) * 0x94D049BB133111EBull;
+        h ^= (uint64_t(std::get<4>(k)) << 32) ^ std::get<5>(k);
+        return size_t(h ^ (h >> 33));
+    }
+};
+std::unordered_map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<Texture>, TexKeyHash> g_textures;
 std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, std::vector<PooledImage>> g_image_pool;
 std::vector<std::pair<uint64_t, std::unique_ptr<Texture>>> g_retired_textures;
 std::unordered_map<uint64_t, VkSampler> g_samplers;
@@ -384,6 +408,8 @@ void dump_failure(const char* prefix, uint64_t h, const std::string& glsl, const
     }
 }
 
+uint64_t g_vp_ucode_serial = 0;
+
 uint64_t hash_vertex_program(uint32_t start) {
     uint64_t h = 1469598103934665603ull ^ start;
     bool flow = false;
@@ -398,9 +424,15 @@ uint64_t hash_vertex_program(uint32_t start) {
 
 VpEntry* vertex_program() {
     uint32_t start = R(TRANSFORM_PROGRAM_START);
+    static std::unordered_map<uint32_t, std::pair<uint64_t, VpEntry*>> recent;
+    auto rit = recent.find(start);
+    if (rit != recent.end() && rit->second.first == g_vp_ucode_serial) return rit->second.second;
     uint64_t h = hash_vertex_program(start);
     auto it = g_vp_cache.find(h);
-    if (it != g_vp_cache.end()) return &it->second;
+    if (it != g_vp_cache.end()) {
+        recent[start] = {g_vp_ucode_serial, &it->second};
+        return &it->second;
+    }
     VpEntry& e = g_vp_cache[h];
     e.hash = h;
     VertexProgramInfo vp = decompile_vertex_program(g_vp_ucode, start);
@@ -461,19 +493,34 @@ uint32_t fp_address() {
     return lv2::rsx_address(prog & ~3u, (prog & 3) - 1);
 }
 
-FpEntry* fragment_program(uint32_t ea) {
-    if (!ea) return nullptr;
-    FpWordReader read = [ea](uint32_t i) {
-        uint32_t v = vm::read32(ea + i * 4);
-        return (v << 16) | (v >> 16);
-    };
-    FragmentProgramInfo a = analyse_fragment_program(read);
-    if (!a.valid) return nullptr;
+struct FpFast {
+    uint64_t program_hash = 0;
+    uint64_t h = 0;
+    uint32_t texture_mask = 0;
+    uint32_t slots = 0;
+    std::vector<uint8_t> skip;
+    std::vector<uint8_t> bytes;
+    FpEntry* entry = nullptr;
+};
+
+std::unordered_map<uint32_t, FpFast> g_fp_fast;
+
+bool fp_fast_valid(const FpFast& f, uint32_t ea) {
+    if (!readable(ea, uint64_t(f.slots) * 16)) return false;
+    const uint8_t* p = vm::ptr(ea);
+    for (uint32_t i = 0; i < f.slots; i++) {
+        if (f.skip[i]) continue;
+        if (std::memcmp(p + i * 16, f.bytes.data() + i * 16, 16) != 0) return false;
+    }
+    return true;
+}
+
+FragmentProgramKey fp_key(uint32_t texture_mask) {
     FragmentProgramKey key;
     key.control = R(SHADER_CONTROL) & 0xCE;
     uint32_t dims = texture_dims();
     for (uint32_t u = 0; u < 16; u++) {
-        if (!(a.texture_mask & (1u << u))) continue;
+        if (!(texture_mask & (1u << u))) continue;
         key.texture_dims |= dims & (3u << (u * 2));
         uint32_t tfmt = R(TEXTURE_BASE + 4 + u * 0x20);
         if (tfmt & 0x4000) key.unnormalized |= 1u << u;
@@ -482,9 +529,55 @@ FpEntry* fragment_program(uint32_t ea) {
         if (tcode >= 0x90 && tcode <= 0x93 && tzf != 0 && tzf != 7) key.shadow |= 1u << u;
     }
     key.mrt_count = mrt_count();
-    uint64_t h = a.hash ^ (uint64_t(key.control) << 1) ^ (uint64_t(key.texture_dims) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(key.mrt_count) << 40) ^ (uint64_t(key.unnormalized) * 0xC2B2AE3D27D4EB4Full) ^ (uint64_t(key.shadow) << 48);
+    return key;
+}
+
+uint64_t fp_key_hash(uint64_t program_hash, const FragmentProgramKey& key) {
+    return program_hash ^ (uint64_t(key.control) << 1) ^ (uint64_t(key.texture_dims) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(key.mrt_count) << 40) ^ (uint64_t(key.unnormalized) * 0xC2B2AE3D27D4EB4Full) ^
+           (uint64_t(key.shadow) << 48);
+}
+
+FpEntry* fragment_program(uint32_t ea) {
+    if (!ea) return nullptr;
+    auto fit = g_fp_fast.find(ea);
+    if (fit != g_fp_fast.end() && fp_fast_valid(fit->second, ea)) {
+        uint64_t fh = fp_key_hash(fit->second.program_hash, fp_key(fit->second.texture_mask));
+        if (fh == fit->second.h) return fit->second.entry;
+        auto cit = g_fp_cache.find(fh);
+        if (cit != g_fp_cache.end()) {
+            fit->second.h = fh;
+            fit->second.entry = &cit->second;
+            return &cit->second;
+        }
+    }
+    FpWordReader read = [ea](uint32_t i) {
+        uint32_t v = vm::read32(ea + i * 4);
+        return (v << 16) | (v >> 16);
+    };
+    FragmentProgramInfo a = analyse_fragment_program(read);
+    if (!a.valid) return nullptr;
+    FragmentProgramKey key = fp_key(a.texture_mask);
+    uint64_t h = fp_key_hash(a.hash, key);
+    auto remember = [&](FpEntry* e) {
+        uint32_t slots = a.start_slot + a.length_slots;
+        if (!slots || slots > 4096 || !readable(ea, uint64_t(slots) * 16)) return;
+        FpFast& f = g_fp_fast[ea];
+        f.program_hash = a.hash;
+        f.h = h;
+        f.texture_mask = a.texture_mask;
+        f.slots = slots;
+        f.skip.assign(slots, 0);
+        for (uint32_t ls : a.literal_slots) {
+            if (a.start_slot + ls < slots) f.skip[a.start_slot + ls] = 1;
+        }
+        f.bytes.assign(vm::ptr(ea), vm::ptr(ea) + size_t(slots) * 16);
+        f.entry = e;
+    };
     auto it = g_fp_cache.find(h);
-    if (it != g_fp_cache.end()) return &it->second;
+    if (it != g_fp_cache.end()) {
+        remember(&it->second);
+        return &it->second;
+    }
     FpEntry& e = g_fp_cache[h];
     e.hash = h;
     FragmentProgramInfo fp = decompile_fragment_program(read, key);
@@ -602,8 +695,10 @@ Surface* surface(uint32_t offset, VkFormat format, uint32_t w, uint32_t h, bool 
         }
         g_retired_surfaces.emplace_back(frame_serial(), std::move(it->second));
         g_surfaces.erase(it);
+        g_surfaces_version++;
     }
     g_surfaces[key] = std::move(s);
+    g_surfaces_version++;
     return raw;
 }
 
@@ -1337,13 +1432,13 @@ Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface
         Surface* exact = nullptr;
         Surface* larger = nullptr;
         Surface* redirect = nullptr;
-        for (auto& [k, s] : g_surfaces) {
+        for (Surface* s : surfaces_at(t.offset)) {
             if (s->offset != t.offset || s->main != (loc == 1) || s->width < w || s->height < h) continue;
             if (s->depth() == depth_fmt) {
-                if (s->width == w && s->height == h) exact = s.get();
-                else if (!larger) larger = s.get();
+                if (s->width == w && s->height == h) exact = s;
+                else if (!larger) larger = s;
             } else if (s->depth() && !depth_fmt && s->format == VK_FORMAT_D24_UNORM_S8_UINT) {
-                redirect = s.get();
+                redirect = s;
             }
         }
         Surface* src = exact ? exact : larger ? larger : redirect;
@@ -1930,6 +2025,7 @@ bool draw() {
     VkWriteDescriptorSet writes[24]{};
     VkDescriptorImageInfo images[20]{};
     uint32_t nw = 0, ni = 0;
+    uint64_t bind_start = ticks();
     for (uint32_t u = 0; u < 16; u++) {
         if (!(fp->textures & (1u << u))) continue;
         Binding b = bind_texture(u, (fp->dims >> (u * 2)) & 3, colors, depth);
@@ -1938,6 +2034,7 @@ bool draw() {
         nw++;
         ni++;
     }
+    g_stats.phase[7] += ticks() - bind_start;
     for (uint32_t t = 0; t < 4; t++) {
         TextureRegs dummy_regs;
         images[ni] = {sampler(dummy_regs, 1, false), g_dummy[1].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -2821,7 +2918,10 @@ void method(uint32_t reg, uint32_t arg) {
     if (reg >= TRANSFORM_PROGRAM && reg < TRANSFORM_PROGRAM + 128) {
         uint32_t load = R(TRANSFORM_PROGRAM_LOAD);
         if (g_vp_load_word / 4 != load && (g_vp_load_word % 4) == 0) g_vp_load_word = load * 4;
-        if (g_vp_load_word < 544 * 4) g_vp_ucode[g_vp_load_word] = arg;
+        if (g_vp_load_word < 544 * 4 && g_vp_ucode[g_vp_load_word] != arg) {
+            g_vp_ucode[g_vp_load_word] = arg;
+            g_vp_ucode_serial++;
+        }
         g_vp_load_word++;
         g_regs[(TRANSFORM_PROGRAM_LOAD >> 2)] = g_vp_load_word / 4;
         return;
@@ -2922,8 +3022,8 @@ bool present(uint32_t buffer_id) {
         QueryPerformanceFrequency(&f);
         double ms = 1000.0 / double(f.QuadPart) / 60.0;
         LOG_INFO("rsx", "renderer per frame: draw %.2f ms (textures %.2f ms), present %.2f ms", g_stats.draw_ticks * ms, g_stats.tex_ticks * ms, g_stats.present_ticks * ms);
-        LOG_INFO("rsx", "  phases: programs %.2f indices %.2f textures+ubo %.2f vertices %.2f misc %.2f pipeline %.2f record %.2f", g_stats.phase[0] * ms, g_stats.phase[1] * ms, g_stats.phase[2] * ms,
-                 g_stats.phase[3] * ms, g_stats.phase[4] * ms, g_stats.phase[5] * ms, g_stats.phase[6] * ms);
+        LOG_INFO("rsx", "  phases: programs %.2f indices %.2f textures+ubo %.2f (bind %.2f) vertices %.2f misc %.2f pipeline %.2f record %.2f", g_stats.phase[0] * ms, g_stats.phase[1] * ms, g_stats.phase[2] * ms,
+                 g_stats.phase[7] * ms, g_stats.phase[3] * ms, g_stats.phase[4] * ms, g_stats.phase[5] * ms, g_stats.phase[6] * ms);
         std::memset(g_stats.phase, 0, sizeof g_stats.phase);
         LOG_INFO("rsx", "  copies %.1f per frame (%.1f MB), redirects %.1f", g_stats.copies / 60.0, g_stats.copy_bytes / 60.0 / 1048576.0, g_stats.redirects / 60.0);
         g_stats.copies = g_stats.copy_bytes = g_stats.redirects = 0;
