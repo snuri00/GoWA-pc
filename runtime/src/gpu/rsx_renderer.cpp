@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -430,14 +431,50 @@ void dump_failure(const char* prefix, uint64_t h, const std::string& glsl, const
 
 uint64_t g_vp_ucode_serial = 0;
 
+uint32_t g_vp_canon[544 * 4];
+uint32_t g_vp_canon_start = 0;
+
+bool vp_branch(uint32_t sca) { return sca == 0x09 || sca == 0x0A || sca == 0x11 || sca == 0x12; }
+
+uint32_t vp_target(const uint32_t* w) { return (((w[0] >> 23) & 1) << 9) | ((w[2] & 0x3F) << 3) | ((w[3] >> 29) & 7); }
+
 uint64_t hash_vertex_program(uint32_t start) {
-    uint64_t h = 1469598103934665603ull ^ start;
-    bool flow = false;
-    for (uint32_t s = start; s < 544; s++) {
-        h = fnv(&g_vp_ucode[s * 4], 16, h);
-        uint32_t sca = (g_vp_ucode[s * 4 + 1] >> 27) & 0x1F;
-        if (sca == 0x08 || sca == 0x09 || sca == 0x0A || sca == 0x0B || sca == 0x0C || sca == 0x11 || sca == 0x12) flow = true;
-        if ((g_vp_ucode[s * 4 + 3] & 1) && !flow) break;
+    std::bitset<544> seen;
+    uint32_t work[544];
+    uint32_t nwork = 0;
+    work[nwork++] = start;
+    bool relocatable = true;
+    while (nwork) {
+        uint32_t s = work[--nwork];
+        if (s < start) relocatable = false;
+        while (s < 544 && !seen[s]) {
+            seen[s] = true;
+            const uint32_t* w = &g_vp_ucode[s * 4];
+            if (vp_branch((w[1] >> 27) & 0x1F) && nwork < 544) work[nwork++] = vp_target(w);
+            if (w[3] & 1) break;
+            s++;
+        }
+    }
+    uint32_t base = relocatable ? start : 0;
+    std::memset(g_vp_canon, 0, sizeof g_vp_canon);
+    for (uint32_t s = 0; s < 544; s++) {
+        if (!seen[s]) continue;
+        uint32_t* d = &g_vp_canon[(s - base) * 4];
+        std::memcpy(d, &g_vp_ucode[s * 4], 16);
+        if (base && vp_branch((d[1] >> 27) & 0x1F)) {
+            uint32_t t = vp_target(d) - base;
+            d[0] = (d[0] & ~(1u << 23)) | (((t >> 9) & 1) << 23);
+            d[2] = (d[2] & ~0x3Fu) | ((t >> 3) & 0x3F);
+            d[3] = (d[3] & ~(7u << 29)) | ((t & 7) << 29);
+        }
+    }
+    g_vp_canon_start = start - base;
+    uint64_t h = 1469598103934665603ull ^ g_vp_canon_start;
+    for (uint32_t s = 0; s < 544; s++) {
+        if (!seen[s]) continue;
+        uint32_t r = s - base;
+        h = fnv(&r, 4, h);
+        h = fnv(&g_vp_canon[r * 4], 16, h);
     }
     return h;
 }
@@ -455,7 +492,7 @@ VpEntry* vertex_program() {
     }
     VpEntry& e = g_vp_cache[h];
     e.hash = h;
-    VertexProgramInfo vp = decompile_vertex_program(g_vp_ucode, start);
+    VertexProgramInfo vp = decompile_vertex_program(g_vp_canon, g_vp_canon_start);
     std::vector<uint32_t> spirv;
     std::string log;
     e.ok = vp.valid && compile_glsl(ShaderStage::Vertex, vp.glsl, spirv, log);
