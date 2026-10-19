@@ -124,6 +124,15 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
         if ((v & 0x80000000u) && buffer > 7) buffer = vm::read32(head_addr(head) + 0x14);
         if (!gpu::rsx::present(buffer)) gpu::flip(buffer);
         if (hooks::fps_unlock_active()) {
+            static int64_t next_flip = 0;
+            double target = hooks::fps_unlock_target();
+            int64_t period = static_cast<int64_t>(1e9 / (target > 1.0 ? target : 59.94) / ppu::time_scale());
+            int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (next_flip && now < next_flip) {
+                host::sleep_until_ns(next_flip);
+                now = next_flip;
+            }
+            next_flip = (next_flip && now - next_flip < period) ? next_flip + period : now + period;
             flip_done(buffer);
             return CELL_OK;
         }
