@@ -187,9 +187,26 @@ int main(int argc, char** argv) {
     int memdump_at = std::getenv("GOWA_MEMDUMP_AT") ? std::atoi(std::getenv("GOWA_MEMDUMP_AT")) : -1;
     SetThreadDescription(GetCurrentThread(), L"Host main");
     static const int census = std::getenv("GOWA_THREAD_CPU") ? std::atoi(std::getenv("GOWA_THREAD_CPU")) : 0;
+    std::vector<uint32_t> peeks;
+    if (const char* e = std::getenv("GOWA_PEEK")) {
+        for (const char* q = e; *q;) {
+            char* end = nullptr;
+            peeks.push_back(static_cast<uint32_t>(std::strtoul(q, &end, 16)));
+            q = *end ? end + 1 : end;
+        }
+    }
     for (int tick = 0;; tick++) {
         if (census > 0 && tick % census == 0) thread_census(census);
         hooks::tick_patches();
+        if (!peeks.empty()) {
+            std::string line;
+            for (uint32_t addr : peeks) {
+                char buf[32];
+                std::snprintf(buf, sizeof buf, " %x=%08x", addr, vm::read32(addr));
+                line += buf;
+            }
+            LOG_INFO("peek", "%s", line.c_str());
+        }
         if (watch_delay && tick == watch_delay) crash::arm_watch();
         else if (tick > watch_delay) crash::rearm_watch();
         if (tick == memdump_at) trace::dump_memory("memdump.bin");
