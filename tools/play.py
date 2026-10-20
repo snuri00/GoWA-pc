@@ -7,6 +7,8 @@ import subprocess
 import sys
 import time
 
+from threadmon import ThreadMon
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN_DIR = os.path.join(ROOT, "run")
 EXE = os.path.join(ROOT, "build", "gowa.exe")
@@ -37,9 +39,31 @@ def last_flip(log_path, state):
             state["pos"] = f.tell()
     except OSError:
         return state.get("flip")
-    for m in re.finditer(rb"I +([0-9.]+) [^\r\n]*rsx: flip", data):
-        state["flip"] = float(m.group(1))
+    for m in re.finditer(rb"I +([0-9.]+) [^\r\n]*rsx: flip (\d+)[^\r\n]*worst ([0-9.]+)", data):
+        t, n = float(m.group(1)), int(m.group(2))
+        if "flip" in state and n > state["n"]:
+            state["fps"] = (n - state["n"]) / max(t - state["flip"], 1e-3)
+        state["worst"] = float(m.group(3))
+        state["flip"], state["n"] = t, n
     return state.get("flip")
+
+
+def summarize(rows, path):
+    def avg(sel):
+        acc = {}
+        for r in sel:
+            for k, v in r[2].items():
+                acc[k] = acc.get(k, 0) + v
+        return {k: v / len(sel) for k, v in acc.items()} if sel else {}
+    played = [r for r in rows if r[0] > 90 and r[1] > 0]
+    low = [r for r in played if r[1] < 24]
+    high = [r for r in played if r[1] >= 28]
+    with open(path, "w") as f:
+        f.write("seconds %d, low(<24fps) %d, high(>=28fps) %d\n" % (len(played), len(low), len(high)))
+        lo, hi = avg(low), avg(high)
+        for k in sorted(set(lo) | set(hi), key=lambda k: -lo.get(k, 0)):
+            if lo.get(k, 0) > 0.05 or hi.get(k, 0) > 0.05:
+                f.write("%-28s low %5.1f%%  high %5.1f%%\n" % (k, 100 * lo.get(k, 0), 100 * hi.get(k, 0)))
 
 
 def main():
@@ -79,15 +103,33 @@ def main():
     log_path = os.path.join(RUN_DIR, "gowa.log")
     state = {}
     requested = False
+    mon = ThreadMon(proc.pid)
+    rows = []
+    mlog = open(os.path.join(out, "threads.log"), "w")
+    last_t = time.time()
     while proc.poll() is None:
-        time.sleep(2)
+        time.sleep(1)
         now = time.time() - t0
         flip = last_flip(log_path, state)
+        try:
+            cpu = mon.sample()
+        except OSError:
+            cpu = {}
+        dt = time.time() - last_t
+        last_t = time.time()
+        fps = state.get("fps", 0)
+        load = {k: v / dt for k, v in cpu.items()}
+        rows.append((now, fps, load))
+        top = sorted(load.items(), key=lambda kv: -kv[1])[:10]
+        mlog.write("%7.1f fps %5.1f worst %5.0f  %s\n" % (now, fps, state.get("worst", 0), "  ".join("%s=%.0f" % (k, 100 * v) for k, v in top)))
+        mlog.flush()
         if not requested and flip is not None and now > 40 and now - flip > 45:
             requested = True
             open(os.path.join(RUN_DIR, "blackbox.req"), "w").close()
             print("no frames for %.0f s, capturing a blackbox" % (now - flip))
     code = proc.returncode
+    mlog.close()
+    summarize(rows, os.path.join(out, "threads_summary.txt"))
     copy_saves(SAVE_DIR, PLAY_SAVE)
     if os.path.exists(log_path):
         shutil.copy(log_path, os.path.join(out, "gowa.log"))
