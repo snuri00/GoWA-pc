@@ -75,7 +75,7 @@ def main():
     os.makedirs(out, exist_ok=True)
     print("starting the game; close its window to end the session")
     t0 = time.time()
-    proc = subprocess.Popen([EXE], cwd=RUN_DIR, env=env)
+    proc = subprocess.Popen([EXE], cwd=RUN_DIR, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     log_path = os.path.join(RUN_DIR, "gowa.log")
     state = {}
     requested = False
