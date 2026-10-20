@@ -78,6 +78,8 @@ bool compile_glsl(ShaderStage stage, const std::string& source, std::vector<uint
     return ok;
 }
 
+bool load_cached_glsl(ShaderStage stage, const std::string& source, std::vector<uint32_t>& spirv) { return load_cached(cache_path(source_key(stage, source)), spirv); }
+
 bool compile_glsl_uncached(ShaderStage stage, const std::string& source, std::vector<uint32_t>& spirv, std::string& log) {
     std::call_once(g_init, [] { glslang_initialize_process(); });
     glslang_input_t input{};

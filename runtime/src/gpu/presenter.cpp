@@ -319,8 +319,13 @@ bool init() {
     const char* dexts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
     VkPhysicalDeviceFeatures avail{};
     vkGetPhysicalDeviceFeatures(g.phys, &avail);
+    VkPhysicalDeviceVulkan13Features a13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 a2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    a2.pNext = &a13;
+    vkGetPhysicalDeviceFeatures2(g.phys, &a2);
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.dynamicRendering = VK_TRUE;
+    f13.pipelineCreationCacheControl = a13.pipelineCreationCacheControl;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f13;
     f2.features.samplerAnisotropy = avail.samplerAnisotropy;
@@ -344,7 +349,7 @@ bool init() {
     if (vkCreateDevice(g.phys, &dci, nullptr, &g.device) != VK_SUCCESS) return false;
     volkLoadDevice(g.device);
     vkGetDeviceQueue(g.device, g.queue_family, 0, &g.queue);
-    g.ctx = {g.phys, g.device, g.queue, g.queue_family, g.features};
+    g.ctx = {g.phys, g.device, g.queue, g.queue_family, g.features, a13.pipelineCreationCacheControl == VK_TRUE};
     if (!create_swapchain()) return false;
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;

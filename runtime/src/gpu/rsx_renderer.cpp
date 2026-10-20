@@ -15,6 +15,11 @@
 #include <atomic>
 #include <bitset>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -189,6 +194,7 @@ struct PooledImage {
 VkDeviceSize g_pool_bytes = 0;
 
 struct VpEntry {
+    std::atomic<bool> ready{false};
     bool ok = false;
     uint64_t hash = 0;
     VkShaderModule module = VK_NULL_HANDLE;
@@ -196,6 +202,7 @@ struct VpEntry {
 };
 
 struct FpEntry {
+    std::atomic<bool> ready{false};
     bool ok = false;
     uint64_t hash = 0;
     VkShaderModule module = VK_NULL_HANDLE;
@@ -268,7 +275,12 @@ std::unordered_map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, 
 std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, std::vector<PooledImage>> g_image_pool;
 std::vector<std::pair<uint64_t, std::unique_ptr<Texture>>> g_retired_textures;
 std::unordered_map<uint64_t, VkSampler> g_samplers;
-std::unordered_map<uint64_t, VkPipeline> g_pipelines;
+struct PipelineEntry {
+    std::atomic<bool> ready{false};
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+std::unordered_map<uint64_t, PipelineEntry> g_pipelines;
 std::unordered_map<uint64_t, VpEntry> g_vp_cache;
 std::unordered_map<uint64_t, FpEntry> g_fp_cache;
 uint32_t g_vp_ucode[544 * 4];
@@ -278,8 +290,8 @@ bool g_vp_constants_dirty = true;
 RingAlloc g_vp_constants_alloc;
 uint64_t g_vp_constants_serial = ~0ull;
 float g_imm[16][4];
-uint32_t g_vp_failures = 0;
-uint32_t g_fp_failures = 0;
+std::atomic<uint32_t> g_vp_failures{0};
+std::atomic<uint32_t> g_fp_failures{0};
 uint64_t g_clears = 0;
 Pass g_pass;
 VkQueryPool g_qpool = VK_NULL_HANDLE;
@@ -461,6 +473,80 @@ void dump_failure(const char* prefix, uint64_t h, const std::string& glsl, const
     }
 }
 
+class CompilePool {
+public:
+    void submit(std::function<void()> job) {
+        std::call_once(started_, [this] {
+            for (int i = 0; i < 2; i++) {
+                std::thread([this] { run(); }).detach();
+            }
+        });
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            q_.push_back(std::move(job));
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void run() {
+        SetThreadDescription(GetCurrentThread(), L"Shader compiler");
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lock(m_);
+                cv_.wait(lock, [this] { return !q_.empty(); });
+                job = std::move(q_.front());
+                q_.pop_front();
+            }
+            job();
+        }
+    }
+
+    std::once_flag started_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> q_;
+};
+
+CompilePool g_compile_pool;
+
+bool async_compile() {
+    static const bool on = [] {
+        const char* e = std::getenv("GOWA_ASYNC_SHADERS");
+        return !e || e[0] != '0';
+    }();
+    return on;
+}
+
+void finish_vp(VpEntry& e, const std::string& glsl) {
+    std::vector<uint32_t> spirv;
+    std::string log;
+    e.ok = compile_glsl(ShaderStage::Vertex, glsl, spirv, log);
+    if (e.ok) e.module = make_module(spirv);
+    else if (g_vp_failures++ < 20) dump_failure("vp_fail", e.hash, glsl, log);
+    e.ready.store(true, std::memory_order_release);
+}
+
+void finish_fp(FpEntry& e, const std::string& glsl) {
+    std::vector<uint32_t> spirv;
+    std::string log;
+    e.ok = compile_glsl(ShaderStage::Fragment, glsl, spirv, log);
+    if (e.ok) e.module = make_module(spirv);
+    else if (g_fp_failures++ < 20) dump_failure("fp_fail", e.hash, glsl, log);
+    e.ready.store(true, std::memory_order_release);
+}
+
+template <typename Entry>
+void compile_entry(Entry& e, ShaderStage stage, std::string glsl, void (*finish)(Entry&, const std::string&)) {
+    std::vector<uint32_t> spirv;
+    if (!async_compile() || load_cached_glsl(stage, glsl, spirv)) {
+        finish(e, glsl);
+        return;
+    }
+    g_compile_pool.submit([&e, glsl = std::move(glsl), finish] { finish(e, glsl); });
+}
+
 uint64_t g_vp_ucode_serial = 0;
 
 uint32_t g_vp_canon[544 * 4];
@@ -527,14 +613,12 @@ VpEntry* vertex_program() {
     VpEntry& e = g_vp_cache[h];
     e.hash = h;
     VertexProgramInfo vp = decompile_vertex_program(g_vp_canon, g_vp_canon_start);
-    std::vector<uint32_t> spirv;
-    std::string log;
-    e.ok = vp.valid && compile_glsl(ShaderStage::Vertex, vp.glsl, spirv, log);
-    if (e.ok) {
-        e.module = make_module(spirv);
-        e.inputs = vp.input_mask | 1u;
-    } else if (g_vp_failures++ < 20) {
-        dump_failure("vp_fail", h, vp.glsl, log);
+    e.inputs = vp.input_mask | 1u;
+    if (vp.valid) {
+        compile_entry(e, ShaderStage::Vertex, vp.glsl, finish_vp);
+    } else {
+        if (g_vp_failures++ < 20) dump_failure("vp_fail", h, vp.glsl, "");
+        e.ready.store(true, std::memory_order_release);
     }
     if (std::getenv("GOWA_SHADER_DUMP")) {
         std::string words;
@@ -546,7 +630,7 @@ VpEntry* vertex_program() {
         }
         dump_failure("vp", h, vp.glsl, words);
     }
-    LOG_INFO("rsx", "vertex program %016llx start %u: %s (%zu seen, %u failures)", static_cast<unsigned long long>(h), start, e.ok ? "ok" : "FAILED", g_vp_cache.size(), g_vp_failures);
+    LOG_INFO("rsx", "vertex program %016llx start %u: %s (%zu seen, %u failures)", static_cast<unsigned long long>(h), start, !e.ready ? "queued" : e.ok ? "ok" : "FAILED", g_vp_cache.size(), g_vp_failures.load());
     return &e;
 }
 
@@ -674,21 +758,19 @@ FpEntry* fragment_program(uint32_t ea) {
     FpEntry& e = g_fp_cache[h];
     e.hash = h;
     FragmentProgramInfo fp = decompile_fragment_program(read, key);
-    std::vector<uint32_t> spirv;
-    std::string log;
-    e.ok = fp.valid && compile_glsl(ShaderStage::Fragment, fp.glsl, spirv, log);
-    if (e.ok) {
-        e.module = make_module(spirv);
-        e.literal_slots = fp.literal_slots;
-        e.start_slot = fp.start_slot;
-        e.textures = fp.texture_mask;
-        e.dims = key.texture_dims;
-    } else if (g_fp_failures++ < 20) {
-        dump_failure("fp_fail", h, fp.glsl, log);
+    e.literal_slots = fp.literal_slots;
+    e.start_slot = fp.start_slot;
+    e.textures = fp.texture_mask;
+    e.dims = key.texture_dims;
+    if (std::getenv("GOWA_SHADER_DUMP")) dump_failure("fp", h, fp.glsl, "");
+    if (fp.valid) {
+        compile_entry(e, ShaderStage::Fragment, fp.glsl, finish_fp);
+    } else {
+        if (g_fp_failures++ < 20) dump_failure("fp_fail", h, fp.glsl, "");
+        e.ready.store(true, std::memory_order_release);
     }
-    if (std::getenv("GOWA_SHADER_DUMP")) dump_failure("fp", h, fp.glsl, log);
     LOG_INFO("rsx", "fragment program %016llx at 0x%08x (%u slots, %zu literals): %s (%zu seen, %u failures)", static_cast<unsigned long long>(h), ea, fp.length_slots,
-             fp.literal_slots.size(), e.ok ? "ok" : "FAILED", g_fp_cache.size(), g_fp_failures);
+             fp.literal_slots.size(), !e.ready ? "queued" : e.ok ? "ok" : "FAILED", g_fp_cache.size(), g_fp_failures.load());
     return &e;
 }
 
@@ -1927,10 +2009,7 @@ struct PipelineKey {
     uint32_t topology_class;
 };
 
-VkPipeline pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule fs) {
-    uint64_t h = fnv(&k, sizeof k);
-    auto it = g_pipelines.find(h);
-    if (it != g_pipelines.end()) return it->second;
+VkResult create_pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule fs, VkPipelineCreateFlags flags, VkPipeline& p) {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", nullptr};
     stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr};
@@ -2022,16 +2101,36 @@ VkPipeline pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule fs) 
     gi.pColorBlendState = &cb;
     gi.pDynamicState = &dy;
     gi.layout = g_pipeline_layout;
-    VkPipeline p = VK_NULL_HANDLE;
+    gi.flags = flags;
+    p = VK_NULL_HANDLE;
+    VkResult r = vkCreateGraphicsPipelines(vk().device, g_pipeline_cache, 1, &gi, nullptr, &p);
+    if (r != VK_SUCCESS) p = VK_NULL_HANDLE;
+    if (r != VK_SUCCESS && r != VK_PIPELINE_COMPILE_REQUIRED) LOG_WARN("rsx", "pipeline creation failed (%d)", static_cast<int>(r));
+    return r;
+}
+
+VkPipeline pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule fs) {
+    uint64_t h = fnv(&k, sizeof k);
+    auto it = g_pipelines.find(h);
+    if (it != g_pipelines.end()) return it->second.ready.load(std::memory_order_acquire) ? it->second.pipeline : VK_NULL_HANDLE;
+    PipelineEntry& e = g_pipelines[h];
     CompileTimer ct;
     g_compile_frame.pipelines++;
-    if (vkCreateGraphicsPipelines(vk().device, g_pipeline_cache, 1, &gi, nullptr, &p) != VK_SUCCESS) {
-        LOG_WARN("rsx", "pipeline creation failed");
-        p = VK_NULL_HANDLE;
-    }
-    g_pipelines[h] = p;
     g_stats.pipelines++;
-    return p;
+    if (async_compile()) {
+        if (vk().cache_control && create_pipeline(k, vs, fs, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, e.pipeline) == VK_SUCCESS) {
+            e.ready.store(true, std::memory_order_release);
+            return e.pipeline;
+        }
+        g_compile_pool.submit([&e, k, vs, fs] {
+            create_pipeline(k, vs, fs, 0, e.pipeline);
+            e.ready.store(true, std::memory_order_release);
+        });
+        return VK_NULL_HANDLE;
+    }
+    create_pipeline(k, vs, fs, 0, e.pipeline);
+    e.ready.store(true, std::memory_order_release);
+    return e.pipeline;
 }
 
 void build_indices(std::vector<uint32_t>& raw, bool& inline_draw, uint32_t& inline_stride) {
@@ -2237,10 +2336,10 @@ bool draw() {
     if (!init_objects()) return skip(__LINE__);
     uint64_t ph = ticks();
     VpEntry* vp = vertex_program();
-    if (!vp || !vp->ok) return skip(__LINE__);
+    if (!vp || !vp->ready.load(std::memory_order_acquire) || !vp->ok) return skip(__LINE__);
     uint32_t fp_ea = fp_address();
     FpEntry* fp = fragment_program(fp_ea);
-    if (!fp || !fp->ok) return skip(__LINE__);
+    if (!fp || !fp->ready.load(std::memory_order_acquire) || !fp->ok) return skip(__LINE__);
     uint32_t w = clip_w(), h = clip_h();
     if (!w || !h) return skip(__LINE__);
     std::vector<Surface*> colors = color_targets();
