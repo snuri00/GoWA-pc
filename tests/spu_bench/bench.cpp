@@ -151,6 +151,7 @@ uint64_t g_hle_insns = 0;
 bool g_hle_strict = false;
 bool g_hle_profile = false;
 uint64_t g_host_budget = 1ull << 16;
+std::map<std::pair<uint32_t, uint32_t>, uint64_t>* g_exit_hist = std::getenv("GOWA_BENCH_EXITS") ? new std::map<std::pair<uint32_t, uint32_t>, uint64_t>() : nullptr;
 struct HleStat {
     uint64_t cycles = 0;
     uint64_t insns = 0;
@@ -669,7 +670,9 @@ Result run(State& s, const Capture& cap, bool regions) {
             if (f && f->host_handler) {
                 if (cap.insns - n > g_host_budget + 200000) {
                     uint32_t pc0 = s.c.pc;
-                    s.c.executed = uint32_t(g_host_budget);
+                    uint64_t hb = g_host_budget;
+                    if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value > n && cap.events[host.pos].value - n < hb) hb = cap.events[host.pos].value - n;
+                    s.c.executed = uint32_t(hb);
                     if (g_js_on) g_phase = js_base | PH_NATIVE;
                     uint64_t h0 = __rdtsc();
                     bool handled = f->host_handler(s.c, host);
@@ -677,6 +680,7 @@ Result run(State& s, const Capture& cap, bool regions) {
                     if (g_js_on) g_phase = js_base | PH_DISP;
                     if (handled) {
                         uint64_t k = s.c.executed;
+                        if (g_exit_hist) (*g_exit_hist)[{pc0, s.c.pc}] += 1;
                         uint64_t target = n + k;
                         if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value < target && host.error.empty()) {
                             char b[160];
@@ -1044,6 +1048,14 @@ int main(int argc, char** argv) {
             }
             std::fclose(f);
         }
+    }
+    if (g_exit_hist) {
+        std::map<uint32_t, uint64_t> by_exit;
+        for (auto& [k, v] : *g_exit_hist) by_exit[k.second] += v;
+        std::vector<std::pair<uint64_t, uint32_t>> v;
+        for (auto& [pc, c] : by_exit) v.push_back({c, pc});
+        std::sort(v.rbegin(), v.rend());
+        for (size_t i = 0; i < v.size() && i < 40; i++) std::printf("  exit %05x %llu\n", v[i].second, (unsigned long long)v[i].first);
     }
     std::printf("total %.3f cycles/insn over %llu insns, %d mismatching\n", total_insns ? double(total_cycles) / total_insns : 0.0, static_cast<unsigned long long>(total_insns), failures);
     return failures ? 1 : 0;

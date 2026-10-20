@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "pm_adapters.h"
+#include "ej_adapters.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -15,20 +16,37 @@
 
 namespace {
 
+struct Target {
+    const char* name;
+    const uint32_t* (*hooks)(size_t&);
+    const uint32_t* (*signature)(uint32_t, uint32_t&);
+    bool (*image_loaded)(const uint8_t*);
+    bool (*run_hook)(spu::Context&, spu::Host&);
+    uint64_t budget;
+    uint32_t lo, hi;
+    uint32_t data_lo, data_hi;
+    uint32_t code_lo, code_hi;
+    uint32_t code2_lo, code2_hi;
+};
+
+const Target kPm = {"pm", pm::hooks, pm::signature, pm::image_loaded, pm::run_hook, pm::kDefaultBudget, 0xa00, 0x39f0, 0xaf0, 0x16d0, 0xa00, 0xaf0, 0x16d0, 0x39d8};
+const Target kEdge = {"edgejob", edgejob::hooks, edgejob::signature, edgejob::image_loaded, edgejob::run_hook, edgejob::kDefaultBudget, 0x4030, 0x10430, 0x11000, 0x29000, 0x4000, 0x10430, 0x4000, 0x4000};
+const Target* T = &kPm;
+
 uint32_t rbe32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
 
 std::set<uint32_t> hook_set() {
     size_t n = 0;
-    const uint32_t* h = pm::hooks(n);
+    const uint32_t* h = T->hooks(n);
     return std::set<uint32_t>(h, h + n);
 }
 
 bool sig_ok(const uint8_t* ls, uint32_t pc) {
     uint32_t words = 0;
-    const uint32_t* sig = pm::signature(pc, words);
+    const uint32_t* sig = T->signature(pc, words);
     for (uint32_t i = 0; i < words; i++)
         if (rbe32(ls + pc + 4 * i) != sig[i]) return false;
-    return pm::image_loaded(ls);
+    return T->image_loaded(ls);
 }
 
 std::string state_diff(const edgecap::Machine& a, const edgecap::Machine& b) {
@@ -58,7 +76,7 @@ std::string state_diff(const edgecap::Machine& a, const edgecap::Machine& b) {
 
 int unit(const std::vector<std::string>& caps) {
     std::set<uint32_t> hooks = hook_set();
-    uint64_t budget = std::getenv("PM_BUDGET") ? std::strtoull(std::getenv("PM_BUDGET"), nullptr, 0) : pm::kDefaultBudget;
+    uint64_t budget = std::getenv("PM_BUDGET") ? std::strtoull(std::getenv("PM_BUDGET"), nullptr, 0) : T->budget;
     int bad_total = 0;
     uint64_t all_pm = 0, all_cov = 0, all_calls = 0;
     std::map<uint32_t, uint64_t> uncovered;
@@ -75,12 +93,14 @@ int unit(const std::vector<std::string>& caps) {
         uint64_t skip_until = 0;
         while (!ref.done()) {
             uint32_t pc = ref.c.pc;
-            bool in_pm = pc >= 0xa00 && pc < 0x39f0 && pm::image_loaded(ref.ls.data());
+            bool in_pm = pc >= T->lo && pc < T->hi && T->image_loaded(ref.ls.data());
             if (!std::getenv("PM_UNIT_OFF") && in_pm && ref.n >= skip_until && hooks.count(pc) && sig_ok(ref.ls.data(), pc) && cap.insns - ref.n > budget + 200000) {
                 edgecap::Machine nat(ref);
                 nat.c.ls = nat.ls.data();
-                nat.c.executed = uint32_t(budget);
-                bool handled = pm::run_hook(nat.c, nat);
+                uint64_t hb = budget;
+                if (ref.pos < cap.events.size() && cap.events[ref.pos].kind == 5 && cap.events[ref.pos].value > ref.n && cap.events[ref.pos].value - ref.n < hb) hb = cap.events[ref.pos].value - ref.n;
+                nat.c.executed = uint32_t(hb);
+                bool handled = T->run_hook(nat.c, nat);
                 if (!handled) {
                     declined++;
                 } else {
@@ -93,7 +113,7 @@ int unit(const std::vector<std::string>& caps) {
                     nat.c.irq_check = false;
                     if (nat.pos < cap.events.size() && cap.events[nat.pos].kind == 5 && cap.events[nat.pos].value == nat.n) nat.next(5, 0, uint32_t(nat.n), true);
                     for (uint64_t i = 0; i < k && !ref.done(); i++) {
-                        if (ref.c.pc >= 0xa00 && ref.c.pc < 0x39f0) {
+                        if (ref.c.pc >= T->lo && ref.c.pc < T->hi) {
                             pm_insns++;
                             covered++;
                         }
@@ -201,7 +221,7 @@ int fuzz(const std::vector<std::string>& args) {
         return 1;
     }
     size_t nh = 0;
-    const uint32_t* hooks = pm::hooks(nh);
+    const uint32_t* hooks = T->hooks(nh);
     std::mt19937 rng(seed0);
     int bad_total = 0;
     uint64_t runs = 0, exits_irq = 0, halts = 0, insns = 0, smc = 0;
@@ -211,12 +231,12 @@ int fuzz(const std::vector<std::string>& args) {
         for (int it = 0; it < iters; it++) {
             std::vector<uint8_t> ls(cap.ls0, cap.ls0 + spu::LS_SIZE);
             ls.resize(spu::LS_SIZE + 16, 0);
-            for (uint32_t a = 0xaf0; a < 0x16d0; a += 4) {
+            for (uint32_t a = T->data_lo; a < T->data_hi; a += 4) {
                 if (rng() & 3) continue;
                 uint32_t v = rng();
                 uint32_t pick = rng() & 7;
                 if (pick == 0) v = 0;
-                else if (pick == 1) v = 0xaf0 + (rng() % 0xbe0 & ~3u);
+                else if (pick == 1) v = T->data_lo + (rng() % (T->data_hi - T->data_lo) & ~3u);
                 else if (pick == 2) v &= 0xffff;
                 std::memcpy(ls.data() + a, &v, 4);
             }
@@ -229,7 +249,7 @@ int fuzz(const std::vector<std::string>& args) {
             for (int r = 0; r < 128; r++)
                 for (int k = 0; k < 4; k++) {
                     uint32_t x = rng();
-                    uint32_t v = (x & 3) == 0 ? ((rng() & 1) ? 0xaf0 + (rng() % 0xbe0 & ~15u) : 0x4000 + (rng() % 0x3b000 & ~15u)) : (x & 3) == 1 ? (rng() & 0x3f) : rng();
+                    uint32_t v = (x & 3) == 0 ? ((rng() & 1) ? T->data_lo + (rng() % (T->data_hi - T->data_lo) & ~15u) : 0x11000 + (rng() % 0x2e000 & ~15u)) : (x & 3) == 1 ? (rng() & 0x3f) : rng();
                     c0.gpr[r].u32[k] = v;
                 }
             c0.gpr[1].u32[3] = 0x3f000 + ((rng() & 0x7f) << 4);
@@ -245,7 +265,7 @@ int fuzz(const std::vector<std::string>& args) {
             rh_.c = &rc;
             nh_.seed = rh_.seed = rng();
             nc.executed = 20000;
-            bool handled = pm::run_hook(nc, nh_);
+            bool handled = T->run_hook(nc, nh_);
             if (!handled) {
                 bad++;
                 if (bad <= 3) std::printf("  hook %05x it %d declined\n", hook, it);
@@ -266,7 +286,7 @@ int fuzz(const std::vector<std::string>& args) {
             }
             nc.irq_check = false;
             rc.irq_check = false;
-            if (std::memcmp(rls.data() + 0xa00, ls.data() + 0xa00, 0xf0) != 0 || std::memcmp(rls.data() + 0x16d0, ls.data() + 0x16d0, 0x39d8 - 0x16d0) != 0) {
+            if (std::memcmp(rls.data() + T->code_lo, ls.data() + T->code_lo, T->code_hi - T->code_lo) != 0 || std::memcmp(rls.data() + T->code2_lo, ls.data() + T->code2_lo, T->code2_hi - T->code2_lo) != 0) {
                 smc++;
                 continue;
             }
@@ -306,6 +326,11 @@ int main(int argc, char** argv) {
     }
     std::string cmd = argv[1];
     std::vector<std::string> rest(argv + 2, argv + argc);
+    if (cmd == "--edge" && argc > 2) {
+        T = &kEdge;
+        cmd = argv[2];
+        rest.assign(argv + 3, argv + argc);
+    }
     if (cmd == "unit") return unit(rest);
     if (cmd == "fuzz") return fuzz(rest);
     std::printf("unknown command %s\n", cmd.c_str());
