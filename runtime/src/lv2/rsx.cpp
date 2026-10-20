@@ -8,6 +8,7 @@
 #include "runtime/hooks.h"
 #include "runtime/hostsleep.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -107,7 +108,20 @@ void flip_done(uint32_t buffer) {
     std::memset(vm::ptr(g_rsx.reports + 0x10), 0, 16);
     g_rsx.flips++;
     if (trace::on(trace::RSX)) trace::emit(trace::T_FLIP, buffer, g_rsx.flips);
-    if ((g_rsx.flips % 60) == 1) LOG_INFO("rsx", "flip %llu (buffer %u)", static_cast<unsigned long long>(g_rsx.flips), buffer);
+    static auto last = std::chrono::steady_clock::now();
+    static double worst = 0.0;
+    static uint32_t over50 = 0, over100 = 0;
+    auto now = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(now - last).count();
+    last = now;
+    worst = (std::max)(worst, ms);
+    over50 += ms > 50.0;
+    over100 += ms > 100.0;
+    if ((g_rsx.flips % 60) == 1) {
+        LOG_INFO("rsx", "flip %llu (buffer %u) worst %.1f ms, >50ms %u, >100ms %u", static_cast<unsigned long long>(g_rsx.flips), buffer, worst, over50, over100);
+        worst = 0.0;
+        over50 = over100 = 0;
+    }
     send_event(1u << 4);
 }
 

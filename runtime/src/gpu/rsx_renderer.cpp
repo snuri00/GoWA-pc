@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <ctime>
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
 #include <map>
 #include <set>
@@ -295,6 +296,23 @@ std::unordered_map<uint32_t, uint32_t> g_zpass_cache;
 Dummy g_dummy[4];
 VkDescriptorSetLayout g_set_layout = VK_NULL_HANDLE;
 VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
+VkPipelineCache g_pipeline_cache = VK_NULL_HANDLE;
+uint64_t g_pipelines_saved = 0;
+
+void save_pipeline_cache() {
+    if (!g_pipeline_cache) return;
+    size_t size = 0;
+    if (vkGetPipelineCacheData(vk().device, g_pipeline_cache, &size, nullptr) != VK_SUCCESS || !size) return;
+    std::vector<char> blob(size);
+    if (vkGetPipelineCacheData(vk().device, g_pipeline_cache, &size, blob.data()) != VK_SUCCESS) return;
+    std::error_code ec;
+    std::filesystem::create_directories("shader_cache", ec);
+    FILE* f = std::fopen("shader_cache/pipelines.bin.tmp", "wb");
+    if (!f) return;
+    bool ok = std::fwrite(blob.data(), 1, size, f) == size;
+    std::fclose(f);
+    if (ok) std::filesystem::rename("shader_cache/pipelines.bin.tmp", "shader_cache/pipelines.bin", ec);
+}
 bool g_ready = false;
 bool g_trace = false;
 int g_trace_serial = 0;
@@ -330,6 +348,20 @@ std::vector<std::pair<uint32_t, uint32_t>> g_ranges;
 bool g_indexed = false;
 std::vector<uint32_t> g_inline;
 std::vector<uint32_t> g_elements;
+
+struct CompileFrame {
+    std::chrono::steady_clock::duration time{};
+    uint32_t vp = 0;
+    uint32_t fp = 0;
+    uint32_t pipelines = 0;
+};
+
+CompileFrame g_compile_frame;
+
+struct CompileTimer {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~CompileTimer() { g_compile_frame.time += std::chrono::steady_clock::now() - t0; }
+};
 
 struct Stats {
     uint64_t draws = 0;
@@ -490,6 +522,8 @@ VpEntry* vertex_program() {
         recent[start] = {g_vp_ucode_serial, &it->second};
         return &it->second;
     }
+    CompileTimer ct;
+    g_compile_frame.vp++;
     VpEntry& e = g_vp_cache[h];
     e.hash = h;
     VertexProgramInfo vp = decompile_vertex_program(g_vp_canon, g_vp_canon_start);
@@ -635,6 +669,8 @@ FpEntry* fragment_program(uint32_t ea) {
         remember(&it->second);
         return &it->second;
     }
+    CompileTimer ct;
+    g_compile_frame.fp++;
     FpEntry& e = g_fp_cache[h];
     e.hash = h;
     FragmentProgramInfo fp = decompile_fragment_program(read, key);
@@ -1051,6 +1087,28 @@ bool init_objects() {
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &g_set_layout;
     if (vkCreatePipelineLayout(c.device, &pl, nullptr, &g_pipeline_layout) != VK_SUCCESS) return false;
+    {
+        std::vector<char> blob;
+        if (FILE* f = std::fopen("shader_cache/pipelines.bin", "rb")) {
+            std::fseek(f, 0, SEEK_END);
+            long size = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (size > 0) {
+                blob.resize(size_t(size));
+                if (std::fread(blob.data(), 1, blob.size(), f) != blob.size()) blob.clear();
+            }
+            std::fclose(f);
+        }
+        VkPipelineCacheCreateInfo pc{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        pc.initialDataSize = blob.size();
+        pc.pInitialData = blob.empty() ? nullptr : blob.data();
+        if (vkCreatePipelineCache(c.device, &pc, nullptr, &g_pipeline_cache) != VK_SUCCESS) {
+            pc.initialDataSize = 0;
+            pc.pInitialData = nullptr;
+            vkCreatePipelineCache(c.device, &pc, nullptr, &g_pipeline_cache);
+        }
+        LOG_INFO("rsx", "pipeline cache: loaded %zu bytes", blob.size());
+    }
     const VkImageViewType types[4] = {VK_IMAGE_VIEW_TYPE_1D, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_CUBE, VK_IMAGE_VIEW_TYPE_3D};
     VkCommandBuffer cmd = frame_cmd();
     for (uint32_t i = 0; i < 4; i++) {
@@ -1420,7 +1478,7 @@ bool redirect_pipeline() {
     gi.pColorBlendState = &cb;
     gi.pDynamicState = &dy;
     gi.layout = g_redirect_layout;
-    return vkCreateGraphicsPipelines(c.device, VK_NULL_HANDLE, 1, &gi, nullptr, &g_redirect_pipeline) == VK_SUCCESS;
+    return vkCreateGraphicsPipelines(c.device, g_pipeline_cache, 1, &gi, nullptr, &g_redirect_pipeline) == VK_SUCCESS;
 }
 
 VkImageView depth_view(Surface* s) {
@@ -1965,7 +2023,9 @@ VkPipeline pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule fs) 
     gi.pDynamicState = &dy;
     gi.layout = g_pipeline_layout;
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(vk().device, VK_NULL_HANDLE, 1, &gi, nullptr, &p) != VK_SUCCESS) {
+    CompileTimer ct;
+    g_compile_frame.pipelines++;
+    if (vkCreateGraphicsPipelines(vk().device, g_pipeline_cache, 1, &gi, nullptr, &p) != VK_SUCCESS) {
         LOG_WARN("rsx", "pipeline creation failed");
         p = VK_NULL_HANDLE;
     }
@@ -3120,6 +3180,11 @@ uint32_t zpass_value(uint32_t ea) {
 
 void frame_complete() {
     g_frame_draw = 0;
+    double compile_ms = std::chrono::duration<double, std::milli>(g_compile_frame.time).count();
+    if (compile_ms > 4.0) {
+        LOG_INFO("rsx", "compile stall %.1f ms (vp %u, fp %u, pipelines %u)", compile_ms, g_compile_frame.vp, g_compile_frame.fp, g_compile_frame.pipelines);
+    }
+    g_compile_frame = {};
     if (!g_vb_checks.empty()) {
         uint32_t changed = 0;
         for (const VbCheck& c : g_vb_checks) {
@@ -3268,6 +3333,10 @@ bool present(uint32_t buffer_id) {
         }
         g_stats.image_allocs = g_stats.pool_hits = g_stats.textures_freed = 0;
         g_stats.draw_ticks = g_stats.tex_ticks = g_stats.present_ticks = 0;
+    }
+    if (presents % 300 == 0 && g_stats.pipelines != g_pipelines_saved) {
+        g_pipelines_saved = g_stats.pipelines;
+        save_pipeline_cache();
     }
     if (presents % 600 == 0) {
         std::string sk;
