@@ -645,9 +645,19 @@ void SpuThread::remember_get(uint32_t ea, uint32_t size, uint32_t lsa) {
         }
     }
     if (!slot_ptr) {
-        clear_snap(dma_snap_next);
-        slot_ptr = &dma_snaps[dma_snap_next];
-        dma_snap_next = (dma_snap_next + 1) % dma_snaps.size();
+        uint32_t table = vm::is_mapped(0x9B2298) ? vm::read32(0x9B2298) : 0;
+        uint32_t victim = dma_snap_next;
+        for (uint32_t n = 0; table && n < dma_snaps.size(); n++) {
+            uint32_t k = (dma_snap_next + n) % dma_snaps.size();
+            const DmaSnap& d = dma_snaps[k];
+            if (d.ea >= table + 0xA280 || d.ea + d.size <= table) {
+                victim = k;
+                break;
+            }
+        }
+        clear_snap(victim);
+        slot_ptr = &dma_snaps[victim];
+        dma_snap_next = (victim + 1) % dma_snaps.size();
     }
     slot_ptr->ea = ea;
     slot_ptr->size = size;
@@ -658,6 +668,7 @@ void SpuThread::remember_get(uint32_t ea, uint32_t size, uint32_t lsa) {
 }
 
 bool SpuThread::merge_put(uint32_t ea, uint32_t size, uint32_t lsa) {
+    merge_hit = false;
     uint64_t cand = (lsa >> 7) < snap_line.size() ? snap_line[lsa >> 7] : 0;
     while (cand) {
         DmaSnap& d = dma_snaps[__builtin_ctzll(cand)];
@@ -665,6 +676,7 @@ bool SpuThread::merge_put(uint32_t ea, uint32_t size, uint32_t lsa) {
         if (!d.size || ea < d.ea || ea + size > d.ea + d.size || d.lsa + (ea - d.ea) != lsa) continue;
         uint8_t* base = d.data.data() + (ea - d.ea);
         const uint8_t* src = ls + lsa;
+        merge_hit = true;
         if (std::memcmp(vm::ptr(ea), base, size) == 0) {
             std::memcpy(base, src, size);
             return false;
@@ -774,6 +786,13 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         }
         race_on_put(id, ea, size, ls + lsa, ctx.pc);
         if (ea < 0xF0000000u && put_merge_enabled() && merge_put(ea, size, lsa)) return;
+        if (ea < 0xF0000000u && put_merge_enabled() && !merge_hit) {
+            uint32_t table = vm::is_mapped(0x9B2298) ? vm::read32(0x9B2298) : 0;
+            static std::atomic<int> unprotected{0};
+            if (table && ea < table + 0xA280 && ea + size > table && unprotected.fetch_add(1) < 200) {
+                LOG_WARN("spudma", "thread 0x%x pc 0x%05x unprotected PUT to texture request table ea 0x%08x size 0x%x lsa 0x%05x", id, ctx.pc, ea, size, lsa);
+            }
+        }
         uint32_t guest = ea;
         if (ea < 0xF0000000u) {
             uint32_t done = 0;

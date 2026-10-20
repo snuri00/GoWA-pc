@@ -44,6 +44,7 @@ struct SpuThread : Host {
     void log_watched_dma(const char* what, uint32_t cmd, uint32_t ea, uint32_t lsa, uint32_t size, const uint8_t* data);
     void forget_ls(uint32_t lsa, uint32_t size);
     bool merge_put(uint32_t ea, uint32_t size, uint32_t lsa);
+    bool merge_hit = false;
     std::atomic<uint32_t> ls_epoch{1};
     std::atomic<uint32_t> ls_all_epoch{1};
     std::unique_ptr<std::atomic<uint32_t>[]> line_epoch{new std::atomic<uint32_t>[0x40000 / 128]()};
