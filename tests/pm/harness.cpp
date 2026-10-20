@@ -1,6 +1,8 @@
 #include "capture.h"
 #include "pm_adapters.h"
 #include "ej_adapters.h"
+#include "mh_adapters.h"
+#include "an_adapters.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -27,10 +29,13 @@ struct Target {
     uint32_t data_lo, data_hi;
     uint32_t code_lo, code_hi;
     uint32_t code2_lo, code2_hi;
+    uint32_t ea = 0, size = 0;
 };
 
 const Target kPm = {"pm", pm::hooks, pm::signature, pm::image_loaded, pm::run_hook, pm::kDefaultBudget, 0xa00, 0x39f0, 0xaf0, 0x16d0, 0xa00, 0xaf0, 0x16d0, 0x39d8};
 const Target kEdge = {"edgejob", edgejob::hooks, edgejob::signature, edgejob::image_loaded, edgejob::run_hook, edgejob::kDefaultBudget, 0x4030, 0x10430, 0x11000, 0x29000, 0x4000, 0x10430, 0x4000, 0x4000};
+const Target kMh = {"meshhier", meshhier::hooks, meshhier::signature, meshhier::image_loaded, meshhier::run_hook, meshhier::kDefaultBudget, 0x4030, 0xc130, 0xc200, 0x3f000, 0x4000, 0xc130, 0x4000, 0x4000, 0x78b380, 0x8130};
+const Target kAn = {"anim", anim::hooks, anim::signature, anim::image_loaded, anim::run_hook, anim::kDefaultBudget, 0x4030, 0xea70, 0xeb00, 0x3f000, 0x4000, 0xea70, 0x4000, 0x4000, 0x84be40, 0xaa70};
 const Target* T = &kPm;
 
 uint32_t rbe32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
@@ -220,6 +225,15 @@ int fuzz(const std::vector<std::string>& args) {
         std::printf("bad capture %s\n", base.c_str());
         return 1;
     }
+    std::vector<uint8_t> image;
+    if (T->size) {
+        std::FILE* f = std::fopen((std::string(GOWA_ROOT) + "/bin/01.12/GOWA.patched.elf").c_str(), "rb");
+        if (!f) return 1;
+        image.resize(T->size);
+        std::fseek(f, long(T->ea - 0x10000), SEEK_SET);
+        if (std::fread(image.data(), 1, image.size(), f) != image.size()) return 1;
+        std::fclose(f);
+    }
     size_t nh = 0;
     const uint32_t* hooks = T->hooks(nh);
     std::mt19937 rng(seed0);
@@ -230,6 +244,7 @@ int fuzz(const std::vector<std::string>& args) {
         int bad = 0;
         for (int it = 0; it < iters; it++) {
             std::vector<uint8_t> ls(cap.ls0, cap.ls0 + spu::LS_SIZE);
+            if (T->size) std::memcpy(ls.data() + 0x4000, image.data(), image.size());
             ls.resize(spu::LS_SIZE + 16, 0);
             for (uint32_t a = T->data_lo; a < T->data_hi; a += 4) {
                 if (rng() & 3) continue;
@@ -326,8 +341,8 @@ int main(int argc, char** argv) {
     }
     std::string cmd = argv[1];
     std::vector<std::string> rest(argv + 2, argv + argc);
-    if (cmd == "--edge" && argc > 2) {
-        T = &kEdge;
+    if ((cmd == "--edge" || cmd == "--mh" || cmd == "--an") && argc > 2) {
+        T = cmd == "--edge" ? &kEdge : cmd == "--mh" ? &kMh : &kAn;
         cmd = argv[2];
         rest.assign(argv + 3, argv + argc);
     }

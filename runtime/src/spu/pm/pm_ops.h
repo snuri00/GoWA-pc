@@ -38,6 +38,23 @@ using renjob::xo::shlqbi;
 using renjob::xo::shlqby;
 using renjob::xo::shlqbybi;
 
+inline V sumb(V a, V b) {
+    alignas(16) uint8_t x[16], y[16];
+    alignas(16) uint16_t r[8];
+    _mm_store_si128(reinterpret_cast<__m128i*>(x), a);
+    _mm_store_si128(reinterpret_cast<__m128i*>(y), b);
+    for (int i = 0; i < 4; i++) {
+        uint16_t sb = 0, sa = 0;
+        for (int k = 0; k < 4; k++) {
+            sb = uint16_t(sb + y[i * 4 + k]);
+            sa = uint16_t(sa + x[i * 4 + k]);
+        }
+        r[i * 2 + 1] = sb;
+        r[i * 2] = sa;
+    }
+    return _mm_load_si128(reinterpret_cast<const __m128i*>(r));
+}
+
 inline __attribute__((always_inline)) void stm(spu::Context& c, uint8_t* ls, uint32_t a, V v) {
     a &= 0x3fff0;
     _mm_storeu_si128(reinterpret_cast<__m128i*>(ls + a), bswap(v));
