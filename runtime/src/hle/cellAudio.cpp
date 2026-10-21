@@ -1,3 +1,4 @@
+#include "runtime/placement.h"
 #include "ppu/ops.h"
 #include "runtime/hostsleep.h"
 #include "common.h"
@@ -131,6 +132,7 @@ void mix_block(const Port& p, uint64_t block, float* stereo) {
 
 void audio_thread() {
     SetThreadDescription(GetCurrentThread(), L"cellAudio");
+    placement::apply("audio");
     Output out;
     out.open();
     auto next = std::chrono::steady_clock::now();

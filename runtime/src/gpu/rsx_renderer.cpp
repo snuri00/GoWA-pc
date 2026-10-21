@@ -1,3 +1,4 @@
+#include "runtime/placement.h"
 #include <immintrin.h>
 #include "gpu/presenter.h"
 #include "gpu/rsx.h"
@@ -491,6 +492,7 @@ public:
 private:
     void run() {
         SetThreadDescription(GetCurrentThread(), L"Shader compiler");
+        placement::apply("shader");
         for (;;) {
             std::function<void()> job;
             {

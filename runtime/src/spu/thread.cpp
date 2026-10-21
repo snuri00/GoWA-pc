@@ -1,3 +1,4 @@
+#include "runtime/placement.h"
 #include "spu/aot.h"
 #include "hle.h"
 #include "thread.h"
@@ -1264,6 +1265,7 @@ void SpuThread::run() {
         int stride = std::atoi(aff);
         if (stride > 0) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << ((slot * stride) % 12));
     }
+    placement::apply("spu" + std::to_string(slot));
     _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
     LOG_INFO("spu", "thread 0x%x '%s' start pc 0x%05x args 0x%llx 0x%llx", id, name.c_str(), ctx.pc,
              static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));

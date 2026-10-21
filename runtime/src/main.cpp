@@ -1,3 +1,4 @@
+#include "runtime/placement.h"
 #include "runtime/image.h"
 #include "runtime/loader.h"
 #include "runtime/log.h"
@@ -186,6 +187,7 @@ int main(int argc, char** argv) {
     bool status = std::getenv("GOWA_STATUS") != nullptr;
     int memdump_at = std::getenv("GOWA_MEMDUMP_AT") ? std::atoi(std::getenv("GOWA_MEMDUMP_AT")) : -1;
     SetThreadDescription(GetCurrentThread(), L"Host main");
+    placement::apply("host");
     static const int census = std::getenv("GOWA_THREAD_CPU") ? std::atoi(std::getenv("GOWA_THREAD_CPU")) : 0;
     std::vector<uint32_t> peeks;
     if (const char* e = std::getenv("GOWA_PEEK")) {
