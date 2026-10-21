@@ -107,7 +107,7 @@ def supervise(env, duration):
             open(os.path.join(RUN_DIR, "blackbox.req"), "w").close()
             print("no flips for %.0fs, requesting blackbox capture" % (now - flip))
     proc.kill()
-    subprocess.run(["taskkill", "/F", "/IM", "gowa.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
     return 124
 
 
