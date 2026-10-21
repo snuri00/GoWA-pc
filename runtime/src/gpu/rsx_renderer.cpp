@@ -1,6 +1,7 @@
 #include "runtime/placement.h"
 #include <immintrin.h>
 #include "gpu/presenter.h"
+#include "motion_vectors.h"
 #include "gpu/rsx.h"
 #include "runtime/log.h"
 #include "runtime/trace.h"
@@ -2333,6 +2334,10 @@ bool skip(int line) {
     return false;
 }
 
+bool g_mv_done = false;
+std::string g_mv_hudless;
+void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h);
+
 bool draw() {
     VkCommandBuffer cmd = frame_cmd();
     if (!init_objects()) return skip(__LINE__);
@@ -2445,6 +2450,7 @@ bool draw() {
         }
     }
     if (!upload_uniform(lits.data(), lits.size() * 4, ubo[2])) return skip(__LINE__);
+    if (mv::enabled() && fp->hash == mv::kCameraVelocityFp && !colors.empty()) mv::set_camera(lits.data(), lits.size() / 4, colors[0]->offset, texture_regs(1).offset);
     struct FragmentState {
         float window[4];
         float fog[4];
@@ -2687,6 +2693,7 @@ bool draw() {
             g_qreset_needed = false;
         }
     }
+    if (mv::enabled()) mv_draw(colors, w, h);
     begin_pass(colors, depth, w, h);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
@@ -3299,6 +3306,7 @@ void frame_complete() {
     resolve_zpass();
     complete_writebacks();
     complete_dumps();
+    mv::complete();
     if (!std::getenv("GOWA_NO_GC")) collect_garbage();
 }
 
@@ -3379,6 +3387,56 @@ void method(uint32_t reg, uint32_t arg) {
     }
 }
 
+namespace {
+
+void mv_frame() {
+    double elapsed = mv::elapsed();
+    uint32_t vo = 0, zo = 0;
+    if (!mv::enabled() || !mv::camera(vo, zo)) return;
+    Surface* vel = nullptr;
+    Surface* z = nullptr;
+    for (Surface* s : surfaces_at(vo)) {
+        if (!s->depth() && !s->main && format_bytes(s->format) == 4 && (!vel || s->generation > vel->generation)) vel = s;
+    }
+    for (Surface* s : surfaces_at(zo)) {
+        if (s->format == VK_FORMAT_D24_UNORM_S8_UINT && !s->main && (!z || s->generation > z->generation)) z = s;
+    }
+    if (!vel || !z) return;
+    static Surface* last_vel = nullptr;
+    static Surface* last_z = nullptr;
+    if (vel != last_vel || z != last_z) {
+        LOG_INFO("mv", "inputs: velocity 0x%x %ux%u fmt %d, depth 0x%x %ux%u (%zu/%zu candidates)", vel->offset, vel->width, vel->height, int(vel->format), z->offset, z->width, z->height, surfaces_at(vo).size(), surfaces_at(zo).size());
+        last_vel = vel;
+        last_z = z;
+    }
+    transition(vel, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    transition(z, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    end_pass();
+    if (mv::run(frame_cmd(), vel->view, depth_view(z), z->iw, z->ih, elapsed) == 2) g_mv_hudless = mv::dump_base(elapsed) + "_hudless.ppm";
+}
+
+bool display_target(uint32_t offset) {
+    for (uint32_t id = 0; id < 8; id++) {
+        uint32_t o, p, w, h;
+        if (display_buffer(id, o, p, w, h) && o == offset) return true;
+    }
+    return false;
+}
+
+void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h) {
+    if (colors.empty() || !display_target(colors[0]->offset)) return;
+    if (!g_mv_done) {
+        g_mv_done = true;
+        mv_frame();
+    } else if (!g_mv_hudless.empty()) {
+        end_pass();
+        schedule_snapshot(colors[0], w, h, g_mv_hudless);
+        g_mv_hudless.clear();
+    }
+}
+
+}
+
 bool present(uint32_t buffer_id) {
     if (!enabled()) return false;
     end_pass();
@@ -3403,6 +3461,7 @@ bool present(uint32_t buffer_id) {
         traced_at2 = true;
         g_trace = true;
     }
+    g_mv_done = false;
     if (g_trace) g_trace_serial++;
     if (g_trace) g_trace_draws = 0;
     if (presents % 60 == 0) {
