@@ -18,9 +18,9 @@ add_library(tk_spu STATIC
 target_include_directories(tk_spu PUBLIC ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(tk_spu PRIVATE ${TK_FLAGS})
 
-file(GLOB TK_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/tasks/*.cpp)
+file(GLOB TK_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/tasks/*.cpp ${GOWA_ROOT}/runtime/src/spu/scream/scj_*.cpp)
 add_library(tk_native STATIC ${TK_NATIVE_SRC})
-target_include_directories(tk_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/tasks ${GOWA_ROOT}/runtime/src/spu/pm ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
+target_include_directories(tk_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/tasks ${GOWA_ROOT}/runtime/src/spu/scream ${GOWA_ROOT}/runtime/src/spu ${GOWA_ROOT}/runtime/src/spu/pm ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(tk_native PRIVATE ${TK_FLAGS})
 
 add_executable(tk_harness tk_harness.cpp ${EDGE_DIR}/capture.cpp)

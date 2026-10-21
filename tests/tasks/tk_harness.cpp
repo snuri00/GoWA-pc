@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "tk_adapters.h"
+#include "scj_adapters.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -33,8 +34,15 @@ const Target* T = &g_target;
 const tasks::Image* g_image = nullptr;
 
 bool select_task(const std::string& name) {
-    size_t m = 0;
-    const tasks::Image* img = tasks::images(m);
+    size_t m = 0, ms = 0;
+    const tasks::Image* timg = tasks::images(m);
+    const tasks::Image* simg = screamjob::task_images(ms);
+    std::vector<tasks::Image> all(timg, timg + m);
+    all.insert(all.end(), simg, simg + ms);
+    static std::vector<tasks::Image> keep;
+    keep = all;
+    const tasks::Image* img = keep.data();
+    m = keep.size();
     for (size_t k = 0; k < m; k++)
         if (name == img[k].name || name == img[k].name + 5) {
             g_image = &img[k];
@@ -225,6 +233,7 @@ struct ScriptHost : spu::Host {
         ops++;
         return true;
     }
+    bool interrupt_pending() override { return (mix(seed * 104729u + ops * 17u + 3) & 3) == 0; }
     void halt(uint32_t pc, uint32_t w) override {
         log.push_back((uint64_t(5) << 40) | pc);
         c->halted = true;

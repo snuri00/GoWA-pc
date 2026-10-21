@@ -514,6 +514,7 @@ public:
         return e ? e->result != 0 : false;
     }
     void halt(uint32_t pc, uint32_t word) override { next(4, pc, word, true); }
+    bool interrupt_pending() override { return pos < cap.events.size() && cap.events[pos].kind == 5; }
 };
 
 struct Slot {

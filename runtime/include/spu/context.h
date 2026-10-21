@@ -38,6 +38,7 @@ public:
     virtual uint32_t channel_count(uint32_t ch) = 0;
     virtual bool stop_and_signal(uint32_t code) = 0;
     virtual void halt(uint32_t pc, uint32_t word) = 0;
+    virtual bool interrupt_pending() { return true; }
 };
 
 void interpret(Context& c, Host& host);

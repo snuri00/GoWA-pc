@@ -23,6 +23,7 @@ NS = "pm::gen"
 OPS_H = "pm_ops.h"
 HEADER_BYTES = 0x40
 EXTRA_ROOTS = ()
+IE_INLINE = False
 
 RJ.configure(IMG_EA=PM_EA, IMG_LS=PM_LS, IMG_SIZE=PM_SIZE, CODE_END=0x39D8)
 
@@ -171,6 +172,8 @@ def loop_heads(insns):
 def interrupt_bits(d, target_expr):
     rb = d["rb"]
     if rb & 0x10:
+        if IE_INLINE:
+            return "c.interrupts_enabled = true; if (h.interrupt_pending()) { c.irq_check = true; X(%s, 0); }" % target_expr, False
         return "c.interrupts_enabled = true; c.irq_check = true; X(%s, 0);" % target_expr, True
     if rb & 0x20:
         return "c.interrupts_enabled = false;", False

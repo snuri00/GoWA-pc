@@ -45,7 +45,7 @@ inline __m128i special(__m128 r) {
 inline __m128 pos_zero(__m128 r) { return _mm_andnot_ps(_mm_cmpeq_ps(r, _mm_setzero_ps()), r); }
 
 template <class F>
-__attribute__((noinline, cold)) inline __m128 slow(__m128 a, __m128 b, __m128 c, __m128 r, __m128i lanes, F f) {
+__attribute__((noinline, cold)) inline __m128 __vectorcall slow(__m128 a, __m128 b, __m128 c, __m128 r, __m128i lanes, F f) {
     alignas(16) uint32_t av[4], bv[4], cv[4], rv[4], lv[4];
     _mm_store_si128(reinterpret_cast<__m128i*>(av), _mm_castps_si128(a));
     _mm_store_si128(reinterpret_cast<__m128i*>(bv), _mm_castps_si128(b));

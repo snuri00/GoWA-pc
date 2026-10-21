@@ -143,6 +143,7 @@ struct SpuThread : Host {
     uint32_t channel_count(uint32_t ch) override;
     bool stop_and_signal(uint32_t code) override;
     void halt(uint32_t pc, uint32_t word) override;
+    bool interrupt_pending() override;
 
     void push_snr(uint32_t number, uint32_t value);
     void push_in_mbox(uint32_t value);
