@@ -1,4 +1,5 @@
 #include "motion_vectors.h"
+#include "dlssg.h"
 
 #include "runtime/log.h"
 #include "shader_compiler.h"
@@ -76,6 +77,7 @@ struct State {
     double pending_time = 0.0;
     uint32_t dumps = 0;
     uint64_t runs = 0;
+    VkImageLayout out_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 
 State g;
@@ -258,8 +260,15 @@ bool enabled() {
         const char* v = std::getenv("GOWA_MV_DEBUG");
         return v && std::atoi(v) != 0;
     }();
-    return e;
+    return e || dlssg::active();
 }
+
+VkImage output(VkImageLayout& layout) {
+    layout = g.out_layout;
+    return g.out.image;
+}
+
+const float* camera_consts() { return g.consts; }
 
 void set_camera(const float* fc, size_t vec4_count, uint32_t velocity_offset, uint32_t depth_offset) {
     if (vec4_count < 18) return;
@@ -326,6 +335,7 @@ int run(VkCommandBuffer cmd, VkImageView velocity, VkImageView depth, uint32_t w
     VkAccessFlags final_access = dump ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_SHADER_READ_BIT;
     VkPipelineStageFlags final_stage = dump ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     for (Image* i : imgs) barrier(cmd, i->image, VK_IMAGE_LAYOUT_GENERAL, final_layout, VK_ACCESS_SHADER_WRITE_BIT, final_access, cs, final_stage);
+    g.out_layout = final_layout;
     if (dump) {
         VkDeviceSize off = 0;
         const uint32_t bpp[3] = {8, 8, 4};

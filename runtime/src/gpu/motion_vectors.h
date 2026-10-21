@@ -18,5 +18,7 @@ int run(VkCommandBuffer cmd, VkImageView velocity, VkImageView depth, uint32_t w
 std::string dump_base(double elapsed);
 double elapsed();
 void complete();
+VkImage output(VkImageLayout& layout);
+const float* camera_consts();
 
 }

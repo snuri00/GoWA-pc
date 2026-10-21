@@ -2,6 +2,7 @@
 #include "gpu/presenter.h"
 #include "gpu/rsx.h"
 #include "vk_context.h"
+#include "dlssg.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
 #include "runtime/hooks.h"
@@ -116,12 +117,14 @@ bool create_swapchain() {
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    if (hooks::fps_unlock_target() > 60.5) {
+    if (hooks::fps_unlock_target() > 60.5 || dlssg::want_low_latency_present()) {
         uint32_t pm = 0;
         vkGetPhysicalDeviceSurfacePresentModesKHR(g.ctx.phys, g.surface, &pm, nullptr);
         std::vector<VkPresentModeKHR> modes(pm);
         vkGetPhysicalDeviceSurfacePresentModesKHR(g.ctx.phys, g.surface, &pm, modes.data());
-        if (std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end()) ci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+        bool immediate = dlssg::want_low_latency_present() && std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end();
+        if (immediate) ci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        else if (std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end()) ci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
         else if (std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end()) ci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
     }
     ci.clipped = VK_TRUE;
@@ -133,6 +136,8 @@ bool create_swapchain() {
     vkGetSwapchainImagesKHR(g.device, g.swapchain, &n, nullptr);
     g.swap_images.resize(n);
     vkGetSwapchainImagesKHR(g.device, g.swapchain, &n, g.swap_images.data());
+    dlssg::set_backbuffer(g.swap_extent.width, g.swap_extent.height);
+    LOG_INFO("gpu", "swapchain %ux%u, %u images, present mode %d", g.swap_extent.width, g.swap_extent.height, n, int(ci.presentMode));
     return true;
 }
 
@@ -239,7 +244,7 @@ bool enabled() { return g_enabled; }
 
 bool init() {
     if (std::getenv("GOWA_HEADLESS")) return false;
-    if (volkInitialize() != VK_SUCCESS) {
+    if (!dlssg::load_vulkan() && volkInitialize() != VK_SUCCESS) {
         LOG_WARN("gpu", "Vulkan loader not available, running headless");
         return false;
     }
@@ -263,8 +268,14 @@ bool init() {
             g.hwnd = h;
         }
         wcv.notify_all();
+        if (std::getenv("GOWA_FOCUS")) SetTimer(h, 1, 2000, nullptr);
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            if (msg.message == WM_TIMER && msg.hwnd == h && GetForegroundWindow() != h) {
+                keybd_event(VK_MENU, 0, 0, 0);
+                keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+                SetForegroundWindow(h);
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -318,7 +329,18 @@ bool init() {
     qci.queueFamilyIndex = g.queue_family;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
-    const char* dexts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    std::vector<const char*> dexts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    if (dlssg::active()) {
+        uint32_t en = 0;
+        vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &en, nullptr);
+        std::vector<VkExtensionProperties> avail_exts(en);
+        vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &en, avail_exts.data());
+        for (const char* want : {"VK_NVX_binary_import", "VK_NVX_image_view_handle"}) {
+            for (auto& e : avail_exts) {
+                if (std::strcmp(e.extensionName, want) == 0) dexts.push_back(want);
+            }
+        }
+    }
     VkPhysicalDeviceFeatures avail{};
     vkGetPhysicalDeviceFeatures(g.phys, &avail);
     VkPhysicalDeviceVulkan13Features a13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -328,6 +350,14 @@ bool init() {
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.dynamicRendering = VK_TRUE;
     f13.pipelineCreationCacheControl = a13.pipelineCreationCacheControl;
+    VkPhysicalDeviceVulkan12Features a12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 q2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    q2.pNext = &a12;
+    vkGetPhysicalDeviceFeatures2(g.phys, &q2);
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12.bufferDeviceAddress = a12.bufferDeviceAddress;
+    f12.timelineSemaphore = a12.timelineSemaphore;
+    if (dlssg::active()) f13.pNext = &f12;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f13;
     f2.features.samplerAnisotropy = avail.samplerAnisotropy;
@@ -346,11 +376,12 @@ bool init() {
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 2;
-    dci.ppEnabledExtensionNames = dexts;
+    dci.enabledExtensionCount = static_cast<uint32_t>(dexts.size());
+    dci.ppEnabledExtensionNames = dexts.data();
     if (vkCreateDevice(g.phys, &dci, nullptr, &g.device) != VK_SUCCESS) return false;
     volkLoadDevice(g.device);
     vkGetDeviceQueue(g.device, g.queue_family, 0, &g.queue);
+    dlssg::device_ready(g.phys, g.device);
     g.ctx = {g.phys, g.device, g.queue, g.queue_family, g.features, a13.pipelineCreationCacheControl == VK_TRUE};
     if (!create_swapchain()) return false;
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -377,6 +408,7 @@ bool init() {
 void shutdown() {
     if (!g.device) return;
     vkDeviceWaitIdle(g.device);
+    dlssg::shutdown();
 }
 
 void set_display_buffer(uint32_t id, uint32_t offset, uint32_t pitch, uint32_t width, uint32_t height) {
@@ -414,6 +446,7 @@ void image_barrier(VkCommandBuffer cmd, VkImage img, VkImageAspectFlags aspect, 
 namespace {
 
 void submit_and_present(uint32_t index) {
+    dlssg::pre_submit(g.cmd, g.swap_extent.width, g.swap_extent.height);
     vkEndCommandBuffer(g.cmd);
     g.recording = false;
     vkResetFences(g.device, 1, &g.fence);
@@ -436,7 +469,10 @@ void submit_and_present(uint32_t index) {
     pi.swapchainCount = 1;
     pi.pSwapchains = &g.swapchain;
     pi.pImageIndices = &index;
+    dlssg::post_submit();
+    dlssg::present_begin();
     VkResult r = vkQueuePresentKHR(g.queue, &pi);
+    dlssg::present_end();
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
 }
 

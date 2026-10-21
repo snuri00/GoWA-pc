@@ -2,6 +2,7 @@
 #include <immintrin.h>
 #include "gpu/presenter.h"
 #include "motion_vectors.h"
+#include "dlssg.h"
 #include "gpu/rsx.h"
 #include "runtime/log.h"
 #include "runtime/trace.h"
@@ -3412,7 +3413,14 @@ void mv_frame() {
     transition(vel, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     transition(z, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     end_pass();
-    if (mv::run(frame_cmd(), vel->view, depth_view(z), z->iw, z->ih, elapsed) == 2) g_mv_hudless = mv::dump_base(elapsed) + "_hudless.ppm";
+    int ran = mv::run(frame_cmd(), vel->view, depth_view(z), z->iw, z->ih, elapsed);
+    if (ran == 2) g_mv_hudless = mv::dump_base(elapsed) + "_hudless.ppm";
+    if (ran && dlssg::active()) {
+        transition(z, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkImageLayout ml;
+        VkImage mvi = mv::output(ml);
+        dlssg::capture_inputs(frame_cmd(), mvi, ml, z->image, z->layout, z->iw, z->ih, mv::camera_consts());
+    }
 }
 
 bool display_target(uint32_t offset) {
@@ -3428,7 +3436,13 @@ void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h) {
     if (!g_mv_done) {
         g_mv_done = true;
         mv_frame();
-    } else if (!g_mv_hudless.empty()) {
+        return;
+    }
+    if (dlssg::hudless_pending()) {
+        transition(colors[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        dlssg::capture_hudless(frame_cmd(), colors[0]->image, colors[0]->layout, std::min(colors[0]->iw, uint32_t(w * colors[0]->scale + 0.5f)), std::min(colors[0]->ih, uint32_t(h * colors[0]->scale + 0.5f)));
+    }
+    if (!g_mv_hudless.empty()) {
         end_pass();
         schedule_snapshot(colors[0], w, h, g_mv_hudless);
         g_mv_hudless.clear();
