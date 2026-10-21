@@ -85,6 +85,10 @@ inline void st2(uint8_t* ls, uint32_t a, uint32_t b, __m256 v) {
     stq(ls, b, _mm256_extractf128_ps(v, 1));
 }
 
+const __m256i kBs8 = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+inline __m256 ld8b(const uint8_t* p) { return _mm256_castsi256_ps(_mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)), kBs8)); }
+inline void st8b(uint8_t* p, __m256 v) { _mm256_storeu_si256(reinterpret_cast<__m256i*>(p), _mm256_shuffle_epi8(_mm256_castps_si256(v), kBs8)); }
+
 #define SH8(v, i) _mm256_shuffle_ps(v, v, i)
 
 struct Acc {
@@ -120,6 +124,88 @@ inline __m256 xform(__m256 v, __m256 A, __m256 B, __m256 C, __m256 D) {
     return xform_exact(v, A, B, C, D);
 }
 
+inline __m256 special_ps(__m256 r) { return _mm256_cmp_ps(_mm256_and_ps(r, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF))), _mm256_castsi256_ps(_mm256_set1_epi32(0x7F7FFFFF)), _CMP_NLT_UQ); }
+
+__attribute__((noinline)) __m256 binormal_exact(__m256 n, __m256 t) {
+    const __m256 mask = _mm256_castsi256_ps(_mm256_setr_epi32(-1, -1, -1, 0, -1, -1, -1, 0));
+    const __m256 one = _mm256_set1_ps(1.0f), half = _mm256_set1_ps(0.5f);
+    const __m256i eps = _mm256_set1_epi32(spuf::key(0x0da2425f));
+    __m256 ts = SH8(t, _MM_SHUFFLE(0, 0, 2, 1));
+    __m256 ns = SH8(n, _MM_SHUFFLE(0, 0, 2, 1));
+    __m256 c = fnms8(t, ns, fm8(n, ts));
+    c = _mm256_and_ps(SH8(c, _MM_SHUFFLE(0, 0, 2, 1)), mask);
+    __m256 b = fm8(SH8(n, _MM_SHUFFLE(3, 3, 3, 3)), c);
+    __m256 s = fm8(b, b);
+    __m256 l = fa8(fa8(s, SH8(s, _MM_SHUFFLE(0, 3, 2, 1))), SH8(s, _MM_SHUFFLE(1, 0, 3, 2)));
+    l = SH8(l, 0);
+    __m256i gt = _mm256_cmpgt_epi32(key8(l), eps);
+    __m256 y = frsqest8(l);
+    __m256 e = fnms8(l, fm8(y, y), one);
+    __m256 r = fma8(e, fm8(y, half), y);
+    __m256 nb = fm8(b, r);
+    return _mm256_and_ps(_mm256_blendv_ps(b, nb, _mm256_castsi256_ps(gt)), mask);
+}
+
+void binormals_packed(uint8_t* ls, uint32_t t1, uint32_t t2, uint32_t out, int32_t count) {
+    const __m256 mask = _mm256_castsi256_ps(_mm256_setr_epi32(-1, -1, -1, 0, -1, -1, -1, 0));
+    const __m256 one = _mm256_set1_ps(1.0f), half = _mm256_set1_ps(0.5f);
+    const __m256i eps = _mm256_set1_epi32(spuf::key(0x0da2425f));
+    for (int32_t base = 0; base < count; base += 8) {
+        __m256 nv[4], tv[4], bv[4], lv[4];
+        __m256 kb = _mm256_setzero_ps();
+        int kbad = 0;
+        for (int i = 0; i < 4; i++) {
+            uint32_t off = uint32_t(base + 2 * i) * 16;
+            __m256 n = ld2(ls, t1 + off, t1 + off + 16);
+            __m256 t = ld2(ls, t2 + off, t2 + off + 16);
+            __m256 ts = SH8(t, _MM_SHUFFLE(0, 0, 2, 1));
+            __m256 ns = SH8(n, _MM_SHUFFLE(0, 0, 2, 1));
+            Acc k;
+            __m256 c = k.fnms(t, ns, k.fm(n, ts));
+            c = _mm256_and_ps(SH8(c, _MM_SHUFFLE(0, 0, 2, 1)), mask);
+            __m256 b = k.fm(SH8(n, _MM_SHUFFLE(3, 3, 3, 3)), c);
+            __m256 s = k.fm(b, b);
+            lv[i] = k.fa(k.fa(s, SH8(s, _MM_SHUFFLE(0, 3, 2, 1))), SH8(s, _MM_SHUFFLE(1, 0, 3, 2)));
+            kbad |= (k.clean() ? 0 : 1) << i;
+            nv[i] = n;
+            tv[i] = t;
+            bv[i] = b;
+        }
+        __m256 u01 = _mm256_unpacklo_ps(lv[0], lv[1]), u23 = _mm256_unpacklo_ps(lv[2], lv[3]);
+        __m256 L = _mm256_castpd_ps(_mm256_unpacklo_pd(_mm256_castps_pd(u01), _mm256_castps_pd(u23)));
+        __m256 gt = _mm256_castsi256_ps(_mm256_cmpgt_epi32(key8(L), eps));
+        Acc kn;
+        __m256 y = frsqest8(L);
+        __m256 e = kn.fnms(L, kn.fm(y, y), one);
+        __m256 r = kn.fma(e, kn.fm(y, half), y);
+        kb = kn.m;
+        __m256 res[4];
+        auto lane = [](__m256 v, int i) {
+            switch (i) {
+            case 0: return SH8(v, 0x00);
+            case 1: return SH8(v, 0x55);
+            case 2: return SH8(v, 0xaa);
+            default: return SH8(v, 0xff);
+            }
+        };
+        for (int i = 0; i < 4; i++) {
+            __m256 gi = lane(gt, i);
+            __m256 ri = lane(r, i);
+            __m256 nb = _mm256_mul_ps(bv[i], ri);
+            __m256 bad = _mm256_or_ps(lane(kb, i), special_ps(nb));
+            if (((kbad >> i) & 1) || !_mm256_testz_ps(bad, gi)) {
+                res[i] = binormal_exact(nv[i], tv[i]);
+                continue;
+            }
+            res[i] = _mm256_and_ps(_mm256_blendv_ps(pz8(bv[i]), pz8(nb), gi), mask);
+        }
+        for (int i = 0; i < 4; i++) {
+            uint32_t off = out + uint32_t(base + 2 * i) * 16;
+            st2(ls, off, off + 16, res[i]);
+        }
+    }
+}
+
 }
 
 void transform_vertexes(uint8_t* ls, uint32_t count, uint32_t src, uint32_t dst, uint32_t matrix, uint32_t r3_out[4]) {
@@ -133,6 +219,42 @@ void transform_vertexes(uint8_t* ls, uint32_t count, uint32_t src, uint32_t dst,
     };
     __m256 A = mk(0), B = mk(1), C = mk(2), D = mk(3);
     uint32_t groups = (count + 7) >> 3;
+    if (spuf::avx2_on()) {
+        const __m256i lim = _mm256_set1_epi32(0x5D7FFFFF);
+        const __m256i am = _mm256_set1_epi32(0x7FFFFFFF);
+        auto big = [&](__m256 v) { return _mm256_cmpgt_epi32(_mm256_and_si256(_mm256_castps_si256(v), am), lim); };
+        __m256i mb = _mm256_or_si256(_mm256_or_si256(big(A), big(B)), _mm256_or_si256(big(C), big(D)));
+        bool msmall = _mm256_testz_si256(mb, mb) != 0;
+        uint64_t sspan = 128ull * groups + 128, dspan = 128ull * (groups ? groups : 1);
+        bool flat = msmall && (src & 15) == 0 && (dst & 15) == 0 && src + sspan <= 0x40000 && dst + dspan <= 0x40000 && (src == dst || uint64_t(dst) + dspan <= src || uint64_t(src) + sspan <= dst);
+        if (flat) {
+            for (uint32_t g = 0; g < groups; g++) {
+                const uint8_t* sp = ls + src + 128 * g;
+                __m256 v[4];
+                __m256i vb = _mm256_setzero_si256();
+                for (int i = 0; i < 4; i++) {
+                    v[i] = ld8b(sp + 32 * i);
+                    vb = _mm256_or_si256(vb, big(v[i]));
+                }
+                __m256 o[4];
+                if (_mm256_testz_si256(vb, vb)) {
+                    for (int i = 0; i < 4; i++) {
+                        __m256 t = _mm256_mul_ps(v[i], A);
+                        t = _mm256_fmadd_ps(SH8(v[i], _MM_SHUFFLE(0, 3, 2, 1)), B, t);
+                        t = _mm256_fmadd_ps(SH8(v[i], _MM_SHUFFLE(1, 0, 3, 2)), C, t);
+                        o[i] = pz8(_mm256_fmadd_ps(SH8(v[i], _MM_SHUFFLE(2, 1, 0, 3)), D, t));
+                    }
+                } else
+                    for (int i = 0; i < 4; i++) o[i] = xform(v[i], A, B, C, D);
+                uint8_t* dp = ls + dst + 128 * g;
+                for (int i = 0; i < 4; i++) st8b(dp + 32 * i, o[i]);
+            }
+            uint32_t w[4];
+            quad_words(ls, src + 128 * groups + 112, w);
+            for (int i = 0; i < 4; i++) r3_out[i] = w[(i + 1) & 3];
+            return;
+        }
+    }
     __m256 prev[4];
     for (int i = 0; i < 4; i++) prev[i] = _mm256_setzero_ps();
     for (uint32_t g = 0; g <= groups; g++) {
@@ -181,6 +303,10 @@ void compute_binormals(uint8_t* ls, uint32_t ctx, int32_t count, uint32_t r3_out
     const __m256 mask = _mm256_castsi256_ps(_mm256_setr_epi32(-1, -1, -1, 0, -1, -1, -1, 0));
     const __m256 one = _mm256_set1_ps(1.0f), half = _mm256_set1_ps(0.5f);
     const __m256i eps = _mm256_set1_epi32(spuf::key(0x0da2425f));
+    if (spuf::avx2_on()) {
+        binormals_packed(ls, t1, t2, out, count);
+        return;
+    }
     for (int32_t base = 0; base < count; base += 8) {
         __m256 res[4];
         for (int i = 0; i < 4; i++) {

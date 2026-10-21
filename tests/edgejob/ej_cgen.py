@@ -50,6 +50,7 @@ G.configure(
     OPS_H="../pm/pm_ops.h",
     HEADER_BYTES=0x30,
     EXTRA_ROOTS=tuple(sorted(recorded_starts(0x4000, IMAGE) - NATIVES)),
+    DISPATCH_TABLE=True,
 )
 
 if __name__ == "__main__":

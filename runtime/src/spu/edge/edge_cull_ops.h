@@ -32,7 +32,12 @@ XO V ilh(uint32_t i) { return s16(i); }
 XO V ilhu(uint32_t i) { return s32(i << 16); }
 XO V ila(uint32_t i) { return s32(i); }
 XO V iohl(V t, uint32_t i) { return _mm_or_si128(t, s32(i)); }
-inline V fsmbi(uint32_t m) {
+XO V fsmbi(uint32_t m) {
+    if (spuf::avx2_on()) {
+        V b = _mm_shuffle_epi8(_mm_cvtsi32_si128(int(m)), _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1));
+        V bit = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+        return _mm_cmpeq_epi8(_mm_and_si128(b, bit), bit);
+    }
     alignas(16) uint8_t b[16];
     for (int i = 0; i < 16; i++) b[15 - i] = (m >> (15 - i)) & 1 ? 0xFF : 0;
     return _mm_load_si128(reinterpret_cast<const __m128i*>(b));
@@ -293,23 +298,69 @@ XO V fcgt(V x, V y) { return _mm_cmpgt_epi32(fkey(x), fkey(y)); }
 XO V fceq(V x, V y) { return _mm_cmpeq_epi32(fkey(x), fkey(y)); }
 XO V fcmgt(V x, V y) { return _mm_cmpgt_epi32(fmag(x), fmag(y)); }
 XO V fcmeq(V x, V y) { return _mm_cmpeq_epi32(fmag(x), fmag(y)); }
-inline V cflts_slow(V x, int i8) {
+XO V cvt_mag(V x, int i8, V& E) {
+    V e = _mm_and_si128(_mm_srli_epi32(x, 23), s32(0xff));
+    V ez = _mm_cmpeq_epi32(e, _mm_setzero_si128());
+    E = _mm_andnot_si128(ez, _mm_add_epi32(e, s32(uint32_t(46 - i8))));
+    V mant = _mm_or_si128(_mm_and_si128(x, s32(0x7fffff)), s32(0x800000));
+    V d = _mm_sub_epi32(s32(23), E);
+    V r = _mm_or_si128(_mm_srlv_epi32(mant, d), _mm_sllv_epi32(mant, _mm_sub_epi32(_mm_setzero_si128(), d)));
+    return _mm_andnot_si128(ez, r);
+}
+XO V cfltu_v(V x, int i8) {
+    V E;
+    V r = cvt_mag(x, i8, E);
+    r = _mm_or_si128(r, _mm_cmpgt_epi32(E, s32(31)));
+    return _mm_andnot_si128(_mm_srai_epi32(x, 31), r);
+}
+XO V cflts_v(V x, int i8) {
+    V E;
+    V r = cvt_mag(x, i8, E);
+    V neg = _mm_srai_epi32(x, 31);
+    r = _mm_sub_epi32(_mm_xor_si128(r, neg), neg);
+    V sat = _mm_xor_si128(s32(0x7FFFFFFF), neg);
+    return _mm_blendv_epi8(r, sat, _mm_cmpgt_epi32(E, s32(30)));
+}
+XO V ifscale(V x, int i8) { return I(_mm_mul_ps(_mm_cvtepi32_ps(x), F(s32(uint32_t(127 + i8 - 155) << 23)))); }
+inline V cflts_scalar(V x, int i8) {
     alignas(16) uint32_t a[4];
     _mm_store_si128(reinterpret_cast<__m128i*>(a), x);
     for (auto& v : a) v = uint32_t(spuf::cflts(v, i8));
     return _mm_load_si128(reinterpret_cast<const __m128i*>(a));
 }
-inline V cfltu(V x, int i8) {
+inline V cfltu_scalar(V x, int i8) {
     alignas(16) uint32_t a[4];
     _mm_store_si128(reinterpret_cast<__m128i*>(a), x);
     for (auto& v : a) v = spuf::cfltu(v, i8);
     return _mm_load_si128(reinterpret_cast<const __m128i*>(a));
 }
-inline V cuflt_slow(V x, int i8) {
+inline V cuflt_scalar(V x, int i8) {
     alignas(16) uint32_t a[4];
     _mm_store_si128(reinterpret_cast<__m128i*>(a), x);
     for (auto& v : a) v = spuf::cuflt(v, i8);
     return _mm_load_si128(reinterpret_cast<const __m128i*>(a));
+}
+inline V csflt_scalar(V x, int i8) {
+    alignas(16) uint32_t a[4];
+    _mm_store_si128(reinterpret_cast<__m128i*>(a), x);
+    for (auto& v : a) v = spuf::csflt(int32_t(v), i8);
+    return _mm_load_si128(reinterpret_cast<const __m128i*>(a));
+}
+XO V cflts_slow(V x, int i8) {
+    if (spuf::avx2_on()) return cflts_v(x, i8);
+    return cflts_scalar(x, i8);
+}
+XO V cfltu(V x, int i8) {
+    if (spuf::avx2_on()) return cfltu_v(x, i8);
+    return cfltu_scalar(x, i8);
+}
+XO V cuflt_slow(V x, int i8) {
+    if (spuf::avx2_on() && i8 >= 30 && i8 <= 258 && _mm_testz_si128(x, s32(0xff000000u))) return ifscale(x, i8);
+    return cuflt_scalar(x, i8);
+}
+XO V csflt(V x, int i8) {
+    if (spuf::avx2_on() && i8 >= 30 && i8 <= 258 && _mm_testz_si128(_mm_add_epi32(x, s32(0x1000000)), s32(0xfe000000u))) return ifscale(x, i8);
+    return csflt_scalar(x, i8);
 }
 XO V cflts(V x, int i8) {
     if (i8 != 173) return cflts_slow(x, i8);
@@ -321,12 +372,6 @@ XO V cflts(V x, int i8) {
 XO V cuflt(V x, int i8) {
     if (i8 != 155 || _mm_movemask_ps(F(x))) return cuflt_slow(x, i8);
     return I(_mm_cvtepi32_ps(x));
-}
-inline V csflt(V x, int i8) {
-    alignas(16) uint32_t a[4];
-    _mm_store_si128(reinterpret_cast<__m128i*>(a), x);
-    for (auto& v : a) v = spuf::csflt(int32_t(v), i8);
-    return _mm_load_si128(reinterpret_cast<const __m128i*>(a));
 }
 
 #undef XO
