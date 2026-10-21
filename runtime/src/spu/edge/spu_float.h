@@ -5,9 +5,19 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace spuf {
+
+inline bool avx2_env() {
+    const char* e = std::getenv("GOWA_EDGE_AVX2");
+    return !(e && e[0] == '0');
+}
+
+inline const bool g_avx2 = avx2_env();
+
+inline bool avx2_on() { return g_avx2; }
 
 struct CsrGuard {
     unsigned old;
