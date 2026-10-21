@@ -66,7 +66,10 @@ SpuThread::SpuThread() {
     ctx.block_valid = region_valid.data();
 }
 
-SpuThread::~SpuThread() { _aligned_free(ls); }
+SpuThread::~SpuThread() {
+    rsv::park_free(park_slot);
+    _aligned_free(ls);
+}
 
 template <class Pred>
 bool SpuThread::block(std::unique_lock<std::mutex>& lk, Pred pred) {
@@ -75,7 +78,9 @@ bool SpuThread::block(std::unique_lock<std::mutex>& lk, Pred pred) {
             ctx.halted = true;
             return false;
         }
+        waiting.store(3, std::memory_order_relaxed);
         cv.wait_for(lk, std::chrono::microseconds(100));
+        waiting.store(0, std::memory_order_relaxed);
     }
     return true;
 }
@@ -267,11 +272,29 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
                 uint64_t rt = rtime;
                 uint8_t snap[128];
                 std::memcpy(snap, rdata, 128);
-                lk.unlock();
-                rsv::wait_lost(line, rt, snap, 1000);
-                lk.lock();
+                if (park_slot >= 0 && rsv::park_enabled()) {
+                    uint32_t w0 = rsv::park_word(park_slot);
+                    int64_t limit = -1;
+                    if ((event_mask & EV_TM) && !dec_frozen) {
+                        uint64_t elapsed = timebase_now() - dec_start;
+                        limit = elapsed >= dec_value ? 0 : static_cast<int64_t>((dec_value - elapsed) / 80);
+                    }
+                    lk.unlock();
+                    waiting.store(1, std::memory_order_relaxed);
+                    rsv::wait_parked(line, rt, snap, park_slot, w0, limit, stop_flag);
+                    waiting.store(0, std::memory_order_relaxed);
+                    lk.lock();
+                } else {
+                    lk.unlock();
+                    waiting.store(1, std::memory_order_relaxed);
+                    rsv::wait_lost(line, rt, snap, 1000);
+                    waiting.store(0, std::memory_order_relaxed);
+                    lk.lock();
+                }
             } else {
+                waiting.store(2, std::memory_order_relaxed);
                 cv.wait_for(lk, std::chrono::microseconds(100));
+                waiting.store(0, std::memory_order_relaxed);
             }
             collect_events();
         }
@@ -1683,6 +1706,7 @@ std::vector<SpuThread*> g_reg;
 
 void occupancy_sampler() {
     std::map<std::pair<uint32_t, uint32_t>, uint64_t> by_job;
+    std::map<uint32_t, uint64_t> kpcs;
     uint64_t conc[8] = {};
     uint64_t samples = 0;
     auto last = std::chrono::steady_clock::now();
@@ -1702,7 +1726,10 @@ void occupancy_sampler() {
                 uint32_t src = t->line_src[(pc & 0x3FFFF) >> 7];
                 bool job = pc >= 0x4000;
                 if (job) busy++;
-                by_job[{job ? wid : 0xFFFFFFFFu, job ? src : 0}]++;
+                uint32_t w = t->waiting.load(std::memory_order_relaxed);
+                if (w) by_job[{0xFFFFFFF0u + w, 0}]++;
+                else by_job[{job ? wid : 0xFFFFFFFFu, job ? src : 0}]++;
+                if (!w && !job) kpcs[pc & ~0xFu]++;
             }
         }
         conc[(std::min)(busy, 7)]++;
@@ -1716,10 +1743,24 @@ void occupancy_sampler() {
         for (size_t i = 0; i < v.size() && i < 40; i++) {
             char b[64];
             if (v[i].first.first == 0xFFFFFFFFu) std::snprintf(b, sizeof b, " [kernel %.2f]", double(v[i].second) / samples);
+            else if (v[i].first.first > 0xFFFFFFF0u) std::snprintf(b, sizeof b, " [hostwait%u %.2f]", v[i].first.first - 0xFFFFFFF0u, double(v[i].second) / samples);
             else std::snprintf(b, sizeof b, " [wid %u %08x %.2f]", v[i].first.first, v[i].first.second, double(v[i].second) / samples);
             line += b;
         }
         LOG_INFO("spuocc", "avg SPUs per job:%s", line.c_str());
+        {
+            std::vector<std::pair<uint32_t, uint64_t>> kv(kpcs.begin(), kpcs.end());
+            std::sort(kv.begin(), kv.end(), [](auto& a, auto& b) { return a.second > b.second; });
+            std::string k;
+            for (size_t i = 0; i < kv.size() && i < 16; i++) {
+                char b[48];
+                std::snprintf(b, sizeof b, " %05x:%.3f", kv[i].first, double(kv[i].second) / samples);
+                k += b;
+            }
+            LOG_INFO("spuocc", "kernel spin pcs:%s", k.c_str());
+            LOG_INFO("spuocc", "lr waits:%s", rsv::wait_stats_take().c_str());
+            kpcs.clear();
+        }
         std::string c;
         for (int i = 0; i < 8; i++) {
             char b[32];
@@ -1825,6 +1866,7 @@ void Group::stop_all() {
         if (!t) continue;
         t->stop_flag = true;
         t->cv.notify_all();
+        rsv::park_kick(t->park_slot);
     }
 }
 

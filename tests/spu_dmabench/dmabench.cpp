@@ -5,11 +5,15 @@
 #include "ppu/context.h"
 
 #include <intrin.h>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <thread>
 #include <mutex>
@@ -123,6 +127,90 @@ int stress(uint32_t base, int iters) {
     return got == want && pgot == want && torn == 0 ? 0 : 1;
 }
 
+int park_ring(uint32_t base, int rounds, int n, int hold_us) {
+    const uint32_t line = base + 0xC30000;
+    for (uint32_t i = 0; i < 128; i += 4) vm::write32(line + i, 0);
+    const uint32_t total = uint32_t(rounds * n);
+    std::atomic<uint64_t> waits{0}, slow{0}, max_us{0}, retries{0};
+    std::atomic<bool> done{false};
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> ts;
+    std::vector<std::shared_ptr<spu::SpuThread>> threads;
+    for (int k = 0; k < n; k++) threads.push_back(std::make_shared<spu::SpuThread>());
+    for (int k = 0; k < n; k++)
+        ts.emplace_back([&, k] {
+            auto t = threads[k];
+            spu::Host& h = *t;
+            ppu::Context pc{};
+            h.write_channel(1, 0x400);
+            for (;;) {
+                mfc(h, 0xD0, 0x80, line, 0x80, 0);
+                h.read_channel(27);
+                uint32_t v;
+                std::memcpy(&v, t->ls + 0x80, 4);
+                v = __builtin_bswap32(v);
+                if (v >= total) break;
+                if (v % uint32_t(n) == uint32_t(k)) {
+                    if (hold_us && (v % 3) == 0) {
+                        auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(hold_us * int((v / 3) % 4));
+                        while (std::chrono::steady_clock::now() < until) _mm_pause();
+                    }
+                    int how = int((v / uint32_t(n)) % 4);
+                    bool ok = false;
+                    if (how == 0) {
+                        uint32_t nv = __builtin_bswap32(v + 1);
+                        std::memcpy(t->ls + 0x80, &nv, 4);
+                        mfc(h, 0xB4, 0x80, line, 0x80, 0);
+                        ok = h.read_channel(27) == 0;
+                    } else if (how == 1) {
+                        uint32_t cur = ppu::lwarx(pc, vm::g_base, line);
+                        ok = cur == v && ppu::stwcx(pc, vm::g_base, line, v + 1);
+                    } else if (how == 2) {
+                        vm::write32(line, v + 1);
+                        ok = true;
+                    } else {
+                        uint32_t nv = __builtin_bswap32(v + 1);
+                        std::memcpy(t->ls + 0x80, &nv, 4);
+                        mfc(h, 0xB0, 0x80, line, 0x80, 0);
+                        h.read_channel(27);
+                        ok = true;
+                    }
+                    if (!ok) retries++;
+                    continue;
+                }
+                auto w0 = std::chrono::steady_clock::now();
+                uint32_t e = h.read_channel(0);
+                h.write_channel(2, e);
+                uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - w0).count();
+                waits++;
+                if (us >= uint64_t(hold_us) * 3 + 1500) slow++;
+                uint64_t m = max_us.load();
+                while (us > m && !max_us.compare_exchange_weak(m, us)) {
+                }
+            }
+            h.write_channel(1, 0);
+        });
+    std::thread mbox([&] {
+        uint32_t i = 0;
+        while (!done.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            threads[i++ % uint32_t(n)]->push_in_mbox(i);
+        }
+    });
+    for (auto& t : ts) t.join();
+    done = true;
+    mbox.join();
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    uint32_t got = vm::read32(line);
+    FILETIME c0, e0, k0, u0;
+    GetProcessTimes(GetCurrentProcess(), &c0, &e0, &k0, &u0);
+    auto ft = [](FILETIME f) { return double((uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime) / 10000.0; };
+    std::printf("park ring cpu: user %.0f ms kernel %.0f ms over %.0f ms wall\n", ft(u0), ft(k0), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    std::printf("park ring: %d threads, counter %u/%u, %.1f ms (%.2f us/handoff), waits %llu, slow waits %llu, max wait %llu us, retries %llu\n", n, got, total, ms, ms * 1000.0 / total,
+                (unsigned long long)waits.load(), (unsigned long long)slow.load(), (unsigned long long)max_us.load(), (unsigned long long)retries.load());
+    return got == total && slow == 0 ? 0 : 1;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -130,6 +218,11 @@ int main(int argc, char** argv) {
     const uint32_t base = 0x30000000;
     vm::map(base, 0x01000000);
     for (uint32_t i = 0; i < 0x01000000; i += 4) vm::write32(base + i, i * 2654435761u);
+    if (argc > 1 && std::string(argv[1]) == "park") {
+        int r = park_ring(base, argc > 2 ? std::atoi(argv[2]) : 20000, argc > 3 ? std::atoi(argv[3]) : 6, argc > 4 ? std::atoi(argv[4]) : 0);
+        std::fflush(stdout);
+        std::_Exit(r);
+    }
     if (argc > 1 && std::string(argv[1]) == "stress") {
         int r = stress(base, argc > 2 ? std::atoi(argv[2]) : 200000);
         std::fflush(stdout);

@@ -188,13 +188,68 @@ void decode_pos_fast(const uint8_t* ls, uint32_t verts, uint32_t stride, uint32_
     for (; v < n; v++) pf.decode(ls, verts + stride * v, out + 16 * v);
 }
 
+inline __m256 pz8v(__m256 r) { return _mm256_andnot_ps(_mm256_cmp_ps(r, _mm256_setzero_ps(), _CMP_EQ_OQ), r); }
+
+uint32_t decode_pos_v2(const uint8_t* ls, uint32_t verts, uint32_t stride, uint32_t n, const PosFmt& pf, uint8_t* out) {
+    __m256i sh_l[3], sh_r[3], off[3], fr[3], frs[3];
+    uint32_t pos = 0;
+    for (int c = 0; c < 3; c++) {
+        sh_l[c] = _mm256_set1_epi64x(pos);
+        sh_r[c] = _mm256_set1_epi64x(64 - pf.wid[c]);
+        pos += pf.wid[c];
+        off[c] = _mm256_set1_epi32(int(pf.off[c]));
+        fr[c] = _mm256_set1_epi32(int(pf.frac[c]));
+        frs[c] = _mm256_set1_epi32(int((32 - pf.frac[c]) & 63));
+    }
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 s32 = _mm256_castsi256_ps(_mm256_set1_epi32(int((127 - 32) << 23)));
+    const __m256 s31 = _mm256_castsi256_ps(_mm256_set1_epi32(int((127 - 31) << 23)));
+    const __m256i bs = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    uint32_t v = 0;
+    for (; v + 8 <= n; v += 8) {
+        const uint8_t* p = ls + verts + stride * v;
+        __m256i wa = _mm256_setr_epi64x(int64_t(ld64be(p)), int64_t(ld64be(p + stride)), int64_t(ld64be(p + 2 * stride)), int64_t(ld64be(p + 3 * stride)));
+        __m256i wb = _mm256_setr_epi64x(int64_t(ld64be(p + 4 * stride)), int64_t(ld64be(p + 5 * stride)), int64_t(ld64be(p + 6 * stride)), int64_t(ld64be(p + 7 * stride)));
+        __m256 r[3];
+        for (int c = 0; c < 3; c++) {
+            __m256i fa = _mm256_srlv_epi64(_mm256_sllv_epi64(wa, sh_l[c]), sh_r[c]);
+            __m256i fb = _mm256_srlv_epi64(_mm256_sllv_epi64(wb, sh_l[c]), sh_r[c]);
+            __m256i f = _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castsi256_ps(fa), _mm256_castsi256_ps(fb), _MM_SHUFFLE(2, 0, 2, 0)));
+            f = _mm256_permute4x64_epi64(f, _MM_SHUFFLE(3, 1, 2, 0));
+            __m256i sum = _mm256_add_epi32(f, off[c]);
+            __m256i ip = _mm256_srav_epi32(sum, fr[c]);
+            __m256i fp = _mm256_sllv_epi32(sum, frs[c]);
+            __m256 a = _mm256_cvtepi32_ps(ip);
+            __m256i hi = _mm256_srai_epi32(fp, 31);
+            __m256i sel = _mm256_blendv_epi8(fp, _mm256_srli_epi32(fp, 1), hi);
+            __m256 b = _mm256_mul_ps(_mm256_cvtepi32_ps(sel), _mm256_blendv_ps(s32, s31, _mm256_castsi256_ps(hi)));
+            r[c] = pz8v(_mm256_add_ps(a, b));
+        }
+        __m256 t0 = _mm256_unpacklo_ps(r[0], r[1]), t1 = _mm256_unpackhi_ps(r[0], r[1]);
+        __m256 t2 = _mm256_unpacklo_ps(r[2], one), t3 = _mm256_unpackhi_ps(r[2], one);
+        __m256 q[4] = {_mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0)), _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2)), _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0)), _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2))};
+        uint8_t* dst = out + 16 * v;
+        for (int k = 0; k < 4; k++) {
+            __m256i b = _mm256_shuffle_epi8(_mm256_castps_si256(q[k]), bs);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 16 * k), _mm256_castsi256_si128(b));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 16 * (k + 4)), _mm256_extracti128_si256(b, 1));
+        }
+    }
+    return v;
+}
+
+void decode_pos_any(const uint8_t* ls, uint32_t verts, uint32_t stride, uint32_t n, const PosFmt& pf, uint8_t* out) {
+    uint32_t v = spuf::avx2_on() ? decode_pos_v2(ls, verts, stride, n, pf, out) : 0;
+    decode_pos_fast(ls, verts + stride * v, stride, n - v, pf, out + 16 * v);
+}
+
 bool run_pos(uint8_t* ls, uint32_t ctx, uint32_t verts, uint32_t nv, const PosFmt& pf, uint32_t stride, Outputs* outs) {
     uint32_t k = alloc_table(ls, ctx, 1);
     uint32_t table = rd32(ls, ctx + 16 + 4 * k);
     wr32(ls, ctx + 92, table);
     uint32_t n2 = (nv + 1) & ~1u;
     bool ok = fast() && in_ls(verts, stride * n2 + 8) && in_ls(table, 16 * n2) && disjoint(verts, stride * n2 + 8, table, 16 * n2);
-    if (ok) decode_pos_fast(ls, verts, stride, n2, pf, ls + table);
+    if (ok) decode_pos_any(ls, verts, stride, n2, pf, ls + table);
     else
         for (uint32_t v = 0; v < n2; v++) pf.decode(ls, verts + stride * v, ls + ((table + 16 * v) & kMask));
     if (outs) {
@@ -410,6 +465,58 @@ inline void unit_fast2(uint32_t ga, uint32_t gb, uint32_t gc, uint32_t gd, const
     _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 48), shufb_be(_mm_or_si128(_mm_andnot_si128(sm, r1), _mm_and_si128(sm, ps.pat[s3])), a1, ps.ctl[1][s3]));
 }
 
+inline uint64_t ld64u(const uint8_t* p) {
+    uint64_t v;
+    std::memcpy(&v, p, 8);
+    return v;
+}
+
+inline __m128i shufb_simple(__m128i a, __m128i b, __m128i ctl) {
+    __m128i ra = _mm_shuffle_epi8(a, ctl);
+    __m128i rb = _mm_shuffle_epi8(b, ctl);
+    return _mm_blendv_epi8(ra, rb, _mm_slli_epi16(ctl, 3));
+}
+
+inline bool unit_v2(const uint8_t* src, uint32_t stride, const PatSet& ps, uint32_t simple, uint8_t* out) {
+    __m256i w = _mm256_setr_epi64x(int64_t(ld64u(src)), int64_t(ld64u(src + stride)), int64_t(ld64u(src + 2 * stride)), int64_t(ld64u(src + 3 * stride)));
+    const __m256i pick = _mm256_setr_epi8(2, 1, 0, -1, 2, 1, 0, -1, 10, 9, 8, -1, 10, 9, 8, -1, 2, 1, 0, -1, 2, 1, 0, -1, 10, 9, 8, -1, 10, 9, 8, -1);
+    __m256i g = _mm256_shuffle_epi8(w, pick);
+    __m256i f = _mm256_and_si256(_mm256_srlv_epi32(g, _mm256_setr_epi32(14, 4, 14, 4, 14, 4, 14, 4)), _mm256_set1_epi32(0x3ff));
+    __m256 x = _mm256_castsi256_ps(_mm256_or_si256(f, _mm256_set1_epi32(0x3f800000)));
+    __m256 a = pz8v(_mm256_fmadd_ps(x, _mm256_set1_ps(kUA), _mm256_set1_ps(kUB)));
+    __m256 sq = _mm256_mul_ps(a, a);
+    __m256 sh = _mm256_castsi256_ps(_mm256_srli_si256(_mm256_castps_si256(sq), 4));
+    __m256 m = _mm256_sub_ps(_mm256_set1_ps(1.0f), _mm256_add_ps(sq, sh));
+    __m256 rr = _mm256_mul_ps(m, frsqest8(m));
+    __m256 rmag = _mm256_and_ps(rr, _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)));
+    if (!_mm256_testz_ps(_mm256_cmp_ps(rmag, _mm256_castsi256_ps(_mm256_set1_epi32(0x7f7fffff)), _CMP_NLT_UQ), _mm256_castsi256_ps(_mm256_set1_epi32(-1)))) return false;
+    __m256 root = pz8v(rr);
+    const __m256i bs = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    __m256i rbe = _mm256_shuffle_epi8(_mm256_castps_si256(root), bs);
+    __m256i abe = _mm256_shuffle_epi8(_mm256_castps_si256(a), bs);
+    const __m128i sm = _mm_setr_epi8(-128, 0, 0, 0, -128, 0, 0, 0, -128, 0, 0, 0, -1, -1, -1, -1);
+    __m128i r0 = _mm256_castsi256_si128(rbe), r1 = _mm256_extracti128_si256(rbe, 1);
+    __m128i a0 = _mm256_castsi256_si128(abe), a1 = _mm256_extracti128_si256(abe, 1);
+    uint32_t s0 = src[2] & 15, s1 = src[stride + 2] & 15, s2 = src[2 * stride + 2] & 15, s3 = src[3 * stride + 2] & 15;
+    __m128i base0 = _mm_andnot_si128(sm, r0), base1 = _mm_andnot_si128(sm, r1);
+    __m128i q0 = _mm_or_si128(base0, _mm_and_si128(sm, ps.pat[s0]));
+    __m128i q1 = _mm_or_si128(base0, _mm_and_si128(sm, ps.pat[s1]));
+    __m128i q2 = _mm_or_si128(base1, _mm_and_si128(sm, ps.pat[s2]));
+    __m128i q3 = _mm_or_si128(base1, _mm_and_si128(sm, ps.pat[s3]));
+    if ((((simple >> s0) & (simple >> s1) & (simple >> s2) & (simple >> s3)) & 1) != 0) {
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out), shufb_simple(q0, a0, ps.ctl[0][s0]));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 16), shufb_simple(q1, a0, ps.ctl[1][s1]));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 32), shufb_simple(q2, a1, ps.ctl[0][s2]));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 48), shufb_simple(q3, a1, ps.ctl[1][s3]));
+    } else {
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out), shufb_be(q0, a0, ps.ctl[0][s0]));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 16), shufb_be(q1, a0, ps.ctl[1][s1]));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 32), shufb_be(q2, a1, ps.ctl[0][s2]));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 48), shufb_be(q3, a1, ps.ctl[1][s3]));
+    }
+    return true;
+}
+
 bool run_unit(uint8_t* ls, uint32_t ctx, uint32_t verts, uint32_t nv, const PosFmt& pf, const uint8_t* spill, uint32_t stride, int ngroups, const uint32_t* attrs, const uint32_t* slots, Outputs* outs, bool raw_pos = false, uint32_t uoff = 6) {
     auto decode_one = [&](uint32_t a, uint8_t* o) {
         if (raw_pos) {
@@ -446,13 +553,23 @@ bool run_unit(uint8_t* ls, uint32_t ctx, uint32_t verts, uint32_t nv, const PosF
                 spuf::stf(ls + t0 + 16 * v + 12, 1.0f);
             }
         } else
-            decode_pos_fast(ls, verts, stride, n2, pf, ls + t0);
+            decode_pos_any(ls, verts, stride, n2, pf, ls + t0);
         for (int g = 0; g < ngroups; g++) std::memset(ls + tg[g] + 16 * n2, 0, 32);
         for (int g = 0; g < ngroups; g++) {
             uint8_t* dst = ls + tg[g];
             const uint8_t* src = ls + verts + uoff + 3 * g;
             uint32_t v = 0;
             auto g3 = [](const uint8_t* p) { return (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | p[2]; };
+            if (spuf::avx2_on()) {
+                uint32_t simple = 0;
+                for (int k = 0; k < 16; k++)
+                    if (_mm_movemask_epi8(_mm_or_si128(ps.ctl[0][k], ps.ctl[1][k])) == 0) simple |= 1u << k;
+                auto g3 = [](const uint8_t* p) { return (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | p[2]; };
+                for (; v + 4 <= n2; v += 4) {
+                    const uint8_t* p = src + stride * v;
+                    if (!unit_v2(p, stride, ps, simple, dst + 16 * v)) unit_fast2(g3(p), g3(p + stride), g3(p + 2 * stride), g3(p + 3 * stride), ps, dst + 16 * v);
+                }
+            }
             for (; v + 4 <= n2; v += 4) {
                 const uint8_t* p = src + stride * v;
                 unit_fast2(g3(p), g3(p + stride), g3(p + 2 * stride), g3(p + 3 * stride), ps, dst + 16 * v);
@@ -507,10 +624,52 @@ bool run_unit(uint8_t* ls, uint32_t ctx, uint32_t verts, uint32_t nv, const PosF
 
 uint64_t overlay_hash(const uint8_t* p, uint32_t n) { return hash64(p, n); }
 
+namespace {
+
+struct OvCache {
+    uint64_t hash = 0;
+    uint32_t size = 0;
+    uint8_t bytes[0x940];
+};
+
+constexpr int kOvSlots = 16;
+
+}
+
+bool overlay_matches(const uint8_t* p, uint32_t n, uint64_t hash) {
+    thread_local OvCache cache[kOvSlots];
+    thread_local int next = 0;
+    bool use = spuf::avx2_on() && n <= sizeof cache[0].bytes;
+    if (use)
+        for (OvCache& c : cache)
+            if (c.size == n && c.hash == hash) {
+                if (std::memcmp(c.bytes, p, n) == 0) return true;
+                break;
+            }
+    if (hash64(p, n) != hash) return false;
+    if (use) {
+        OvCache* slot = nullptr;
+        for (OvCache& c : cache)
+            if (c.size == n && c.hash == hash) slot = &c;
+        if (!slot) slot = &cache[next++ % kOvSlots];
+        slot->hash = hash;
+        slot->size = n;
+        std::memcpy(slot->bytes, p, n);
+    }
+    return true;
+}
+
 int vdecomp_identify(const uint8_t* ls, uint32_t entry) {
     entry &= 0x3fff0;
     uint64_t head;
     std::memcpy(&head, ls + entry, 8);
+    if (spuf::avx2_on()) {
+        for (const Sig& s : kSigs) {
+            if (s.head != head || entry + s.size > kLs) continue;
+            if (overlay_matches(ls + entry, s.size, s.hash)) return s.id;
+        }
+        return -1;
+    }
     uint32_t last = 0;
     uint64_t h = 0;
     for (const Sig& s : kSigs) {
