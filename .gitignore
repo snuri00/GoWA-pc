@@ -31,3 +31,9 @@ __pycache__/
 /docs/
 *.md
 /run/
+build_tc/
+build_edge/
+build_renjob/
+build_cs/
+/dlss/
+/third_party/streamline/

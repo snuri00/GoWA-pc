@@ -18,6 +18,7 @@ struct VkCtx {
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queue_family = 0;
     VkPhysicalDeviceFeatures features{};
+    bool cache_control = false;
 };
 
 const VkCtx& vk();

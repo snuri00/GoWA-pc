@@ -20,6 +20,7 @@ struct Press {
     uint32_t offset;
     uint16_t mask;
     uint32_t pressure;
+    uint16_t axis_value;
 };
 
 bool g_init = false;
@@ -28,6 +29,18 @@ uint32_t g_setting = 0;
 std::once_flag g_script_once;
 std::vector<Press> g_script;
 std::chrono::steady_clock::time_point g_start = std::chrono::steady_clock::now();
+
+bool axis_of(const std::string& name, uint32_t& offset, uint16_t& value) {
+    if (name.size() != 3 || (name[2] != '+' && name[2] != '-')) return false;
+    std::string a = name.substr(0, 2);
+    if (a == "rx") offset = 4;
+    else if (a == "ry") offset = 5;
+    else if (a == "lx") offset = 6;
+    else if (a == "ly") offset = 7;
+    else return false;
+    value = name[2] == '+' ? 0xFF : 0x00;
+    return true;
+}
 
 bool button_of(const std::string& name, uint32_t& offset, uint16_t& mask, uint32_t& pressure) {
     struct B { const char* n; uint32_t o; uint16_t m; uint32_t p; };
@@ -59,7 +72,9 @@ void load_script() {
         std::string item = s.substr(pos, end - pos);
         size_t at = item.find('@');
         Press p{};
-        if (at != std::string::npos && button_of(item.substr(0, at), p.offset, p.mask, p.pressure)) {
+        bool axis = at != std::string::npos && axis_of(item.substr(0, at), p.offset, p.axis_value);
+        if (axis) p.mask = 0;
+        if (at != std::string::npos && (axis || button_of(item.substr(0, at), p.offset, p.mask, p.pressure))) {
             std::string when = item.substr(at + 1);
             size_t colon = when.find(':');
             p.at = std::atof(when.substr(0, colon).c_str());
@@ -81,11 +96,18 @@ void fill(uint32_t out) {
     b[23] = 0x200;
     for (const Press& p : g_script) {
         if (now >= p.at && now < p.at + p.hold) {
+            if (!p.mask) {
+                b[p.offset] = p.axis_value;
+                continue;
+            }
             b[p.offset] |= p.mask;
             if (p.pressure) b[p.pressure] = 0xFF;
         }
     }
     host::poll_pad(b);
+    for (const Press& p : g_script) {
+        if (!p.mask && now >= p.at && now < p.at + p.hold) b[p.offset] = p.axis_value;
+    }
     vm::write32(out, 24);
     for (int i = 0; i < 24; i++) vm::write16(out + 4 + i * 2, b[i]);
 }

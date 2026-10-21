@@ -4,6 +4,7 @@
 #include <xinput.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 
@@ -36,11 +37,22 @@ bool focused() {
 
 bool key(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-uint16_t axis(SHORT v, bool invert) {
-    int x = v / 256 + 128;
-    if (invert) x = 255 - x;
-    return static_cast<uint16_t>(std::clamp(x, 0, 255));
+void stick(SHORT sx, SHORT sy, int deadzone, uint16_t& ox, uint16_t& oy) {
+    float x = sx, y = sy;
+    float mag = std::sqrt(x * x + y * y);
+    if (mag <= deadzone) {
+        ox = oy = 128;
+        return;
+    }
+    float scale = (std::min(mag, 32767.0f) - deadzone) / (32767.0f - deadzone) / mag;
+    x *= scale;
+    y *= scale;
+    ox = static_cast<uint16_t>(std::clamp(static_cast<int>(std::lround(128.0f + x * 127.0f)), 0, 255));
+    oy = static_cast<uint16_t>(std::clamp(static_cast<int>(std::lround(128.0f - y * 127.0f)), 0, 255));
 }
+
+int g_slot = -1;
+ULONGLONG g_next_scan = 0;
 
 void press(uint16_t* b, uint32_t offset, uint16_t mask, uint32_t pressure) {
     b[offset] |= mask;
@@ -53,7 +65,18 @@ void poll_pad(uint16_t* b) {
     std::call_once(g_once, load);
     if (g_xinput) {
         XINPUT_STATE st{};
-        if (g_xinput(0, &st) == ERROR_SUCCESS) {
+        bool have = g_slot >= 0 && g_xinput(static_cast<DWORD>(g_slot), &st) == ERROR_SUCCESS;
+        if (!have && GetTickCount64() >= g_next_scan) {
+            g_slot = -1;
+            for (DWORD i = 0; i < 4 && !have; i++) {
+                if (g_xinput(i, &st) == ERROR_SUCCESS) {
+                    g_slot = static_cast<int>(i);
+                    have = true;
+                }
+            }
+            if (!have) g_next_scan = GetTickCount64() + 1000;
+        }
+        if (have) {
             WORD w = st.Gamepad.wButtons;
             if (w & XINPUT_GAMEPAD_BACK) press(b, 2, 0x01, 0);
             if (w & XINPUT_GAMEPAD_LEFT_THUMB) press(b, 2, 0x02, 0);
@@ -63,18 +86,22 @@ void poll_pad(uint16_t* b) {
             if (w & XINPUT_GAMEPAD_DPAD_RIGHT) press(b, 2, 0x20, 8);
             if (w & XINPUT_GAMEPAD_DPAD_DOWN) press(b, 2, 0x40, 11);
             if (w & XINPUT_GAMEPAD_DPAD_LEFT) press(b, 2, 0x80, 9);
-            if (st.Gamepad.bLeftTrigger > 64) press(b, 3, 0x01, 18);
-            if (st.Gamepad.bRightTrigger > 64) press(b, 3, 0x02, 19);
+            if (st.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) {
+                b[3] |= 0x01;
+                b[18] = st.Gamepad.bLeftTrigger;
+            }
+            if (st.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) {
+                b[3] |= 0x02;
+                b[19] = st.Gamepad.bRightTrigger;
+            }
             if (w & XINPUT_GAMEPAD_LEFT_SHOULDER) press(b, 3, 0x04, 16);
             if (w & XINPUT_GAMEPAD_RIGHT_SHOULDER) press(b, 3, 0x08, 17);
             if (w & XINPUT_GAMEPAD_Y) press(b, 3, 0x10, 12);
             if (w & XINPUT_GAMEPAD_B) press(b, 3, 0x20, 13);
             if (w & XINPUT_GAMEPAD_A) press(b, 3, 0x40, 14);
             if (w & XINPUT_GAMEPAD_X) press(b, 3, 0x80, 15);
-            b[4] = axis(st.Gamepad.sThumbRX, false);
-            b[5] = axis(st.Gamepad.sThumbRY, true);
-            b[6] = axis(st.Gamepad.sThumbLX, false);
-            b[7] = axis(st.Gamepad.sThumbLY, true);
+            stick(st.Gamepad.sThumbRX, st.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, b[4], b[5]);
+            stick(st.Gamepad.sThumbLX, st.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, b[6], b[7]);
         }
     }
     if (!focused()) return;

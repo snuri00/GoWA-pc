@@ -293,6 +293,7 @@ LV2_SYSCALL(181, sys_spu_thread_write_ls) {
     uint64_t v = u64arg(ctx, 2);
     if (lsa >= 0x40000 || (type != 1 && type != 2 && type != 4 && type != 8) || lsa % type) return CELL_EINVAL;
     for (uint32_t i = 0; i < type; i++) t->ls[lsa + i] = static_cast<uint8_t>(v >> (8 * (type - 1 - i)));
+    t->mark_ls(lsa, type);
     return CELL_OK;
 }
 

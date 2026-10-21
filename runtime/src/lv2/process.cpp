@@ -2,8 +2,11 @@
 #include "object.h"
 #include "runtime/loader.h"
 #include "runtime/vfs.h"
+#include "runtime/log.h"
 
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <thread>
 
@@ -92,6 +95,16 @@ LV2_SYSCALL(144, sys_time_get_timezone) {
 
 LV2_SYSCALL(141, sys_timer_usleep) {
     uint64_t us = u64arg(ctx, 0);
+    static const long min_us = std::getenv("GOWA_USLEEP_MIN") ? std::atol(std::getenv("GOWA_USLEEP_MIN")) : 100;
+    static std::atomic<uint64_t> hist[8];
+    static const bool stats = std::getenv("GOWA_USLEEP_STATS") != nullptr;
+    if (stats) {
+        int b = us < 10 ? 0 : us < 30 ? 1 : us < 100 ? 2 : us < 300 ? 3 : us < 1000 ? 4 : us < 5000 ? 5 : 6;
+        if (hist[b].fetch_add(1) % 100000 == 99999 || (hist[7].fetch_add(1) & 0x3FFFF) == 0)
+            LOG_INFO("lv2", "usleep histogram <10:%llu <30:%llu <100:%llu <300:%llu <1000:%llu <5000:%llu more:%llu", (unsigned long long)hist[0].load(), (unsigned long long)hist[1].load(), (unsigned long long)hist[2].load(),
+                     (unsigned long long)hist[3].load(), (unsigned long long)hist[4].load(), (unsigned long long)hist[5].load(), (unsigned long long)hist[6].load());
+    }
+    if (min_us && us < uint64_t(min_us)) us = uint64_t(min_us);
     host::sleep_us(static_cast<uint64_t>(us / ppu::time_scale()));
     return CELL_OK;
 }

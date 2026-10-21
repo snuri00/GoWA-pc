@@ -82,6 +82,7 @@ bool load_image(int index) {
                 return false;
             }
             std::memcpy(vm::ptr(static_cast<uint32_t>(vaddr)), &data[off], filesz);
+            if (!(be32(ph + 4) & 2) && filesz == memsz) vm::mark_immutable(static_cast<uint32_t>(vaddr), static_cast<uint32_t>(filesz));
             std::memset(vm::ptr(static_cast<uint32_t>(vaddr + filesz)), 0, memsz - filesz);
         } else if (type == 7 && !im.prx) {
             g_process.tls_vaddr = static_cast<uint32_t>(vaddr);

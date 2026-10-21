@@ -1,3 +1,4 @@
+#include "runtime/placement.h"
 #include "runtime/hostsleep.h"
 #include "event.h"
 #include "gpu/presenter.h"
@@ -5,8 +6,10 @@
 #include "runtime/trace.h"
 #include "ppu/ops.h"
 #include "runtime/reservation.h"
+#include "runtime/hooks.h"
 #include "runtime/hostsleep.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -106,7 +109,20 @@ void flip_done(uint32_t buffer) {
     std::memset(vm::ptr(g_rsx.reports + 0x10), 0, 16);
     g_rsx.flips++;
     if (trace::on(trace::RSX)) trace::emit(trace::T_FLIP, buffer, g_rsx.flips);
-    if ((g_rsx.flips % 60) == 1) LOG_INFO("rsx", "flip %llu (buffer %u)", static_cast<unsigned long long>(g_rsx.flips), buffer);
+    static auto last = std::chrono::steady_clock::now();
+    static double worst = 0.0;
+    static uint32_t over50 = 0, over100 = 0;
+    auto now = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(now - last).count();
+    last = now;
+    worst = (std::max)(worst, ms);
+    over50 += ms > 50.0;
+    over100 += ms > 100.0;
+    if ((g_rsx.flips % 60) == 1) {
+        LOG_INFO("rsx", "flip %llu (buffer %u) worst %.1f ms, >50ms %u, >100ms %u", static_cast<unsigned long long>(g_rsx.flips), buffer, worst, over50, over100);
+        worst = 0.0;
+        over50 = over100 = 0;
+    }
     send_event(1u << 4);
 }
 
@@ -122,6 +138,19 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
         uint32_t buffer = (v & 0x80000000u) ? (v & 0xF) : 0;
         if ((v & 0x80000000u) && buffer > 7) buffer = vm::read32(head_addr(head) + 0x14);
         if (!gpu::rsx::present(buffer)) gpu::flip(buffer);
+        if (hooks::fps_unlock_active()) {
+            static int64_t next_flip = 0;
+            double target = hooks::fps_unlock_target();
+            int64_t period = static_cast<int64_t>(1e9 / (target > 1.0 ? target : 59.94) / ppu::time_scale());
+            int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (next_flip && now < next_flip) {
+                host::sleep_until_ns(next_flip);
+                now = next_flip;
+            }
+            next_flip = (next_flip && now - next_flip < period) ? next_flip + period : now + period;
+            flip_done(buffer);
+            return CELL_OK;
+        }
         g_rsx.pending_flip = buffer;
         while (g_rsx.pending_flip >= 0 && g_rsx.running) Sleep(0);
         return CELL_OK;
@@ -248,7 +277,7 @@ void execute(uint32_t reg, uint32_t arg) {
             std::memcpy(rep, &t, 8);
             std::memset(rep + 8, 0, 8);
             if ((arg >> 24) == 1) {
-                uint32_t v = __builtin_bswap32(gpu::rsx::zpass_value());
+                uint32_t v = __builtin_bswap32(gpu::rsx::zpass_value(a));
                 std::memcpy(rep + 8, &v, 4);
             }
             rsv::store_locked(a, rep, 16);
@@ -257,7 +286,8 @@ void execute(uint32_t reg, uint32_t arg) {
                 std::memcpy(&v, rep + 8, 4);
                 trace::emit(trace::T_REPORT, arg >> 24, a, __builtin_bswap32(v));
             }
-            if (std::getenv("GOWA_REPORT_LOG")) LOG_INFO("rsx", "report type %u loc 0x%08x off 0x%x -> ea 0x%08x", arg >> 24, loc, offset, a);
+            static const bool report_log = std::getenv("GOWA_REPORT_LOG") != nullptr;
+            if (report_log) LOG_INFO("rsx", "report type %u loc 0x%08x off 0x%x -> ea 0x%08x", arg >> 24, loc, offset, a);
         }
         break;
     }
@@ -289,6 +319,7 @@ struct LineReader {
 
 void fifo_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX FIFO");
+    placement::apply("fifo");
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_fifo_handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
     if (std::getenv("GOWA_PROFILE_FIFO")) crash::profile_thread(g_fifo_handle, "rsx fifo");
     LOG_INFO("rsx", "null RSX FIFO thread started");
@@ -407,6 +438,7 @@ void fifo_thread() {
 
 void vblank_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX VBlank");
+    placement::apply("vblank");
     auto next = std::chrono::steady_clock::now();
     while (g_rsx.running) {
         next += std::chrono::nanoseconds(static_cast<int64_t>(16683333 / ppu::time_scale()));

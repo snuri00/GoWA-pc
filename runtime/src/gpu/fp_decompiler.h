@@ -10,6 +10,8 @@ namespace gpu {
 struct FragmentProgramKey {
     uint32_t control = 0;
     uint32_t texture_dims = 0;
+    uint32_t unnormalized = 0;
+    uint32_t shadow = 0;
     uint32_t mrt_count = 1;
 };
 

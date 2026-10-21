@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include "ppu/context.h"
 
 #include <cstdint>
@@ -17,6 +18,11 @@ struct Context {
     uint32_t pc = 0;
     uint32_t srr0 = 0;
     uint8_t* ls = nullptr;
+    std::atomic<uint32_t>* line_epoch = nullptr;
+    const std::atomic<uint32_t>* epoch = nullptr;
+    const std::atomic<uint32_t>* all_epoch = nullptr;
+    uint32_t* block_valid = nullptr;
+    uint32_t executed = 0;
     bool interrupts_enabled = false;
     bool irq_check = false;
     bool halted = false;
@@ -32,6 +38,7 @@ public:
     virtual uint32_t channel_count(uint32_t ch) = 0;
     virtual bool stop_and_signal(uint32_t code) = 0;
     virtual void halt(uint32_t pc, uint32_t word) = 0;
+    virtual bool interrupt_pending() { return true; }
 };
 
 void interpret(Context& c, Host& host);
