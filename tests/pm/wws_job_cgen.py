@@ -49,5 +49,7 @@ def generate(ea, size, ns, out_cpp, out_h, exits=frozenset(), ls=0x4000):
         OPS_H="../pm/pm_ops.h",
         HEADER_BYTES=0x30,
         EXTRA_ROOTS=tuple(sorted(recorded_starts(ls, img) - set(exits))),
+        DISPATCH_TABLE=True,
+        DISPATCH_GATE="spuf::glue_disp_on()",
     )
     G.emit(out_cpp, out_h)

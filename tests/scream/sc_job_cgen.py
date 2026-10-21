@@ -96,6 +96,8 @@ def generate(name, ea, size, code_end):
         OPS_H="scream_job_ops.h",
         HEADER_BYTES=0x30,
         IE_INLINE=True,
+        DISPATCH_TABLE=True,
+        DISPATCH_GATE="spuf::glue_disp_on()",
         EXTRA_ROOTS=tuple(sorted(((recorded_starts(0x4000, img) | set(a for a in codegen_extra_starts() if 0x4030 <= a < code_end)) - exits))),
     )
     print(name, file=sys.stderr)
