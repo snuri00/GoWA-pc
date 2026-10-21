@@ -337,7 +337,12 @@ bool restore_post_pass_keys(ppu::Context&) {
         uint64_t pass;
     };
     static const Slot slots[] = {{0x9abfb8, 4}, {0x9abfa0, 6}};
+    static const bool blur = [] {
+        const char* e = std::getenv("GOWA_MOTION_BLUR");
+        return !(e && std::string(e) == "0");
+    }();
     for (const Slot& s : slots) {
+        if (s.pass == 4 && !blur) continue;
         if (vm::read64(s.addr)) continue;
         uint64_t key = (base & 0x0c3ffffffffffff0ull) | 0x9000000000000000ull | (uint64_t(5) << 54) | s.pass;
         vm::write64(s.addr, key);
