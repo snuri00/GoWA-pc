@@ -34,6 +34,11 @@ void profile_thread(void* native, const char* name);
 
 namespace spu {
 
+int g_edge_direct = [] {
+    const char* e = std::getenv("GOWA_EDGE_DIRECT");
+    return e ? std::atoi(e) : 0;
+}();
+
 namespace {
 std::atomic<uint64_t> g_ev_reads{0}, g_ev_waits{0}, g_ev_wait_us{0}, g_getllar{0}, g_putllc_ok{0}, g_putllc_fail{0}, g_getllar_same{0};
 
@@ -727,8 +732,92 @@ bool SpuThread::merge_put(uint32_t ea, uint32_t size, uint32_t lsa) {
     return false;
 }
 
+namespace {
+
+bool dma_plain() {
+    static const bool plain = g_dma_watch.empty() && !std::getenv("GOWA_SPU_RACE") && !std::getenv("GOWA_SPU_PUT_FIND") && !std::getenv("GOWA_SPU_PUT_CLEARS");
+    return plain;
+}
+
+uint32_t ls_word(const uint8_t* ls, uint32_t a) {
+    uint32_t v;
+    std::memcpy(&v, ls + a, 4);
+    return __builtin_bswap32(v);
+}
+
+bool edge_loaded(const uint8_t* ls) {
+    static const uint32_t guid[4] = {0x43642a02u, 0x42370282u, 0x420c0702u, 0x43499982u};
+    for (int i = 0; i < 4; i++)
+        if (ls_word(ls, 0x4000 + 4 * i) != guid[i]) return false;
+    return ls_word(ls, 0x4020) == 0xc0dec0deu;
+}
+
+bool in_ring(const uint8_t* ls, uint32_t ea, uint32_t size) {
+    uint64_t end = uint64_t(ea) + size;
+    uint32_t a0 = ls_word(ls, 0x10c00), a1 = ls_word(ls, 0x10c08);
+    if (a0 >= 0x10000 && a1 > a0 && a1 - a0 <= 0x400000 && ea >= a0 && end <= a1) return true;
+    uint32_t b0 = ls_word(ls, 0x10c20), bn = ls_word(ls, 0x10c24);
+    return b0 >= 0x10000 && bn && bn <= 0x400000 && ea >= b0 && end <= uint64_t(b0) + bn;
+}
+
+bool edge_list(const uint8_t* ls) {
+    uint32_t wid = ls_word(ls, 0x1dc);
+    return wid >= 19 && wid <= 21;
+}
+
+}
+
+std::atomic<uint64_t> g_edge_merge_hits{0};
+
+bool SpuThread::dma_direct(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
+    if (!dma_plain() || ea >= 0xF0000000u || ea < 0x10000 || size > 0x4000 || cmd == 0x89) return false;
+    if (!vm::is_mapped(ea) || !vm::is_mapped(ea + size - 1)) return false;
+    lsa &= 0x3FFFF;
+    if (lsa + size > LS_SIZE) return false;
+    if (trace::on(trace::DMA)) return false;
+    bool put = (cmd & 0xF0) == 0x20 || (cmd & 0xF0) == 0x30 || (cmd & 0xF0) == 0xA0;
+    const bool merge = put_merge_enabled();
+    if (put) {
+        bool merged = merge && merge_put(ea, size, lsa);
+        if (merge && merge_hit && edge_loaded(ls) && g_edge_merge_hits.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_INFO("spudma", "thread 0x%x Edge job PUT hit a GET snapshot: ea 0x%08x size 0x%x lsa 0x%05x merged %d wid %u", id, ea, size, lsa, merged ? 1 : 0, ls_word(ls, 0x1dc));
+        }
+        if (merged) return true;
+        uint32_t table = vm::is_mapped(0x9B2298) ? vm::read32(0x9B2298) : 0;
+        if (merge && !merge_hit) {
+            static std::atomic<int> unprotected{0};
+            if (table && ea < table + 0xA280 && ea + size > table && unprotected.fetch_add(1) < 200) {
+                LOG_WARN("spudma", "thread 0x%x pc 0x%05x unprotected PUT to texture request table ea 0x%08x size 0x%x lsa 0x%05x", id, ctx.pc, ea, size, lsa);
+            }
+        }
+        if (g_edge_direct >= 2 && !merge_hit && edge_loaded(ls) && in_ring(ls, ea, size) && !(table && ea < table + 0xA280 && ea + size > table)) {
+            std::memcpy(vm::ptr(ea), ls + lsa, size);
+            edge_direct_puts++;
+            return true;
+        }
+        rsv::store_range(ea, ls + lsa, size);
+        return true;
+    }
+    if (vm::is_immutable(ea, size)) return false;
+    uint32_t dirty_lo = 0xFFFFFFFFu, dirty_hi = 0;
+    if (rsv::copy_range_prefetch(ea, ls + lsa, size, dirty_lo, dirty_hi)) mark_ls(lsa + dirty_lo, dirty_hi - dirty_lo);
+    bool snap = merge && size >= 16;
+    if (snap && g_edge_direct >= 3 && edge_loaded(ls) && edge_list(ls)) {
+        uint32_t table = vm::is_mapped(0x9B2298) ? vm::read32(0x9B2298) : 0;
+        if (!(table && ea < table + 0xA280 && ea + size > table)) {
+            snap = false;
+            edge_nosnap_gets++;
+        }
+    }
+    if (snap) remember_get(ea, size, lsa);
+    else forget_ls(lsa, size);
+    for (uint32_t l = lsa >> 7, last = (lsa + size - 1) >> 7; l <= last; l++) line_src[l] = ea;
+    return true;
+}
+
 void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
     if (!size) return;
+    if (g_edge_direct && dma_direct(cmd, lsa, ea, size)) return;
     if (size > 0x4000) {
         LOG_ERROR("spu", "thread 0x%x DMA size 0x%x too large", id, size);
         return;

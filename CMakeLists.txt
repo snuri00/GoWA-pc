@@ -80,6 +80,12 @@ target_include_directories(spu_bench PRIVATE runtime/include runtime/src/spu)
 target_link_libraries(spu_bench PRIVATE gowa_spu gowa_ppu_ops dbghelp)
 target_compile_options(spu_bench PRIVATE ${GOWA_ARCH_FLAGS} /clang:-frounding-math /EHsc)
 
+add_executable(spu_live tests/spu_bench/bench.cpp $<TARGET_OBJECTS:gowa_runtime> $<TARGET_OBJECTS:gowa_volk>)
+target_include_directories(spu_live PRIVATE runtime/include runtime/src/spu)
+target_compile_definitions(spu_live PRIVATE SPU_BENCH_LIVE)
+target_link_libraries(spu_live PRIVATE gowa_ppu gowa_spu gowa_ppu_ops dbghelp winmm glslang SPIRV glslang-default-resource-limits)
+target_compile_options(spu_live PRIVATE ${GOWA_ARCH_FLAGS} /clang:-frounding-math /EHsc)
+
 add_executable(spu_conformance tests/spu_conformance/harness.cpp runtime/src/spu/interpreter.cpp)
 target_include_directories(spu_conformance PRIVATE runtime/include)
 target_link_libraries(spu_conformance PRIVATE gowa_ppu_ops)
