@@ -400,5 +400,4 @@ def emit(out_cpp, out_h):
 
 
 if __name__ == "__main__":
-    configure(DISPATCH_TABLE=True, DISPATCH_GATE="spuf::glue_disp_on()")
     emit(sys.argv[1], sys.argv[2])
