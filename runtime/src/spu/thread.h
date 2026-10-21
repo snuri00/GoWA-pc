@@ -18,6 +18,9 @@ namespace spu {
 
 struct Group;
 
+extern int g_edge_direct;
+extern std::atomic<uint64_t> g_edge_merge_hits;
+
 struct SpuThread : Host {
     uint32_t id = 0;
     uint32_t slot = 0;
@@ -45,6 +48,8 @@ struct SpuThread : Host {
     void forget_ls(uint32_t lsa, uint32_t size);
     bool merge_put(uint32_t ea, uint32_t size, uint32_t lsa);
     bool merge_hit = false;
+    uint64_t edge_direct_puts = 0;
+    uint64_t edge_nosnap_gets = 0;
     std::atomic<uint32_t> ls_epoch{1};
     std::atomic<uint32_t> ls_all_epoch{1};
     std::unique_ptr<std::atomic<uint32_t>[]> line_epoch{new std::atomic<uint32_t>[0x40000 / 128]()};
@@ -158,6 +163,7 @@ private:
     uint32_t dec_now();
     void process_mfc(uint32_t cmd);
     void dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size);
+    bool dma_direct(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size);
     bool run_list(uint32_t tag, uint32_t cmd, uint32_t lsa, uint32_t list, uint32_t size);
     uint8_t* translate(uint32_t ea, uint32_t size, bool write, bool& handled, uint32_t lsa);
     template <class Pred>

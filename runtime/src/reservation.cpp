@@ -145,6 +145,24 @@ void store_locked(uint32_t addr, const void* data, uint32_t size) {
     if (sleepers()) e.ver.notify_all();
 }
 
+void store_range(uint32_t addr, const uint8_t* data, uint32_t size) {
+    static const bool logged = std::getenv("GOWA_RSV_LOG") != nullptr;
+    const bool wake = sleepers();
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t a = addr + done;
+        uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+        if (done + chunk < size) _m_prefetchw(&entry(a + 128).ver);
+        Entry& e = entry(a & ~127u);
+        uint64_t v0 = lock_line(e);
+        if (logged) log_change(a & ~127u, a & 127u, data + done, chunk, "store");
+        std::memcpy(vm::ptr(a), data + done, chunk);
+        unlock_line(e, v0, true);
+        if (wake) e.ver.notify_all();
+        done += chunk;
+    }
+}
+
 void merge_bits(uint32_t addr, const uint8_t* data, const uint8_t* base, uint32_t size) {
     Entry& e = entry(addr & ~127u);
     uint64_t v0 = lock_line(e);
@@ -239,6 +257,54 @@ bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t&
             std::atomic_thread_fence(std::memory_order_acquire);
             if (e.ver.load(std::memory_order_acquire) != v1) continue;
             if (changed) {
+                any = true;
+                dirty_lo = (std::min)(dirty_lo, done);
+                dirty_hi = (std::max)(dirty_hi, done + chunk);
+            }
+            break;
+        }
+        done += chunk;
+    }
+    return any;
+}
+
+bool copy_range_prefetch(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi) {
+    for (uint32_t a = (addr & ~127u) + 128; a < addr + size && a < (addr & ~127u) + 128 * 9; a += 128) _mm_prefetch(reinterpret_cast<const char*>(&entry(a).ver), _MM_HINT_T0);
+    const uint8_t* src = vm::ptr(addr);
+    bool any = false;
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t a = addr + done;
+        uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+        if (done + chunk + 1024 < size) {
+            _mm_prefetch(reinterpret_cast<const char*>(&entry(a + 1024).ver), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(src + done + 1024), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(src + done + 1024 + 64), _MM_HINT_T0);
+        }
+        Entry& e = entry(a & ~127u);
+        for (;;) {
+            uint64_t v1 = e.ver.load(std::memory_order_acquire);
+            if (v1 & 64) {
+                _mm_pause();
+                continue;
+            }
+            uint32_t diff = 0;
+            const uint8_t* s = src + done;
+            uint8_t* d = dst + done;
+            uint32_t i = 0;
+            for (; i + 32 <= chunk; i += 32) {
+                __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+                __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d + i));
+                diff |= ~static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)));
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i), x);
+            }
+            for (; i < chunk; i++) {
+                diff |= d[i] != s[i];
+                d[i] = s[i];
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (e.ver.load(std::memory_order_acquire) != v1) continue;
+            if (diff) {
                 any = true;
                 dirty_lo = (std::min)(dirty_lo, done);
                 dirty_hi = (std::max)(dirty_hi, done + chunk);

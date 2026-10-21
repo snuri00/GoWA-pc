@@ -1,6 +1,11 @@
 #include "spu/aot.h"
 #include "spu/context.h"
 #include "hle.h"
+#ifdef SPU_BENCH_LIVE
+#include "runtime/memory.h"
+#include "thread.h"
+#include <set>
+#endif
 
 #include <intrin.h>
 
@@ -517,6 +522,164 @@ public:
     bool interrupt_pending() override { return pos < cap.events.size() && cap.events[pos].kind == 5; }
 };
 
+
+#ifdef SPU_BENCH_LIVE
+std::set<uint32_t> g_live_blocks;
+spu::SpuThread* g_live_thread = nullptr;
+uint64_t g_live_mismatch = 0;
+bool g_live_check = true;
+std::string g_live_first;
+
+class Live : public Replay {
+public:
+    spu::SpuThread& t;
+    uint32_t mfc[6] = {};
+    Live(State& st, const Capture& c, spu::SpuThread& th) : Replay(st, c), t(th) {}
+    void note(const char* what, uint32_t a, uint32_t b) {
+        g_live_mismatch++;
+        if (g_live_first.empty()) {
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "event %zu pc %05x: %s 0x%x vs 0x%x", pos, s.c.pc, what, a, b);
+            g_live_first = buf;
+        }
+    }
+    static void ensure(uint32_t ea, uint32_t size) {
+        if (!size) return;
+        for (uint64_t a = ea & ~0xFFFFull; a < uint64_t(ea) + size; a += 0x10000) {
+            if (g_live_blocks.insert(uint32_t(a)).second) vm::map(uint32_t(a), 0x10000);
+        }
+    }
+    void expected(uint32_t lsa, uint32_t size, uint8_t* out) const {
+        for (uint32_t i = 0; i < size;) {
+            uint32_t a = (lsa + i) & 0x3FFFF;
+            uint32_t n = (std::min)(size - i, spu::LS_SIZE - a);
+            std::memcpy(out + i, s.ls + a, n);
+            i += n;
+        }
+        if (pos >= cap.events.size()) return;
+        for (auto& [line, d] : cap.events[pos].lines) {
+            if (((line - lsa) & 0x3FFFF) >= size && ((lsa - line) & 0x3FFFF) >= 128) continue;
+            for (uint32_t k = 0; k < 128; k++) {
+                uint32_t off = (line + k - lsa) & 0x3FFFF;
+                if (off < size) out[off] = d[k];
+            }
+        }
+    }
+    void seed(uint32_t ea, uint32_t lsa, uint32_t size) {
+        if (!size || ea >= 0xF0000000u || size > 0x4000) return;
+        ensure(ea, size);
+        expected(lsa, size, vm::ptr(ea));
+    }
+    void check(uint32_t lsa, uint32_t size) {
+        if (!g_live_check || !size || size > 0x4000) return;
+        static uint8_t want[0x4000];
+        expected(lsa, size, want);
+        for (uint32_t i = 0; i < size; i++) {
+            if (s.ls[(lsa + i) & 0x3FFFF] != want[i]) {
+                note("ls byte", (lsa + i) & 0x3FFFF, want[i]);
+                return;
+            }
+        }
+    }
+    template <class F>
+    void walk_list(uint32_t lsa, uint32_t list, uint32_t size, F&& f) {
+        uint32_t cur = lsa & 0x3FFF0;
+        list &= 0x3FFF8;
+        while (size >= 8) {
+            const uint8_t* e = s.ls + list;
+            bool stall = (e[0] & 0x80) != 0;
+            uint32_t tsize = ((uint32_t(e[2]) << 8) | e[3]) & 0x7FFF;
+            uint32_t ea;
+            std::memcpy(&ea, e + 4, 4);
+            ea = __builtin_bswap32(ea);
+            f(ea, cur | (ea & 0xF), tsize);
+            cur = (cur + ((tsize + 15) & ~15u)) & 0x3FFF0;
+            list = (list + 8) & 0x3FFF8;
+            size -= 8;
+            if (stall && size >= 8) return;
+        }
+    }
+    uint32_t next_status(uint32_t ch) const {
+        for (size_t i = pos + 1; i < cap.events.size() && i < pos + 64; i++)
+            if (cap.events[i].kind == 0 && cap.events[i].ch == ch) return cap.events[i].value;
+        return 0xFFFFFFFFu;
+    }
+    void write_channel(uint32_t ch, uint32_t value) override {
+        if (ch >= 16 && ch <= 20) {
+            mfc[ch - 16] = value;
+            t.write_channel(ch, value);
+        } else if (ch == 22 || ch == 23) {
+            t.write_channel(ch, value);
+        } else if (ch == 26) {
+            uint32_t tag = value & 31;
+            auto st = t.stalled[tag];
+            if (st.active) walk_list(st.lsa, st.list, st.remaining, [&](uint32_t ea, uint32_t l, uint32_t n) { if (((st.cmd & 0xF0) == 0x40)) seed(ea, l, n); });
+            t.write_channel(ch, value);
+            if (st.active) walk_list(st.lsa, st.list, st.remaining, [&](uint32_t ea, uint32_t l, uint32_t n) { if (((st.cmd & 0xF0) == 0x40) && ea < 0xF0000000u) check(l, n); });
+        } else if (ch == 21) {
+            uint32_t cmd = value & 0xFF, lsa = mfc[0] & 0x3FFFF, ea = mfc[2], size = mfc[3];
+            bool list = (cmd & 0x04) && cmd < 0x50;
+            bool get = (cmd & 0xF0) == 0x40;
+            bool forward = true;
+            if (cmd == 0xD0) {
+                ensure(ea & ~127u, 128);
+                seed(ea & ~127u, lsa & 0x3FF80, 128);
+            } else if (cmd == 0xB4) {
+                ensure(ea & ~127u, 128);
+                if (next_status(27) == 1) vm::ptr(ea & ~127u)[0] ^= 0xA5;
+            } else if (cmd == 0xB0 || cmd == 0xB8) {
+                ensure(ea & ~127u, 128);
+            } else if (list) {
+                walk_list(lsa, ea, size, [&](uint32_t e, uint32_t l, uint32_t n) {
+                    if (e >= 0xF0000000u) return;
+                    ensure(e, n);
+                    if (get) seed(e, l, n);
+                });
+            } else if ((cmd & 0xF0) == 0x20 || (cmd & 0xF0) == 0x30 || (cmd & 0xF0) == 0x40 || (cmd & 0xF0) == 0xA0 || cmd == 0x89) {
+                if (ea >= 0xF0000000u) forward = false;
+                else {
+                    ensure(ea, size ? size : 4);
+                    if (get) seed(ea, lsa, size);
+                }
+            }
+            if (forward) t.write_channel(ch, value);
+            if (cmd == 0xD0) check(lsa & 0x3FF80, 128);
+            else if (list && get) walk_list(lsa, ea, size, [&](uint32_t e, uint32_t l, uint32_t n) { if (e < 0xF0000000u) check(l, n); });
+            else if (get && forward && !list) check(lsa, size);
+        }
+        Replay::write_channel(ch, value);
+    }
+    bool live_count(uint32_t ch) const {
+        return ch == 24 ? t.tag_stat_count : ch == 25 ? t.stall_stat_count : t.atomic_stat_count;
+    }
+    uint32_t read_channel(uint32_t ch) override {
+        if ((ch == 24 || ch == 25 || ch == 27) && pos < cap.events.size()) {
+            uint32_t want = cap.events[pos].value;
+            if (!live_count(ch)) note("no live status for channel", ch, want);
+            else {
+                uint32_t got = t.read_channel(ch);
+                if (got != want) note(ch == 27 ? "atomic status" : ch == 24 ? "tag status" : "stall status", got, want);
+            }
+        }
+        return Replay::read_channel(ch);
+    }
+    uint32_t channel_count(uint32_t ch) override {
+        if ((ch == 24 || ch == 25 || ch == 27) && pos < cap.events.size()) {
+            uint32_t got = live_count(ch) ? 1 : 0;
+            if (got != cap.events[pos].value) note("status count", ch, cap.events[pos].value);
+        }
+        return Replay::channel_count(ch);
+    }
+};
+#endif
+
+std::unique_ptr<Replay> make_host(State& s, const Capture& cap) {
+#ifdef SPU_BENCH_LIVE
+    if (g_live_thread) return std::make_unique<Live>(s, cap, *g_live_thread);
+#endif
+    return std::make_unique<Replay>(s, cap);
+}
+
 struct Slot {
     const spu::CompiledBlock* b = nullptr;
     uint32_t valid = 0;
@@ -625,7 +788,8 @@ bool iso_count(const State& s, uint64_t& k, uint32_t ret, uint32_t sp) {
 Result run(State& s, const Capture& cap, bool regions) {
     Result r;
     s.reset(cap);
-    Replay host(s, cap);
+    std::unique_ptr<Replay> host_ptr = make_host(s, cap);
+    Replay& host = *host_ptr;
     std::vector<Slot> cache(spu::LS_SIZE / 4);
     uint64_t n = 0;
     ULONG64 t0 = 0;
@@ -896,6 +1060,8 @@ int main(int argc, char** argv) {
     }
     int reps = 5;
     bool regions = true;
+    bool live = false;
+    int live_mode = 3;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -908,6 +1074,8 @@ int main(int argc, char** argv) {
         else if (a == "--hle-strict") g_hle = g_hle_strict = true;
         else if (a == "--hle-profile") g_hle = g_hle_profile = true;
         else if (a == "--jobprof") g_jobprof = true;
+        else if (a == "--live") live = true;
+        else if (a == "--live-mode" && i + 1 < argc) live_mode = std::atoi(argv[++i]);
         else if (a == "--jobsample") g_jobsample = true;
         else if (a == "--pmtrace" && i + 1 < argc) g_pmtrace = std::fopen(argv[++i], "w");
         else if (a == "--to-last-event") g_to_last_event = true;
@@ -940,6 +1108,110 @@ int main(int argc, char** argv) {
         g_sampling = true;
         sampler_thread = std::thread(sampler, self);
     }
+#ifdef SPU_BENCH_LIVE
+    if (live) {
+        vm::init();
+        g_hle = true;
+        g_skip_same = false;
+        int bad = 0;
+        int live_reps = reps == 5 ? 2 : reps;
+        uint64_t live_total[2] = {};
+        for (const std::string& f : files) {
+            Capture cap;
+            if (!load(f, cap)) {
+                std::printf("%s: bad capture\n", f.c_str());
+                bad++;
+                continue;
+            }
+            g_counts.clear();
+            g_have_counts = false;
+            std::map<uint32_t, std::vector<uint8_t>> mem[2];
+            std::vector<uint8_t> ls[2];
+            std::vector<uint8_t> gpr[2];
+            uint32_t pc[2] = {};
+            uint64_t cyc[2] = {};
+            std::string err[2];
+            for (int mode = 0; mode < 2; mode++) {
+                for (uint32_t b : g_live_blocks) std::memset(vm::ptr(b), 0, 0x10000);
+                auto t = std::make_unique<spu::SpuThread>();
+                uint8_t* own = t->ls;
+                t->ls = s.ls;
+                g_live_thread = t.get();
+                spu::g_edge_direct = mode ? live_mode : 0;
+                uint64_t hits0 = spu::g_edge_merge_hits.load();
+                g_live_mismatch = 0;
+                g_live_first.clear();
+                g_count_pos = 0;
+                Result r = run(s, cap, regions);
+                g_have_counts = true;
+                cyc[mode] = r.cycles;
+                char b[64];
+                std::snprintf(b, sizeof b, "%llu live mismatches", static_cast<unsigned long long>(g_live_mismatch));
+                err[mode] = (r.exact ? std::string("exact") : r.error) + ", " + b + (g_live_first.empty() ? "" : " (first: " + g_live_first + ")");
+                char st[160];
+                std::snprintf(st, sizeof st, "; edge merge hits %llu, lockless ring puts %llu, unsnapshotted gets %llu", static_cast<unsigned long long>(spu::g_edge_merge_hits.load() - hits0),
+                              static_cast<unsigned long long>(t->edge_direct_puts), static_cast<unsigned long long>(t->edge_nosnap_gets));
+                err[mode] += st;
+                for (uint32_t blk : g_live_blocks) mem[mode][blk].assign(vm::ptr(blk), vm::ptr(blk) + 0x10000);
+                ls[mode].assign(s.ls, s.ls + spu::LS_SIZE);
+                gpr[mode].assign(reinterpret_cast<const uint8_t*>(s.c.gpr), reinterpret_cast<const uint8_t*>(s.c.gpr) + 2048);
+                pc[mode] = s.c.pc;
+                t->ls = own;
+                g_live_thread = nullptr;
+            }
+            g_live_check = false;
+            if (live_reps) cyc[0] = cyc[1] = UINT64_MAX;
+            for (int k = 0; k < 2 * live_reps; k++) {
+                int mode = k & 1;
+                auto t = std::make_unique<spu::SpuThread>();
+                uint8_t* own = t->ls;
+                t->ls = s.ls;
+                g_live_thread = t.get();
+                spu::g_edge_direct = mode ? live_mode : 0;
+                g_count_pos = 0;
+                Result r = run(s, cap, regions);
+                if (std::getenv("SPU_LIVE_VERBOSE")) std::printf("  rep %d mode %d cycles %llu\n", k, mode, static_cast<unsigned long long>(r.cycles));
+                if (r.cycles < cyc[mode]) cyc[mode] = r.cycles;
+                t->ls = own;
+                g_live_thread = nullptr;
+            }
+            g_live_check = true;
+            live_total[0] += cyc[0];
+            live_total[1] += cyc[1];
+            uint64_t mem_diff = 0;
+            uint32_t first_diff = 0;
+            std::set<uint32_t> keys;
+            for (auto& [k, v] : mem[0]) keys.insert(k);
+            for (auto& [k, v] : mem[1]) keys.insert(k);
+            static const std::vector<uint8_t> zero(0x10000, 0);
+            for (uint32_t k : keys) {
+                const std::vector<uint8_t>& a = mem[0].count(k) ? mem[0][k] : zero;
+                const std::vector<uint8_t>& b = mem[1].count(k) ? mem[1][k] : zero;
+                for (uint32_t i = 0; i < 0x10000; i++)
+                    if (a[i] != b[i]) {
+                        if (!mem_diff) first_diff = k + i;
+                        mem_diff++;
+                    }
+            }
+            uint32_t ls_diff = 0;
+            for (uint32_t l = 0; l < spu::LS_SIZE; l += 128) ls_diff += std::memcmp(ls[0].data() + l, ls[1].data() + l, 128) != 0;
+            bool regs_same = gpr[0] == gpr[1] && pc[0] == pc[1];
+            bool same = !mem_diff && !ls_diff && regs_same;
+            std::printf("%-28s ref: %s\n%-28s direct: %s\n%-28s memory effects %s: %zu blocks, %llu bytes differ%s, %u ls lines differ, regs %s; best cycles ref %llu direct %llu\n", f.c_str(), err[0].c_str(), "", err[1].c_str(), "", same ? "EQUAL" : "DIFFER", keys.size(),
+                        static_cast<unsigned long long>(mem_diff), mem_diff ? (" first at " + std::to_string(first_diff)).c_str() : "", ls_diff, regs_same ? "equal" : "differ", static_cast<unsigned long long>(cyc[0]), static_cast<unsigned long long>(cyc[1]));
+            if (!same) bad++;
+        }
+        std::printf("live: %d captures with differing memory effects, total cycles ref %llu direct %llu (%+.2f%%)\n", bad, static_cast<unsigned long long>(live_total[0]), static_cast<unsigned long long>(live_total[1]),
+                    live_total[0] ? 100.0 * (double(live_total[1]) - double(live_total[0])) / double(live_total[0]) : 0.0);
+        if (g_sample) {
+            g_sampling = false;
+            sampler_thread.join();
+            report_samples();
+        }
+        std::fflush(stdout);
+        std::_Exit(bad ? 1 : 0);
+    }
+#endif
     uint64_t total_cycles = 0, total_insns = 0;
     int failures = 0;
     for (const std::string& f : files) {
