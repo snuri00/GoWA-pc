@@ -3,6 +3,7 @@
 #include "gpu/presenter.h"
 #include "motion_vectors.h"
 #include "dlssg.h"
+#include "dlssnr.h"
 #include "gpu/rsx.h"
 #include "runtime/log.h"
 #include "runtime/trace.h"
@@ -3053,6 +3054,17 @@ void schedule_snapshot(Surface* s, uint32_t w, uint32_t h, const std::string& na
     g_dumps.push_back({a.ptr, s->offset, w, h, s->format, s->main, name});
 }
 
+void schedule_image_snapshot(VkImage image, uint32_t w, uint32_t h, const std::string& name) {
+    RingAlloc a;
+    if (!ring_alloc(uint64_t(w) * h * 4, 16, a)) return;
+    VkBufferImageCopy c{};
+    c.bufferOffset = a.offset;
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(frame_cmd(), image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, a.buffer, 1, &c);
+    g_dumps.push_back({a.ptr, 0, w, h, VK_FORMAT_R8G8B8A8_UNORM, false, name});
+}
+
 void complete_dumps() {
     for (const Dump& d : g_dumps) {
         char fn[512];
@@ -3421,6 +3433,12 @@ void mv_frame() {
         VkImage mvi = mv::output(ml);
         dlssg::capture_inputs(frame_cmd(), mvi, ml, z->image, z->layout, z->iw, z->ih, mv::camera_consts());
     }
+    if (ran && dlssnr::active()) {
+        transition(z, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkImageLayout ml;
+        VkImage mvi = mv::output(ml);
+        dlssnr::capture_inputs(frame_cmd(), mvi, ml, z->image, z->layout, z->iw, z->ih);
+    }
 }
 
 bool display_target(uint32_t offset) {
@@ -3438,9 +3456,21 @@ void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h) {
         mv_frame();
         return;
     }
-    if (dlssg::hudless_pending()) {
+    if (dlssnr::pending()) {
+        end_pass();
         transition(colors[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        dlssg::capture_hudless(frame_cmd(), colors[0]->image, colors[0]->layout, std::min(colors[0]->iw, uint32_t(w * colors[0]->scale + 0.5f)), std::min(colors[0]->ih, uint32_t(h * colors[0]->scale + 0.5f)));
+        dlssnr::evaluate(frame_cmd(), colors[0]->image, colors[0]->layout, std::min(colors[0]->iw, uint32_t(w * colors[0]->scale + 0.5f)), std::min(colors[0]->ih, uint32_t(h * colors[0]->scale + 0.5f)));
+    }
+    if (dlssg::hudless_pending()) {
+        VkImage ni;
+        VkImageLayout nl;
+        uint32_t nw, nh;
+        if (dlssnr::output(ni, nl, nw, nh)) {
+            dlssg::capture_hudless(frame_cmd(), ni, nl, nw, nh);
+        } else {
+            transition(colors[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            dlssg::capture_hudless(frame_cmd(), colors[0]->image, colors[0]->layout, std::min(colors[0]->iw, uint32_t(w * colors[0]->scale + 0.5f)), std::min(colors[0]->ih, uint32_t(h * colors[0]->scale + 0.5f)));
+        }
     }
     if (!g_mv_hudless.empty()) {
         end_pass();
@@ -3538,15 +3568,45 @@ bool present(uint32_t buffer_id) {
     static double next_snap = snap_from;
     for (auto& [key, s] : g_surfaces) {
         if (s->offset == offset && !s->depth() && s->width >= width && s->height >= height) {
-            if (snap_every > 0.0 && elapsed >= next_snap) {
-                char name[64];
-                std::snprintf(name, sizeof name, "/snap_%07.1f.ppm", elapsed);
-                schedule_snapshot(s.get(), width, height, snap_dir + name);
-                while (next_snap <= elapsed) next_snap += snap_every;
+            bool snap = snap_every > 0.0 && elapsed >= next_snap;
+            char name[64];
+            std::snprintf(name, sizeof name, "/snap_%07.1f.ppm", elapsed);
+            if (snap) while (next_snap <= elapsed) next_snap += snap_every;
+            if (dlssnr::active()) {
+                Surface* sp = s.get();
+                uint32_t rw = std::min(sp->iw, up(width, sp->scale)), rh = std::min(sp->ih, up(height, sp->scale));
+                if (dlssnr::pending()) {
+                    end_pass();
+                    transition(sp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                    dlssnr::evaluate(frame_cmd(), sp->image, sp->layout, rw, rh);
+                }
+                VkImage si, so;
+                uint32_t sw, sh, sow, soh;
+                if (snap && dlssnr::snapshot_images(frame_cmd(), si, sw, sh, so, sow, soh)) {
+                    char nname[64];
+                    std::snprintf(nname, sizeof nname, "/nrin_%07.1f.ppm", elapsed);
+                    schedule_image_snapshot(si, sw, sh, snap_dir + nname);
+                    std::snprintf(nname, sizeof nname, "/nrout_%07.1f.ppm", elapsed);
+                    schedule_image_snapshot(so, sow, soh, snap_dir + nname);
+                }
+                VkImage ci;
+                VkImageLayout* cl = nullptr;
+                uint32_t cw, ch;
+                transition(sp, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                if (dlssnr::compose(frame_cmd(), sp->view, sp->layout, rw, rh, ci, cl, cw, ch)) {
+                    if (snap) schedule_image_snapshot(ci, cw, ch, snap_dir + name);
+                    uint64_t pt = ticks();
+                    present_image(ci, *cl, cw, ch);
+                    g_stats.present_ticks += ticks() - pt;
+                    dlssnr::end_frame();
+                    return true;
+                }
             }
+            if (snap) schedule_snapshot(s.get(), width, height, snap_dir + name);
             uint64_t pt = ticks();
             present_image(s->image, s->layout, width, height);
             g_stats.present_ticks += ticks() - pt;
+            dlssnr::end_frame();
             return true;
         }
     }

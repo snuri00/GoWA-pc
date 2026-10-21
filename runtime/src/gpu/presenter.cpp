@@ -3,6 +3,7 @@
 #include "gpu/rsx.h"
 #include "vk_context.h"
 #include "dlssg.h"
+#include "dlssnr.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
 #include "runtime/hooks.h"
@@ -259,7 +260,8 @@ bool init() {
         wc.lpszClassName = L"GOWA";
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         RegisterClassW(&wc);
-        RECT r{0, 0, 1280, 720};
+        LONG ws = dlssnr::mode() == 2 ? 2 : 1;
+        RECT r{0, 0, 1280 * ws, 720 * ws};
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
         HWND h = CreateWindowExW(0, L"GOWA", L"God of War: Ascension", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
                                  r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
@@ -330,7 +332,7 @@ bool init() {
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
     std::vector<const char*> dexts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
-    if (dlssg::active()) {
+    if (dlssg::active() || dlssnr::requested()) {
         uint32_t en = 0;
         vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &en, nullptr);
         std::vector<VkExtensionProperties> avail_exts(en);
@@ -357,7 +359,7 @@ bool init() {
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = a12.bufferDeviceAddress;
     f12.timelineSemaphore = a12.timelineSemaphore;
-    if (dlssg::active()) f13.pNext = &f12;
+    if (dlssg::active() || dlssnr::requested()) f13.pNext = &f12;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f13;
     f2.features.samplerAnisotropy = avail.samplerAnisotropy;
@@ -382,6 +384,7 @@ bool init() {
     volkLoadDevice(g.device);
     vkGetDeviceQueue(g.device, g.queue_family, 0, &g.queue);
     dlssg::device_ready(g.phys, g.device);
+    dlssnr::device_ready(g.instance, g.phys, g.device);
     g.ctx = {g.phys, g.device, g.queue, g.queue_family, g.features, a13.pipelineCreationCacheControl == VK_TRUE};
     if (!create_swapchain()) return false;
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -408,6 +411,7 @@ bool init() {
 void shutdown() {
     if (!g.device) return;
     vkDeviceWaitIdle(g.device);
+    dlssnr::shutdown();
     dlssg::shutdown();
 }
 
