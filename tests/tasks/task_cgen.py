@@ -88,6 +88,8 @@ def generate(name, ea):
         OPS_H="../pm/pm_ops.h",
         HEADER_BYTES=0x30,
         EXTRA_ROOTS=tuple(sorted(recorded_starts(ls, img))),
+        DISPATCH_TABLE=True,
+        DISPATCH_GATE="spuf::glue_disp_on()",
     )
     print(name, file=sys.stderr)
     G.emit(os.path.join(OUT, "tk_%s_gen.cpp" % name), os.path.join(OUT, "tk_%s_gen.h" % name))

@@ -19,6 +19,15 @@ inline const bool g_avx2 = avx2_env();
 
 inline bool avx2_on() { return g_avx2; }
 
+inline bool glue_disp_env() {
+    const char* e = std::getenv("GOWA_GLUE_DISPATCH");
+    return !(e && e[0] == '0');
+}
+
+inline const bool g_glue_disp = g_avx2 && glue_disp_env();
+
+inline bool glue_disp_on() { return g_glue_disp; }
+
 struct CsrGuard {
     unsigned old;
     CsrGuard() : old(_mm_getcsr()) { _mm_setcsr((old & ~0x6000u) | 0x6000u | 0x8040u); }

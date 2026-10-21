@@ -25,6 +25,7 @@ HEADER_BYTES = 0x40
 EXTRA_ROOTS = ()
 IE_INLINE = False
 DISPATCH_TABLE = False
+DISPATCH_GATE = "spuf::avx2_on()"
 
 RJ.configure(IMG_EA=PM_EA, IMG_LS=PM_LS, IMG_SIZE=PM_SIZE, CODE_END=0x39D8)
 
@@ -224,7 +225,7 @@ def emit(out_cpp, out_h):
         for k, l in enumerate(hs):
             if lo <= l < hi:
                 index[(l - lo) // 4] = k + 1
-        o.append("    if (spuf::avx2_on()) {")
+        o.append("    if (%s) {" % DISPATCH_GATE)
         o.append("        static const void* const kEntryLabel[] = {&&ENTRY_DEFAULT, %s};" % ", ".join("&&L_%05x" % l for l in hs))
         o.append("        static const uint16_t kEntryIndex[%d] = {%s};" % (n, ",".join(str(v) for v in index)))
         o.append("        uint32_t ei = (c.pc - 0x%xu) >> 2;" % lo)
@@ -360,7 +361,7 @@ def emit(out_cpp, out_h):
         index = [0] * n
         for k, l in enumerate(targets):
             index[(l - lo) // 4] = k + 1
-        o.append("    if (spuf::avx2_on()) {")
+        o.append("    if (%s) {" % DISPATCH_GATE)
         o.append("        uint32_t di = (tgt - 0x%xu) >> 2;" % lo)
         o.append("        if (di < %du) goto *kDispLabel[kDispIndex[di]];" % n)
         o.append("    }")
@@ -368,7 +369,7 @@ def emit(out_cpp, out_h):
                        "    static const uint16_t kDispIndex[%d] = {%s};" % (n, ",".join(str(v) for v in index))]
         at = o.index("    // DISPATCH_TABLES")
         o[at:at + 1] = disp_tables
-        jump = "{ if (__builtin_expect(cnt >= lim, 0)) X(tgt, 0); if (spuf::avx2_on()) { uint32_t dj = (tgt - 0x%xu) >> 2; if (dj < %du) goto *kDispLabel[kDispIndex[dj]]; } goto DISPATCH; }" % (lo, n)
+        jump = "{ if (__builtin_expect(cnt >= lim, 0)) X(tgt, 0); if (%s) { uint32_t dj = (tgt - 0x%xu) >> 2; if (dj < %du) goto *kDispLabel[kDispIndex[dj]]; } goto DISPATCH; }" % (DISPATCH_GATE, lo, n)
         o = [l.replace("goto DISPATCH;", jump) if "goto DISPATCH;" in l and not l.lstrip().startswith("{ if (__builtin_expect") else l for l in o]
     o.append("    switch (tgt) {")
     for l in targets:
