@@ -329,6 +329,23 @@ bool wait_previous_edge_list_started(ppu::Context& ctx) {
     return false;
 }
 
+bool restore_post_pass_keys(ppu::Context&) {
+    if (const char* e = std::getenv("GOWA_POST_KEYS"); e && std::string(e) == "0") return false;
+    uint64_t base = vm::read32(0x83d004) ? 0 : vm::read64(0x397400);
+    struct Slot {
+        uint32_t addr;
+        uint64_t pass;
+    };
+    static const Slot slots[] = {{0x9abfb8, 4}, {0x9abfa0, 6}};
+    for (const Slot& s : slots) {
+        if (vm::read64(s.addr)) continue;
+        uint64_t key = (base & 0x0c3ffffffffffff0ull) | 0x9000000000000000ull | (uint64_t(5) << 54) | s.pass;
+        vm::write64(s.addr, key);
+        LOG_INFO("patch", "render pass key 0x%08x = 0x%016llx", s.addr, static_cast<unsigned long long>(key));
+    }
+    return false;
+}
+
 void tick_patches() {
     static const bool off = [] {
         const char* e = std::getenv("GOWA_GAME_PATCHES");
@@ -403,7 +420,7 @@ void install_patches() {
         uint32_t addr;
         bool (*guard)(ppu::Context&);
     };
-    static const Patch patches[] = {{0x39ea58, skip_repeated_mip_eviction}, {0x41c480, wait_previous_edge_list_started}, {0x2d0258, fps_unlock_timestep}};
+    static const Patch patches[] = {{0x39ea58, skip_repeated_mip_eviction}, {0x41c480, wait_previous_edge_list_started}, {0x2d0258, fps_unlock_timestep}, {0x397540, restore_post_pass_keys}};
     for (const Patch& p : patches) {
         Hook*& h = g_hooks[p.addr];
         if (!h) {
