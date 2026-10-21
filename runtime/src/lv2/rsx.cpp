@@ -1,3 +1,4 @@
+#include "runtime/placement.h"
 #include "runtime/hostsleep.h"
 #include "event.h"
 #include "gpu/presenter.h"
@@ -318,6 +319,7 @@ struct LineReader {
 
 void fifo_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX FIFO");
+    placement::apply("fifo");
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_fifo_handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
     if (std::getenv("GOWA_PROFILE_FIFO")) crash::profile_thread(g_fifo_handle, "rsx fifo");
     LOG_INFO("rsx", "null RSX FIFO thread started");
@@ -436,6 +438,7 @@ void fifo_thread() {
 
 void vblank_thread() {
     SetThreadDescription(GetCurrentThread(), L"RSX VBlank");
+    placement::apply("vblank");
     auto next = std::chrono::steady_clock::now();
     while (g_rsx.running) {
         next += std::chrono::nanoseconds(static_cast<int64_t>(16683333 / ppu::time_scale()));

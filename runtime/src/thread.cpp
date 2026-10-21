@@ -1,3 +1,4 @@
+#include "runtime/placement.h"
 #include "runtime/thread.h"
 #include "runtime/kernel.h"
 #include "runtime/log.h"
@@ -39,6 +40,7 @@ void body(std::shared_ptr<Thread> t) {
     t_current = t.get();
     t->native = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
     set_host_name("PPU " + t->name);
+    placement::apply("ppu:" + t->name);
     if (const char* e = std::getenv("GOWA_PROFILE_PPU")) {
         if (t->name == e) {
             HANDLE h = nullptr;

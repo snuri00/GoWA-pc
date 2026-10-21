@@ -1,3 +1,4 @@
+#include "runtime/placement.h"
 #include "gpu/presenter.h"
 #include "gpu/rsx.h"
 #include "vk_context.h"
@@ -246,6 +247,7 @@ bool init() {
     std::condition_variable wcv;
     std::thread([&] {
         SetThreadDescription(GetCurrentThread(), L"Window");
+        placement::apply("window");
         WNDCLASSW wc{};
         wc.lpfnWndProc = wnd_proc;
         wc.hInstance = GetModuleHandleW(nullptr);

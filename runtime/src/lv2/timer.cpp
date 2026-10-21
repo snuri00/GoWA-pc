@@ -1,3 +1,4 @@
+#include "runtime/placement.h"
 #include "event.h"
 #include "ppu/ops.h"
 
@@ -30,6 +31,7 @@ uint64_t now_us() { return ppu::timebase() / 80; }
 
 void timer_thread() {
     SetThreadDescription(GetCurrentThread(), L"LV2 Timer");
+    placement::apply("timer");
     std::unique_lock lk(g_lock);
     for (;;) {
         uint64_t now = now_us();
