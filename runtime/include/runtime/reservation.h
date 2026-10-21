@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 
 namespace rsv {
 
@@ -16,6 +17,13 @@ bool lost(uint32_t line, uint64_t rtime, const uint8_t* rdata);
 void wait_change(uint32_t line, uint64_t rtime, uint32_t micros);
 bool wait_lost(uint32_t line, uint64_t rtime, const uint8_t* rdata, uint32_t micros);
 bool sleepers();
+std::string wait_stats_take();
+bool park_enabled();
+int park_alloc();
+void park_free(int slot);
+uint32_t park_word(int slot);
+void park_kick(int slot);
+int wait_parked(uint32_t line, uint64_t rtime, const uint8_t* rdata, int slot, uint32_t w0, int64_t limit_us, const std::atomic<bool>& stop);
 void wake(uint32_t addr);
 bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size);
 bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi);

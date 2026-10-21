@@ -70,9 +70,11 @@ struct SpuThread : Host {
         uint32_t first = (lsa & 0x3FFFF) >> 7, last = ((lsa & 0x3FFFF) + size - 1) >> 7;
         for (uint32_t l = first; l <= last && l < 0x40000 / 128; l++) line_epoch[l].store(e, std::memory_order_release);
     }
+    int park_slot = rsv::park_alloc();
     void wake_rsv_waiter() {
         uint32_t r = raddr;
         if (r) rsv::wake(r);
+        rsv::park_kick(park_slot);
     }
     void mark_all_ls() {
         if (cap_on.load(std::memory_order_relaxed)) note_cap_write(0, 0x40000);
@@ -96,6 +98,7 @@ struct SpuThread : Host {
     std::condition_variable cv;
     std::atomic<bool> stop_flag{false};
     std::atomic<uint64_t> insns{0};
+    std::atomic<uint32_t> waiting{0};
     uint32_t pc_samples[256] = {};
     std::atomic<uint32_t> pc_sample_pos{0};
     bool running = false;
