@@ -24,6 +24,7 @@ OPS_H = "pm_ops.h"
 HEADER_BYTES = 0x40
 EXTRA_ROOTS = ()
 IE_INLINE = False
+DISPATCH_TABLE = False
 
 RJ.configure(IMG_EA=PM_EA, IMG_LS=PM_LS, IMG_SIZE=PM_SIZE, CODE_END=0x39D8)
 
@@ -213,11 +214,30 @@ def emit(out_cpp, out_h):
     o.append("    uint64_t lim = c.interrupts_enabled && budget > kIrqSlice ? kIrqSlice : budget;")
     regs = sorted({r for d in insns.values() for k in ("rt", "ra", "rb", "rc") if k in d for r in [d[k]]})
     o.append("    " + " ".join("V& r%d = R[%d];" % (r, r) for r in regs))
+    if DISPATCH_TABLE:
+        o.append("    // DISPATCH_TABLES")
+    if DISPATCH_TABLE and hooks:
+        lo, hi = CODE[0][0], CODE[-1][1]
+        n = (hi - lo) // 4
+        hs = sorted(set(hooks))
+        index = [0] * n
+        for k, l in enumerate(hs):
+            if lo <= l < hi:
+                index[(l - lo) // 4] = k + 1
+        o.append("    if (spuf::avx2_on()) {")
+        o.append("        static const void* const kEntryLabel[] = {&&ENTRY_DEFAULT, %s};" % ", ".join("&&L_%05x" % l for l in hs))
+        o.append("        static const uint16_t kEntryIndex[%d] = {%s};" % (n, ",".join(str(v) for v in index)))
+        o.append("        uint32_t ei = (c.pc - 0x%xu) >> 2;" % lo)
+        o.append("        if (ei < %du && !(c.pc & 3)) goto *kEntryLabel[kEntryIndex[ei]];" % n)
+        o.append("    }")
     o.append("    switch (c.pc) {")
     for hk in hooks:
         o.append("    case 0x%05x: goto L_%05x;" % (hk, hk))
     o.append("    default: return false;")
     o.append("    }")
+    if DISPATCH_TABLE and hooks:
+        o.append("ENTRY_DEFAULT:")
+        o.append("    return false;")
     prev_fall = None
     for pc in pcs:
         d = insns[pc]
@@ -333,11 +353,31 @@ def emit(out_cpp, out_h):
                 o.append("    X(0x%05x, 0);" % nxt)
     o.append("DISPATCH:")
     o.append("    if (__builtin_expect(cnt >= lim, 0)) X(tgt, 0);")
+    targets = sorted(set(insns) & lead)
+    if DISPATCH_TABLE and targets:
+        lo, hi = CODE[0][0], CODE[-1][1]
+        n = (hi - lo) // 4
+        index = [0] * n
+        for k, l in enumerate(targets):
+            index[(l - lo) // 4] = k + 1
+        o.append("    if (spuf::avx2_on()) {")
+        o.append("        uint32_t di = (tgt - 0x%xu) >> 2;" % lo)
+        o.append("        if (di < %du) goto *kDispLabel[kDispIndex[di]];" % n)
+        o.append("    }")
+        disp_tables = ["    static const void* const kDispLabel[] = {&&DISPATCH_DEFAULT, %s};" % ", ".join("&&L_%05x" % l for l in targets),
+                       "    static const uint16_t kDispIndex[%d] = {%s};" % (n, ",".join(str(v) for v in index))]
+        at = o.index("    // DISPATCH_TABLES")
+        o[at:at + 1] = disp_tables
+        jump = "{ if (__builtin_expect(cnt >= lim, 0)) X(tgt, 0); if (spuf::avx2_on()) { uint32_t dj = (tgt - 0x%xu) >> 2; if (dj < %du) goto *kDispLabel[kDispIndex[dj]]; } goto DISPATCH; }" % (lo, n)
+        o = [l.replace("goto DISPATCH;", jump) if "goto DISPATCH;" in l and not l.lstrip().startswith("{ if (__builtin_expect") else l for l in o]
     o.append("    switch (tgt) {")
-    for l in sorted(set(insns) & lead):
+    for l in targets:
         o.append("    case 0x%05x: goto L_%05x;" % (l, l))
     o.append("    default: X(tgt, 0);")
     o.append("    }")
+    if DISPATCH_TABLE and targets:
+        o.append("DISPATCH_DEFAULT:")
+        o.append("    X(tgt, 0);")
     o.append("}")
     o.append("")
     o.append("const uint32_t kHooks[] = {%s};" % ", ".join("0x%05xu" % h for h in hooks))

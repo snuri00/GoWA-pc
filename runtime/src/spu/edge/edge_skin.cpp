@@ -168,12 +168,12 @@ void blend_exact(const Ls& ls, uint32_t matrices, uint32_t wp, uint32_t pp, uint
     ls.st(pp, o);
 }
 
-void blend_pair(const Ls& ls, const float* mc, uint32_t nmat, uint32_t matrices, uint32_t wp, uint32_t pp, uint32_t tp) {
+bool blend_pair(const Ls& ls, const float* mc, uint32_t nmat, uint32_t matrices, uint32_t wp, uint32_t pp, uint32_t tp, __m256* rout = nullptr) {
     const uint8_t* b = ls.p;
     if (((wp & 0x3ffff) + 16) > 0x40000 || ((pp & 0x3ffff) + 32) > 0x40000) {
         blend_exact(ls, matrices, wp, pp, tp);
         blend_exact(ls, matrices, wp + 8, pp + 16, tp + 48);
-        return;
+        return false;
     }
     __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + (wp & 0x3ffff)));
     __m128i wsel = _mm_shuffle_epi8(raw, _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1));
@@ -183,7 +183,7 @@ void blend_pair(const Ls& ls, const float* mc, uint32_t nmat, uint32_t matrices,
     if (nmat == 0 || !_mm_testz_si128(over, _mm_setr_epi32(-1, -1, 0, 0)) || !small8(p)) {
         blend_exact(ls, matrices, wp, pp, tp);
         blend_exact(ls, matrices, wp + 8, pp + 16, tp + 48);
-        return;
+        return false;
     }
     uint64_t iv = uint64_t(_mm_cvtsi128_si64(isel));
     uint32_t ia[4], ib[4];
@@ -216,10 +216,19 @@ void blend_pair(const Ls& ls, const float* mc, uint32_t nmat, uint32_t matrices,
     __m256 o = _mm256_fmadd_ps(p, r0, tr);
     o = _mm256_fmadd_ps(yzx8(p), r1, o);
     o = _mm256_fmadd_ps(zxy8(p), r2, o);
-    st8(ls.p, tp, tp + 48, pz8(r0));
-    st8(ls.p, tp + 16, tp + 64, pz8(r1));
-    st8(ls.p, tp + 32, tp + 80, pz8(r2));
+    r0 = pz8(r0);
+    r1 = pz8(r1);
+    r2 = pz8(r2);
+    st8(ls.p, tp, tp + 48, r0);
+    st8(ls.p, tp + 16, tp + 64, r1);
+    st8(ls.p, tp + 32, tp + 80, r2);
     st8(ls.p, pp, pp + 16, pz8(o));
+    if (rout) {
+        rout[0] = r0;
+        rout[1] = r1;
+        rout[2] = r2;
+    }
+    return true;
 }
 
 void transform_exact(const Ls& ls, uint32_t tmp, uint32_t a) {
@@ -229,6 +238,102 @@ void transform_exact(const Ls& ls, uint32_t tmp, uint32_t a) {
     o = spuf::fma(yzx(n), r1, o);
     o = spuf::fma(zxy(n), r2, o);
     ls.st(a, o);
+}
+
+inline __m256 ld8u(const uint8_t* lo, const uint8_t* hi) {
+    __m256i v = _mm256_loadu2_m128i(reinterpret_cast<const __m128i*>(hi), reinterpret_cast<const __m128i*>(lo));
+    return _mm256_castsi256_ps(_mm256_shuffle_epi8(v, kBswap));
+}
+
+inline void st8u(uint8_t* lo, uint8_t* hi, __m256 v) {
+    __m256i b = _mm256_shuffle_epi8(_mm256_castps_si256(v), kBswap);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(lo), _mm256_castsi256_si128(b));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(hi), _mm256_extracti128_si256(b, 1));
+}
+
+void transform_exact(const Ls& ls, uint32_t tmp, uint32_t a);
+
+bool skin_pair_v2(const Ls& ls, const uint8_t* mcb, __m128i lim, uint32_t wp, uint32_t pp, uint32_t tp, const uint32_t* tabs, uint32_t ntab) {
+    uint8_t* L = ls.p;
+    __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(L + wp));
+    __m128i isel = _mm_shuffle_epi8(raw, _mm_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1, -1, -1, -1, -1, -1, -1, -1));
+    if (!_mm_testz_si128(_mm_subs_epu8(isel, lim), _mm_setr_epi32(-1, -1, 0, 0))) return false;
+    __m256 p = ld8u(L + pp, L + pp + 16);
+    if (!small8(p)) return false;
+    __m128i wsel = _mm_shuffle_epi8(raw, _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1));
+    __m256i ix = _mm256_cvtepu8_epi32(isel);
+    __m256i off = _mm256_add_epi32(_mm256_slli_epi32(ix, 5), _mm256_slli_epi32(ix, 4));
+    alignas(32) uint32_t o[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(o), off);
+    __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(wsel)), _mm256_castsi256_ps(_mm256_set1_epi32(0x3b808080)));
+    __m256 w0 = _mm256_permutevar8x32_ps(wf, _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4));
+    __m256 w1 = _mm256_permutevar8x32_ps(wf, _mm256_setr_epi32(1, 1, 1, 1, 5, 5, 5, 5));
+    __m256 w2 = _mm256_permutevar8x32_ps(wf, _mm256_setr_epi32(2, 2, 2, 2, 6, 6, 6, 6));
+    __m256 w3 = _mm256_permutevar8x32_ps(wf, _mm256_setr_epi32(3, 3, 3, 3, 7, 7, 7, 7));
+    const uint8_t* a0 = mcb + o[0];
+    const uint8_t* a1 = mcb + o[1];
+    const uint8_t* a2 = mcb + o[2];
+    const uint8_t* a3 = mcb + o[3];
+    const uint8_t* b0 = mcb + o[4];
+    const uint8_t* b1 = mcb + o[5];
+    const uint8_t* b2 = mcb + o[6];
+    const uint8_t* b3 = mcb + o[7];
+    auto ldm = [](const uint8_t* hi, const uint8_t* lo) { return _mm256_loadu2_m128(reinterpret_cast<const float*>(hi), reinterpret_cast<const float*>(lo)); };
+    __m256 r[3];
+    for (int row = 0; row < 3; row++) {
+        int ro = 16 * row;
+        __m256 acc0 = _mm256_mul_ps(w0, ldm(b0 + ro, a0 + ro));
+        acc0 = _mm256_fmadd_ps(w1, ldm(b1 + ro, a1 + ro), acc0);
+        acc0 = _mm256_fmadd_ps(w2, ldm(b2 + ro, a2 + ro), acc0);
+        r[row] = _mm256_fmadd_ps(w3, ldm(b3 + ro, a3 + ro), acc0);
+    }
+    const __m256 xyz = _mm256_castsi256_ps(_mm256_setr_epi32(-1, -1, -1, 0, -1, -1, -1, 0));
+    __m256 r0 = _mm256_blendv_ps(_mm256_set1_ps(1.0f), r[0], xyz);
+    __m256 r1 = _mm256_and_ps(r[1], xyz);
+    __m256 r2 = _mm256_and_ps(r[2], xyz);
+    __m256 u0 = _mm256_unpackhi_ps(r[0], r[1]);
+    __m256 tr = _mm256_and_ps(_mm256_shuffle_ps(u0, r[2], _MM_SHUFFLE(3, 3, 3, 2)), xyz);
+    __m256 ov = _mm256_fmadd_ps(p, r0, tr);
+    ov = _mm256_fmadd_ps(yzx8(p), r1, ov);
+    ov = _mm256_fmadd_ps(zxy8(p), r2, ov);
+    r0 = pz8(r0);
+    r1 = pz8(r1);
+    r2 = pz8(r2);
+    st8u(L + tp, L + tp + 48, r0);
+    st8u(L + tp + 16, L + tp + 64, r1);
+    st8u(L + tp + 32, L + tp + 80, r2);
+    st8u(L + pp, L + pp + 16, pz8(ov));
+    if (ntab) {
+        const __m256 am = _mm256_set1_ps(-0.0f);
+        bool rs = small8(_mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(am, r0), _mm256_andnot_ps(am, r1)), _mm256_andnot_ps(am, r2)));
+        for (uint32_t t = 0; t < ntab; t++) {
+            uint32_t a = tabs[t];
+            __m256 n = ld8u(L + a, L + a + 16);
+            if (!rs || !small8(n)) {
+                transform_exact(ls, tp, a);
+                transform_exact(ls, tp + 48, a + 16);
+                continue;
+            }
+            __m256 x = _mm256_mul_ps(n, r0);
+            x = _mm256_fmadd_ps(yzx8(n), r1, x);
+            x = _mm256_fmadd_ps(zxy8(n), r2, x);
+            st8u(L + a, L + a + 16, pz8(x));
+        }
+    }
+    return true;
+}
+
+void transform_pair_r(const Ls& ls, uint32_t tmp, uint32_t a, __m256 r0, __m256 r1, __m256 r2, bool rsmall) {
+    __m256 n = ld8(ls.p, a, a + 16);
+    if (!rsmall || !small8(n)) {
+        transform_exact(ls, tmp, a);
+        transform_exact(ls, tmp + 48, a + 16);
+        return;
+    }
+    __m256 o = _mm256_mul_ps(n, r0);
+    o = _mm256_fmadd_ps(yzx8(n), r1, o);
+    o = _mm256_fmadd_ps(zxy8(n), r2, o);
+    st8(ls.p, a, a + 16, pz8(o));
 }
 
 void transform_pair(const Ls& ls, uint32_t tmp, uint32_t a) {
@@ -330,6 +435,35 @@ bool skin_vertexes(uint8_t* lsp, uint32_t ctx, uint32_t matrices, uint32_t num_m
     uint32_t tp[2] = {ntab > 0 ? tables[0] : 0, ntab > 1 ? tables[1] : 0};
     uint32_t t96p = ls.w(ctx + 96);
     uint32_t remaining = total;
+    const bool fused = spuf::avx2_on();
+    const __m128i lim = _mm_set1_epi8(char(nfast ? nfast - 1 : 0));
+    while (remaining && fused) {
+        uint32_t cnt = remaining > batch ? batch : remaining;
+        for (uint32_t v = 0; v < cnt; v += 2) {
+            if (nfast && !t96p) {
+                uint32_t tv[2] = {tp[0] + 16 * v, tp[1] + 16 * v};
+                if (skin_pair_v2(ls, reinterpret_cast<const uint8_t*>(cache.data()), lim, wp + 8 * v, pp + 16 * v, temp + 48 * v, tv, ntab)) continue;
+            }
+            __m256 rr[3];
+            bool f = blend_pair(ls, cache.data(), nfast, matrices, wp + 8 * v, pp + 16 * v, temp + 48 * v, rr);
+            if (t96p) {
+                cofactor_one(ls, temp + 48 * v, t96p + 16 * v);
+                cofactor_one(ls, temp + 48 * v + 48, t96p + 16 * v + 16);
+            }
+            if (f) {
+                const __m256 am = _mm256_set1_ps(-0.0f);
+                bool rs = small8(_mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(am, rr[0]), _mm256_andnot_ps(am, rr[1])), _mm256_andnot_ps(am, rr[2])));
+                for (uint32_t t = 0; t < ntab; t++) transform_pair_r(ls, temp + 48 * v, tp[t] + 16 * v, rr[0], rr[1], rr[2], rs);
+            } else
+                for (uint32_t t = 0; t < ntab; t++) transform_pair(ls, temp + 48 * v, tp[t] + 16 * v);
+        }
+        if (t96p) t96p += 16 * cnt;
+        wp += 8 * cnt;
+        pp += 16 * cnt;
+        tp[0] += 16 * cnt;
+        tp[1] += 16 * cnt;
+        remaining -= cnt;
+    }
     while (remaining) {
         uint32_t cnt = remaining > batch ? batch : remaining;
         for (uint32_t v = 0; v < cnt; v += 2) blend_pair(ls, cache.data(), nfast, matrices, wp + 8 * v, pp + 16 * v, temp + 48 * v);
