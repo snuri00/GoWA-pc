@@ -916,13 +916,7 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
         }
         uint32_t guest = ea;
         if (ea < 0xF0000000u) {
-            uint32_t done = 0;
-            while (done < size) {
-                uint32_t a = guest + done;
-                uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
-                rsv::store_locked(a, ls + lsa + done, chunk);
-                done += chunk;
-            }
+            rsv::store_range(guest, ls + lsa, size);
         } else {
             std::memcpy(p, ls + lsa, size);
             if (group) {

@@ -24,19 +24,46 @@ namespace rsv {
 
 namespace {
 
-struct alignas(64) Entry {
+constexpr uint32_t PER_GROUP = 7;
+constexpr uint32_t GROUPS = 1u << 14;
+constexpr uint32_t GROUP_MASK = GROUPS - 1;
+
+struct Entry {
     std::atomic<uint64_t> ver{0};
 };
 
-Entry g_table[65536];
+struct alignas(64) Group {
+    std::atomic<uint64_t> lock{0};
+    Entry e[PER_GROUP];
+};
+static_assert(sizeof(Group) == 64);
 
-Entry& entry(uint32_t addr) { return g_table[(addr >> 7) & 0xFFFF]; }
+Group g_groups[GROUPS];
 
-uint64_t lock_line(Entry& e) {
+Entry& entry(uint32_t addr) {
+    uint32_t l = addr >> 7;
+    return g_groups[(l / PER_GROUP) & GROUP_MASK].e[l % PER_GROUP];
+}
+
+struct Cursor {
+    uint32_t g, s;
+    explicit Cursor(uint32_t addr) : g((addr >> 7) / PER_GROUP), s((addr >> 7) % PER_GROUP) {}
+    Entry& operator*() const { return g_groups[g & GROUP_MASK].e[s]; }
+    void next() {
+        if (++s == PER_GROUP) {
+            s = 0;
+            g++;
+        }
+    }
+};
+
+Group& group_of(Entry& e) { return *reinterpret_cast<Group*>(reinterpret_cast<uintptr_t>(&e) & ~uintptr_t(63)); }
+
+void lock_group(Group& g) {
     uint32_t spins = 0;
     for (;;) {
-        uint64_t v = e.ver.load(std::memory_order_relaxed);
-        if (!(v & 64) && e.ver.compare_exchange_weak(v, v + 64, std::memory_order_acq_rel, std::memory_order_relaxed)) return v;
+        uint64_t z = 0;
+        if (g.lock.load(std::memory_order_relaxed) == 0 && g.lock.compare_exchange_weak(z, 1, std::memory_order_acquire, std::memory_order_relaxed)) return;
         if (++spins < 2000) {
             _mm_pause();
         } else {
@@ -46,7 +73,26 @@ uint64_t lock_line(Entry& e) {
     }
 }
 
-void unlock_line(Entry& e, uint64_t v, bool wrote) { e.ver.store(wrote ? v + 128 : v, std::memory_order_release); }
+void unlock_group(Group& g) { g.lock.store(0, std::memory_order_release); }
+
+uint64_t mark_line(Entry& e) {
+    uint64_t v = e.ver.load(std::memory_order_relaxed);
+    e.ver.store(v + 64, std::memory_order_relaxed);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return v;
+}
+
+uint64_t lock_line(Entry& e) {
+    lock_group(group_of(e));
+    return mark_line(e);
+}
+
+void unlock_line(Entry& e, uint64_t v, bool wrote) {
+    e.ver.store(wrote ? v + 128 : v, std::memory_order_release);
+    unlock_group(group_of(e));
+}
+
+const bool g_logged = std::getenv("GOWA_RSV_LOG") != nullptr;
 
 }
 
@@ -112,7 +158,7 @@ bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uin
         unlock_line(e, v0, false);
         return false;
     }
-    log_change(line, offset, data, size, size == 128 ? "putllc" : "stcx");
+    if (g_logged) log_change(line, offset, data, size, size == 128 ? "putllc" : "stcx");
     uint8_t* dst = vm::ptr(line + offset);
     for (uint32_t i = 0; i < size; i += 8) {
         uint64_t want, was;
@@ -131,7 +177,7 @@ bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uin
 void store_unconditional(uint32_t line, const uint8_t* data) {
     Entry& e = entry(line);
     uint64_t v0 = lock_line(e);
-    log_change(line, 0, data, 128, "putlluc");
+    if (g_logged) log_change(line, 0, data, 128, "putlluc");
     std::memcpy(vm::ptr(line), data, 128);
     unlock_line(e, v0, true);
     if (sleepers()) e.ver.notify_all();
@@ -140,28 +186,50 @@ void store_unconditional(uint32_t line, const uint8_t* data) {
 void store_locked(uint32_t addr, const void* data, uint32_t size) {
     Entry& e = entry(addr & ~127u);
     uint64_t v0 = lock_line(e);
-    log_change(addr & ~127u, addr & 127u, static_cast<const uint8_t*>(data), size, "store");
+    if (g_logged) log_change(addr & ~127u, addr & 127u, static_cast<const uint8_t*>(data), size, "store");
     std::memcpy(vm::ptr(addr), data, size);
     unlock_line(e, v0, true);
     if (sleepers()) e.ver.notify_all();
 }
 
 void store_range(uint32_t addr, const uint8_t* data, uint32_t size) {
-    static const bool logged = std::getenv("GOWA_RSV_LOG") != nullptr;
-    const bool wake = sleepers();
-    uint32_t done = 0;
-    while (done < size) {
-        uint32_t a = addr + done;
-        uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
-        if (done + chunk < size) _m_prefetchw(&entry(a + 128).ver);
-        Entry& e = entry(a & ~127u);
-        uint64_t v0 = lock_line(e);
-        if (logged) log_change(a & ~127u, a & 127u, data + done, chunk, "store");
-        std::memcpy(vm::ptr(a), data + done, chunk);
-        unlock_line(e, v0, true);
-        if (wake) e.ver.notify_all();
-        done += chunk;
+    if (!size) return;
+    const uint32_t first = addr >> 7;
+    const uint32_t n = ((addr + size - 1) >> 7) - first + 1;
+    if (n > 256) {
+        uint32_t done = 0;
+        while (done < size) {
+            uint32_t chunk = (std::min)(size - done, 0x8000u - ((addr + done) & 0x7FFFu));
+            store_range(addr + done, data + done, chunk);
+            done += chunk;
+        }
+        return;
     }
+    const uint32_t g0 = first / PER_GROUP;
+    const uint32_t ng = (first + n - 1) / PER_GROUP - g0 + 1;
+    const uint32_t gi0 = g0 & GROUP_MASK;
+    const uint32_t split = gi0 + ng > GROUPS ? GROUPS - gi0 : ng;
+    for (uint32_t k = 0; k < ng - split; k++) lock_group(g_groups[k]);
+    for (uint32_t k = 0; k < split; k++) lock_group(g_groups[gi0 + k]);
+    uint64_t saved[256];
+    Cursor c(addr);
+    for (uint32_t k = 0; k < n; k++, c.next()) saved[k] = mark_line(*c);
+    if (g_logged) {
+        uint32_t done = 0;
+        while (done < size) {
+            uint32_t a = addr + done;
+            uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+            log_change(a & ~127u, a & 127u, data + done, chunk, "store");
+            done += chunk;
+        }
+    }
+    std::memcpy(vm::ptr(addr), data, size);
+    Cursor u(addr);
+    for (uint32_t k = 0; k < n; k++, u.next()) (*u).ver.store(saved[k] + 128, std::memory_order_release);
+    for (uint32_t k = 0; k < ng - split; k++) unlock_group(g_groups[k]);
+    for (uint32_t k = 0; k < split; k++) unlock_group(g_groups[gi0 + k]);
+    if (sleepers())
+        for (uint32_t k = 0; k < n; k++) entry(addr + (k << 7)).ver.notify_all();
 }
 
 void merge_bits(uint32_t addr, const uint8_t* data, const uint8_t* base, uint32_t size) {
@@ -227,10 +295,11 @@ bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t&
     const uint8_t* src = vm::ptr(addr);
     bool any = false;
     uint32_t done = 0;
+    Cursor c(addr);
     while (done < size) {
         uint32_t a = addr + done;
         uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
-        Entry& e = entry(a & ~127u);
+        Entry& e = *c;
         for (;;) {
             uint64_t v1 = e.ver.load(std::memory_order_acquire);
             if (v1 & 64) {
@@ -265,6 +334,7 @@ bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t&
             break;
         }
         done += chunk;
+        c.next();
     }
     return any;
 }
@@ -274,6 +344,7 @@ bool copy_range_prefetch(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& d
     const uint8_t* src = vm::ptr(addr);
     bool any = false;
     uint32_t done = 0;
+    Cursor c(addr);
     while (done < size) {
         uint32_t a = addr + done;
         uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
@@ -282,7 +353,7 @@ bool copy_range_prefetch(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& d
             _mm_prefetch(reinterpret_cast<const char*>(src + done + 1024), _MM_HINT_T0);
             _mm_prefetch(reinterpret_cast<const char*>(src + done + 1024 + 64), _MM_HINT_T0);
         }
-        Entry& e = entry(a & ~127u);
+        Entry& e = *c;
         for (;;) {
             uint64_t v1 = e.ver.load(std::memory_order_acquire);
             if (v1 & 64) {
@@ -313,6 +384,7 @@ bool copy_range_prefetch(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& d
             break;
         }
         done += chunk;
+        c.next();
     }
     return any;
 }
