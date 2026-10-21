@@ -2,18 +2,26 @@
 
 #include "ej_gen.h"
 
+#include <cstring>
+
 namespace edgejob {
 
 namespace {
 
-uint32_t rbe32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
+struct HeaderBytes {
+    uint8_t b[4 * pm::gen::ej::kHeaderWords];
+    HeaderBytes() {
+        for (uint32_t i = 0; i < pm::gen::ej::kHeaderWords; i++)
+            for (int k = 0; k < 4; k++) b[4 * i + k] = uint8_t(pm::gen::ej::kHeader[i] >> (24 - 8 * k));
+    }
+};
+
+const HeaderBytes hb;
 
 }
 
 bool image_loaded(const uint8_t* ls) {
-    for (uint32_t i = 0; i < pm::gen::ej::kHeaderWords; i++)
-        if (rbe32(ls + pm::gen::ej::kImageLs + 4 * i) != pm::gen::ej::kHeader[i]) return false;
-    return true;
+    return std::memcmp(ls + pm::gen::ej::kImageLs, hb.b, sizeof hb.b) == 0;
 }
 
 bool run_hook(spu::Context& c, spu::Host& h) {
