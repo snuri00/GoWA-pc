@@ -1,5 +1,6 @@
 #include "motion_vectors.h"
 #include "dlssg.h"
+#include "dlssnr.h"
 
 #include "runtime/log.h"
 #include "shader_compiler.h"
@@ -260,7 +261,7 @@ bool enabled() {
         const char* v = std::getenv("GOWA_MV_DEBUG");
         return v && std::atoi(v) != 0;
     }();
-    return e || dlssg::active();
+    return e || dlssg::active() || dlssnr::requested();
 }
 
 VkImage output(VkImageLayout& layout) {
