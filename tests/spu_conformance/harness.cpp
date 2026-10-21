@@ -43,6 +43,7 @@ bool same(const spu::v128& a, const spu::v128& b) { return std::memcmp(&a, &b, 1
 }
 
 int main(int argc, char** argv) {
+    _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
     if (argc < 3) {
         std::fprintf(stderr, "usage: spu_conformance <dir> <rpcs3 output>\n");
         return 2;

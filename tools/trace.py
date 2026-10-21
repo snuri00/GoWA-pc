@@ -371,7 +371,6 @@ def main():
     common.add_argument("--thread", default=argparse.SUPPRESS)
     common.add_argument("--limit", type=int, default=argparse.SUPPRESS)
     ap = argparse.ArgumentParser(description="query a gowa event trace", parents=[common])
-    ap.set_defaults(file="run/trace.bin", start=None, end=None, thread=None, limit=60)
     sub = ap.add_subparsers(dest="cmd", required=True)
     real_add = sub.add_parser
     sub.add_parser = lambda name, **kw: real_add(name, parents=[common], **kw)
@@ -395,6 +394,9 @@ def main():
     p = sub.add_parser("gaps")
     p.add_argument("--grep")
     args = ap.parse_args()
+    for k, v in {"file": "run/trace.bin", "start": None, "end": None, "thread": None, "limit": 60}.items():
+        if not hasattr(args, k):
+            setattr(args, k, v)
     path = args.file if os.path.isabs(args.file) else os.path.join(ROOT, args.file) if not os.path.exists(args.file) else args.file
     tr = Trace(path)
     if args.cmd == "info":

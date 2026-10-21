@@ -1,3 +1,4 @@
+#include "runtime/hooks.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
 #include "runtime/thread.h"
@@ -23,6 +24,8 @@ namespace crash {
 namespace {
 
 std::string symbol_of(DWORD64 addr) {
+    static std::mutex sym_lock;
+    std::lock_guard lk(sym_lock);
     alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
     auto* s = reinterpret_cast<SYMBOL_INFO*>(buf);
     s->SizeOfStruct = sizeof(SYMBOL_INFO);
@@ -120,7 +123,8 @@ void process_hit(const PendingHit& h) {
     uint64_t now = trace::now_ns();
     std::lock_guard lk(g_trap_lock);
     t.hits++;
-    if (t.burst_n && t.burst_tid == tid && t.burst_write == h.write && now - t.burst_t < 2000000 && h.fault + 64 >= t.burst_lo && h.fault <= t.burst_hi + 64) {
+    static const bool no_burst = std::getenv("GOWA_TRAP_NOBURST") != nullptr;
+    if (!no_burst && t.burst_n && t.burst_tid == tid && t.burst_write == h.write && now - t.burst_t < 2000000 && h.fault + 64 >= t.burst_lo && h.fault <= t.burst_hi + 64) {
         t.burst_lo = (std::min)(t.burst_lo, h.fault);
         t.burst_hi = (std::max)(t.burst_hi, h.fault);
         t.burst_n++;
@@ -183,7 +187,14 @@ LONG watch_handler(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+thread_local bool t_sampling = false;
+
 LONG WINAPI handler(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2 && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        auto* fault = reinterpret_cast<uint8_t*>(ep->ExceptionRecord->ExceptionInformation[1]);
+        if (fault >= vm::g_base && fault < vm::g_base + 0x100000000ull && vm::watch_fault(static_cast<uint32_t>(fault - vm::g_base), g_watch_count == 0)) return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (t_sampling) return EXCEPTION_CONTINUE_SEARCH;
     if (g_watch_count) {
         LONG r = watch_handler(ep);
         if (r == EXCEPTION_CONTINUE_EXECUTION) return r;
@@ -219,6 +230,7 @@ LONG WINAPI handler(EXCEPTION_POINTERS* ep) {
                   static_cast<unsigned long long>(c.gpr[1]), static_cast<unsigned long long>(c.gpr[2]), static_cast<unsigned long long>(c.gpr[3]),
                   static_cast<unsigned long long>(c.gpr[4]), static_cast<unsigned long long>(c.gpr[5]));
     }
+    if (!std::getenv("GOWA_CRASH_NO_BLACKBOX")) hooks::capture("crash");
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -253,6 +265,37 @@ std::string sample_stack(void* native, int depth) {
     return line;
 }
 
+int sample_stack(CONTEXT& c, DWORD64* pcs, int depth) {
+    int n = 0;
+    t_sampling = true;
+    __try {
+        for (; n < depth; n++) {
+            pcs[n] = c.Rip;
+            if (n + 1 >= depth) {
+                t_sampling = false;
+                return n + 1;
+            }
+            DWORD64 image = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
+            if (!fn) {
+                t_sampling = false;
+                return n + 1;
+            }
+            PVOID handler_data = nullptr;
+            DWORD64 frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, fn, &c, &handler_data, &frame, nullptr);
+            if (!c.Rip) {
+                t_sampling = false;
+                return n + 1;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        n++;
+    }
+    t_sampling = false;
+    return n;
+}
+
 void profile_thread(void* native, const char* name) {
     std::thread([native, name] {
         HANDLE h = static_cast<HANDLE>(native);
@@ -266,31 +309,19 @@ void profile_thread(void* native, const char* name) {
             c.ContextFlags = CONTEXT_FULL;
             static const int depth = std::getenv("GOWA_PROFILE_DEPTH") ? (std::min)(16, std::atoi(std::getenv("GOWA_PROFILE_DEPTH"))) : 3;
             DWORD64 pcs[16] = {};
-            int n = 0;
-            if (GetThreadContext(h, &c)) {
-                for (; n < depth; n++) {
-                    pcs[n] = c.Rip;
-                    DWORD64 image = 0;
-                    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
-                    if (!fn) {
-                        n++;
-                        break;
-                    }
-                    PVOID handler_data = nullptr;
-                    DWORD64 frame = 0;
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, fn, &c, &handler_data, &frame, nullptr);
-                    if (!c.Rip) {
-                        n++;
-                        break;
-                    }
-                }
-            }
+            int n = GetThreadContext(h, &c) ? sample_stack(c, pcs, depth) : 0;
             ResumeThread(h);
             std::string key;
             for (int i = 0; i < n; i++) {
+                static const bool by_rip = std::getenv("GOWA_PROFILE_RIP") != nullptr;
                 std::string sym = symbol_of(pcs[i]);
                 size_t plus = sym.rfind('+');
-                if (plus != std::string::npos) sym.resize(plus);
+                if (plus != std::string::npos && !(by_rip && i <= 1)) sym.resize(plus);
+                if (by_rip && i <= 1) {
+                    char rva[24];
+                    std::snprintf(rva, sizeof rva, " @%llx", static_cast<unsigned long long>(pcs[i] - reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))));
+                    sym += rva;
+                }
                 key += (i ? " <- " : "") + sym;
             }
             counts[key]++;
@@ -302,7 +333,7 @@ void profile_thread(void* native, const char* name) {
                 for (auto& [k, v] : counts) top.push_back({v, k});
                 std::sort(top.rbegin(), top.rend());
                 LOG_INFO("profile", "%s: %llu samples", name, static_cast<unsigned long long>(total));
-                for (size_t i = 0; i < top.size() && i < 12; i++) LOG_INFO("profile", "  %5.1f%% %s", 100.0 * top[i].first / total, top[i].second.c_str());
+                for (size_t i = 0; i < top.size() && i < (std::getenv("GOWA_PROFILE_TOP") ? size_t(std::atoi(std::getenv("GOWA_PROFILE_TOP"))) : size_t(12)); i++) LOG_INFO("profile", "  %5.1f%% %s", 100.0 * top[i].first / total, top[i].second.c_str());
                 counts.clear();
                 total = 0;
             }

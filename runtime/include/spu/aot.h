@@ -15,6 +15,7 @@ struct CompiledBlock {
     const uint32_t* code;
     BlockFn fn;
     bool pure;
+    BlockFn region;
 };
 
 const CompiledBlock* compiled_blocks(size_t& count);

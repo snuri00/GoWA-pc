@@ -222,6 +222,7 @@ int32_t file_op(const Op& op, uint32_t fs, uint32_t fg) {
         if (!f) return ERR_NODATA;
         _fseeki64(f, offset, SEEK_SET);
         uint32_t want = size ? std::min(size, buf_size) : buf_size;
+        vm::host_write(buf, want);
         done = static_cast<uint32_t>(std::fread(vm::ptr(buf), 1, want, f));
         std::fclose(f);
         break;

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 namespace vm {
 
@@ -27,6 +28,18 @@ bool dealloc(uint32_t addr);
 uint32_t region_free(Region region);
 uint32_t region_size(Region region);
 bool is_mapped(uint32_t addr);
+bool range_mapped(uint32_t addr, uint64_t size);
+void mark_immutable(uint32_t addr, uint32_t size);
+bool is_immutable(uint32_t addr, uint32_t size);
+bool watch_enabled();
+uint64_t watch_faults();
+std::string watch_top_pages();
+uint64_t watch_range(uint32_t addr, uint32_t size, bool& ok);
+uint64_t range_epoch(uint32_t addr, uint32_t size);
+bool watch_fault(uint32_t addr, bool repair_stale);
+uint64_t watch_stale_repairs();
+void host_write(uint32_t addr, uint64_t size);
+void watch_reset(uint32_t addr, uint64_t size);
 
 inline uint8_t* ptr(uint32_t addr) { return g_base + addr; }
 

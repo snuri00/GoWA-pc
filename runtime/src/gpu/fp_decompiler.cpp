@@ -217,10 +217,13 @@ private:
     }
 
     std::string tex_coord(const std::string& a, uint32_t unit) {
+        bool un = (key_.unnormalized >> unit) & 1;
+        std::string size = "textureSize(tex" + std::to_string(unit) + ", 0)";
+        std::string ts = "texscale[" + std::to_string(unit >> 2) + "][" + std::to_string(unit & 3) + "]";
         switch (dim(unit)) {
-        case 0: return a + ".x";
-        case 1: return a + ".xy";
-        default: return a + ".xyz";
+        case 0: return un ? "(" + a + ".x / (float(" + size + ") / " + ts + "))" : a + ".x";
+        case 1: return un ? "(" + a + ".xy / (vec2(" + size + ") / " + ts + "))" : a + ".xy";
+        default: return un && dim(unit) == 3 ? "(" + a + ".xyz / (vec3(" + size + ") / " + ts + "))" : a + ".xyz";
         }
     }
 
@@ -230,6 +233,20 @@ private:
         std::string s = "tex" + std::to_string(unit);
         std::string a = src(sl, 0);
         std::string r;
+        if (((key_.shadow >> unit) & 1) && dim(unit) == 1) {
+            std::string c = op == 0x18 ? "(" + a + " / " + a + ".w)" : a;
+            std::string ref = "vec3(" + tex_coord(c, unit) + ", (" + c + ").z)";
+            switch (op) {
+            case 0x17:
+            case 0x18: r = "vec4(texture(" + s + ", " + ref + "))"; break;
+            case 0x19: r = "vec4(textureGrad(" + s + ", " + ref + ", " + tex_coord(src(sl, 1), unit) + ", " + tex_coord(src(sl, 2), unit) + "))"; break;
+            case 0x2F: r = "vec4(textureLod(" + s + ", " + ref + ", " + src(sl, 1) + ".x))"; break;
+            case 0x31: r = "vec4(texture(" + s + ", " + ref + ", " + src(sl, 1) + ".x))"; break;
+            default: r = "vec4(0.0)"; break;
+            }
+            if ((sl.w[0] >> 21) & 1) r = "(" + r + " * 2.0 - 1.0)";
+            return r;
+        }
         switch (op) {
         case 0x17: r = "texture(" + s + ", " + tex_coord(a, unit) + ")"; break;
         case 0x18: r = "texture(" + s + ", " + tex_coord("(" + a + " / " + a + ".w)", unit) + ")"; break;
@@ -397,11 +414,12 @@ private:
         s << "layout(location = 12) in vec4 in_tex8;\nlayout(location = 13) in vec4 in_tex9;\nlayout(location = 14) in vec4 in_bfc0;\nlayout(location = 15) in vec4 in_bfc1;\n";
         uint32_t lits = static_cast<uint32_t>(l_.literal_slots.size());
         s << "layout(std140, set = 0, binding = 2) uniform FragmentConstants { vec4 fc[" << (lits ? lits : 1) << "]; };\n";
-        s << "layout(std140, set = 0, binding = 3) uniform FragmentState { vec4 window; vec4 fog; uvec4 fflags; };\n";
+        s << "layout(std140, set = 0, binding = 3) uniform FragmentState { vec4 window; vec4 fog; uvec4 fflags; vec4 texscale[4]; };\n";
         for (uint32_t u = 0; u < 16; u++) {
             if (!(used_tex_ & (1u << u))) continue;
             static const char* types[4] = {"sampler1D", "sampler2D", "samplerCube", "sampler3D"};
-            s << "layout(set = 0, binding = " << (32 + u) << ") uniform " << types[dim(u)] << " tex" << u << ";\n";
+            bool shadow = ((key_.shadow >> u) & 1) && dim(u) == 1;
+            s << "layout(set = 0, binding = " << (32 + u) << ") uniform " << (shadow ? "sampler2DShadow" : types[dim(u)]) << " tex" << u << ";\n";
         }
         uint32_t mrt = key_.mrt_count > 4 ? 4 : key_.mrt_count;
         for (uint32_t m = 0; m < (mrt ? mrt : 1); m++) s << "layout(location = " << m << ") out vec4 out_color" << m << ";\n";
@@ -424,6 +442,7 @@ private:
              "    return r;\n}\n";
         s << "vec4 wpos() {\n"
              "    vec4 f = gl_FragCoord;\n"
+             "    f.xy /= max(fog.z, 1.0);\n"
              "    float y = window.y > 0.5 ? window.x - f.y : f.y;\n"
              "    vec2 p = vec2(f.x, y) - (window.z > 0.5 ? vec2(0.5) : vec2(0.0));\n"
              "    return vec4(p, f.z, f.w);\n}\n";

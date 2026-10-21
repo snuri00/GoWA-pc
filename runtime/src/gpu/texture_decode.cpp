@@ -233,13 +233,15 @@ bool describe_texture(const TextureRegs& regs, TextureLayout& out) {
     uint32_t w = regs.rect >> 16;
     uint32_t h = dim == 1 ? 1 : regs.rect & 0xFFFF;
     if (!w || !h) return false;
+    uint32_t depth = dim == 3 ? std::max(1u, regs.control3 >> 20) : 1;
     uint32_t mips = std::max(1u, regs.format >> 16);
-    uint32_t max_levels = f->block == 4 ? floor_log2(std::max(1u, std::min(w / 4, h / 4))) + 1 : floor_log2(std::max(w, h)) + 1;
+    uint32_t max_levels = f->block == 4 ? floor_log2(std::max(1u, std::min(w / 4, h / 4))) + 1 : floor_log2(std::max({w, h, depth})) + 1;
     out.levels = std::min(mips, max_levels);
     out.layers = cube && dim == 2 ? 6 : 1;
-    out.view_type = dim == 1 ? VK_IMAGE_VIEW_TYPE_1D : out.layers == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
+    out.view_type = dim == 1 ? VK_IMAGE_VIEW_TYPE_1D : dim == 3 ? VK_IMAGE_VIEW_TYPE_3D : out.layers == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
     out.width = w;
     out.height = h;
+    out.depth = depth;
     out.format = f->vk;
     out.is_depth = code >= 0x90 && code <= 0x93;
     uint32_t gamma = (regs.address >> 20) & 0xF;
@@ -262,9 +264,10 @@ bool describe_texture(const TextureRegs& regs, TextureLayout& out) {
             r.layer = layer;
             r.width = g.w;
             r.height = g.h;
+            r.depth = std::max(1u, depth >> level);
             out.regions.push_back(r);
-            src += g.src_size;
-            dst += (uint64_t(g.bw) * g.bh * f->out_bytes + 15) & ~15ull;
+            src += uint64_t(g.src_size) * r.depth;
+            dst += (uint64_t(g.bw) * g.bh * r.depth * f->out_bytes + 15) & ~15ull;
         }
         if (!linear) src = (src + 127) & ~127ull;
     }
@@ -287,7 +290,30 @@ void decode_texture(const uint8_t* src, const TextureRegs& regs, const TextureLa
             LevelGeom g = level_geom(*f, layout.width, layout.height, level, linear, pitch);
             const uint8_t* s = src + so;
             uint8_t* d = dst + layout.regions[ri].offset;
-            if (linear || f->block == 4) {
+            uint32_t slices = layout.regions[ri].depth;
+            if (slices > 1) {
+                uint32_t lw = floor_log2(g.bw), lh = floor_log2(g.bh), ld = floor_log2(slices);
+                for (uint32_t z = 0; z < slices; z++) {
+                    for (uint32_t y = 0; y < g.bh; y++) {
+                        for (uint32_t x = 0; x < g.bw; x++) {
+                            uint64_t at;
+                            if (linear || f->block == 4) {
+                                at = uint64_t(z) * g.src_size + uint64_t(y) * g.src_pitch + uint64_t(x) * f->bytes;
+                            } else {
+                                uint64_t m = 0;
+                                uint32_t bit = 0;
+                                for (uint32_t k = 0; k < std::max({lw, lh, ld}); k++) {
+                                    if (k < lw) m |= uint64_t((x >> k) & 1) << bit++;
+                                    if (k < lh) m |= uint64_t((y >> k) & 1) << bit++;
+                                    if (k < ld) m |= uint64_t((z >> k) & 1) << bit++;
+                                }
+                                at = m * f->bytes;
+                            }
+                            convert_unit(*f, s + at, d + ((uint64_t(z) * g.bh + y) * g.bw + x) * f->out_bytes);
+                        }
+                    }
+                }
+            } else if (linear || f->block == 4) {
                 for (uint32_t y = 0; y < g.bh; y++) {
                     for (uint32_t x = 0; x < g.bw; x++) convert_unit(*f, s + y * g.src_pitch + x * f->bytes, d + (uint64_t(y) * g.bw + x) * f->out_bytes);
                 }
@@ -308,7 +334,7 @@ void decode_texture(const uint8_t* src, const TextureRegs& regs, const TextureLa
                     for (uint32_t x = 0; x < g.bw; x++) convert_unit(*f, s + uint64_t(xs[x] | ys[y]) * f->bytes, d + (uint64_t(y) * g.bw + x) * f->out_bytes);
                 }
             }
-            so += g.src_size;
+            so += uint64_t(g.src_size) * slices;
         }
         if (!linear) so = (so + 127) & ~127ull;
     }

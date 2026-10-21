@@ -3,6 +3,7 @@
 
 #include "runtime/log.h"
 
+#include <algorithm>
 #include <chrono>
 #include <immintrin.h>
 #include <cstdio>
@@ -13,18 +14,38 @@
 #include <mutex>
 #include <thread>
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#pragma comment(lib, "Synchronization.lib")
+
 namespace rsv {
 
 namespace {
 
 struct alignas(64) Entry {
     std::atomic<uint64_t> ver{0};
-    std::mutex lock;
 };
 
-Entry g_table[512];
+Entry g_table[65536];
 
-Entry& entry(uint32_t addr) { return g_table[(addr & 0xFF80) >> 7]; }
+Entry& entry(uint32_t addr) { return g_table[(addr >> 7) & 0xFFFF]; }
+
+uint64_t lock_line(Entry& e) {
+    uint32_t spins = 0;
+    for (;;) {
+        uint64_t v = e.ver.load(std::memory_order_relaxed);
+        if (!(v & 64) && e.ver.compare_exchange_weak(v, v + 64, std::memory_order_acq_rel, std::memory_order_relaxed)) return v;
+        if (++spins < 2000) {
+            _mm_pause();
+        } else {
+            spins = 0;
+            std::this_thread::yield();
+        }
+    }
+}
+
+void unlock_line(Entry& e, uint64_t v, bool wrote) { e.ver.store(wrote ? v + 128 : v, std::memory_order_release); }
 
 }
 
@@ -59,8 +80,8 @@ bool watched_line(uint32_t line) {
         }
         return v;
     }();
-    static const bool jm = std::getenv("GOWA_RSV_LOG") && std::string(std::getenv("GOWA_RSV_LOG")) == "jm";
-    if (jm) return vm::read32(line) == 0x007a7b00u || line == 0x3001ad00u;
+    static const bool jm = std::getenv("GOWA_RSV_LOG") && std::string(std::getenv("GOWA_RSV_LOG")).rfind("jm", 0) == 0;
+    if (jm && (vm::read32(line) == 0x007a7b00u || line == 0x3001ad00u)) return true;
     for (uint32_t l : lines) if (l == line) return true;
     return false;
 }
@@ -77,13 +98,20 @@ void log_change(uint32_t line, uint32_t offset, const uint8_t* data, uint32_t si
     if (n) LOG_INFO("rsv", "%s line 0x%08x:%s", how, line, buf);
 }
 
-bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uint8_t* data, uint32_t offset, uint32_t size) {
+bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uint8_t* data, uint32_t offset, uint32_t size, bool data_only) {
     Entry& e = entry(line);
-    std::lock_guard lk(e.lock);
-    if (e.ver.load(std::memory_order_acquire) != rtime) return false;
-    if (std::memcmp(vm::ptr(line + offset), expected, size) != 0) return false;
+    static const bool strict = std::getenv("GOWA_RSV_STRICT") != nullptr;
+    if ((strict || !data_only) && e.ver.load(std::memory_order_acquire) != rtime) return false;
+    uint64_t v0 = lock_line(e);
+    if ((strict || !data_only) && v0 != rtime) {
+        unlock_line(e, v0, false);
+        return false;
+    }
+    if (std::memcmp(vm::ptr(line + offset), expected, size) != 0) {
+        unlock_line(e, v0, false);
+        return false;
+    }
     log_change(line, offset, data, size, size == 128 ? "putllc" : "stcx");
-    e.ver.fetch_add(64, std::memory_order_acq_rel);
     uint8_t* dst = vm::ptr(line + offset);
     for (uint32_t i = 0; i < size; i += 8) {
         uint64_t want, was;
@@ -94,33 +122,203 @@ bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uin
             if (data[i + b] != expected[i + b]) dst[i + b] = data[i + b];
         }
     }
-    e.ver.fetch_add(64, std::memory_order_release);
-    e.ver.notify_all();
+    unlock_line(e, v0, true);
+    if (sleepers()) e.ver.notify_all();
     return true;
 }
 
 void store_unconditional(uint32_t line, const uint8_t* data) {
     Entry& e = entry(line);
-    std::lock_guard lk(e.lock);
+    uint64_t v0 = lock_line(e);
     log_change(line, 0, data, 128, "putlluc");
-    e.ver.fetch_add(64, std::memory_order_acq_rel);
     std::memcpy(vm::ptr(line), data, 128);
-    e.ver.fetch_add(64, std::memory_order_release);
-    e.ver.notify_all();
+    unlock_line(e, v0, true);
+    if (sleepers()) e.ver.notify_all();
 }
 
 void store_locked(uint32_t addr, const void* data, uint32_t size) {
     Entry& e = entry(addr & ~127u);
-    std::lock_guard lk(e.lock);
+    uint64_t v0 = lock_line(e);
     log_change(addr & ~127u, addr & 127u, static_cast<const uint8_t*>(data), size, "store");
-    e.ver.fetch_add(64, std::memory_order_acq_rel);
     std::memcpy(vm::ptr(addr), data, size);
-    e.ver.fetch_add(64, std::memory_order_release);
-    e.ver.notify_all();
+    unlock_line(e, v0, true);
+    if (sleepers()) e.ver.notify_all();
+}
+
+void store_range(uint32_t addr, const uint8_t* data, uint32_t size) {
+    static const bool logged = std::getenv("GOWA_RSV_LOG") != nullptr;
+    const bool wake = sleepers();
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t a = addr + done;
+        uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+        if (done + chunk < size) _m_prefetchw(&entry(a + 128).ver);
+        Entry& e = entry(a & ~127u);
+        uint64_t v0 = lock_line(e);
+        if (logged) log_change(a & ~127u, a & 127u, data + done, chunk, "store");
+        std::memcpy(vm::ptr(a), data + done, chunk);
+        unlock_line(e, v0, true);
+        if (wake) e.ver.notify_all();
+        done += chunk;
+    }
+}
+
+void merge_bits(uint32_t addr, const uint8_t* data, const uint8_t* base, uint32_t size) {
+    Entry& e = entry(addr & ~127u);
+    uint64_t v0 = lock_line(e);
+    uint8_t* dst = vm::ptr(addr);
+    for (uint32_t i = 0; i < size; i++) {
+        uint8_t changed = data[i] ^ base[i];
+        if (changed) dst[i] = static_cast<uint8_t>((dst[i] & ~changed) | (data[i] & changed));
+    }
+    unlock_line(e, v0, true);
+    if (sleepers()) e.ver.notify_all();
+}
+
+bool sleepers() {
+    static const bool on = std::getenv("GOWA_RSV_SLEEP_US") != nullptr;
+    return on;
+}
+
+void wake(uint32_t addr) {
+    if (sleepers()) entry(addr).ver.notify_all();
+}
+
+bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size) {
+    Entry& e = entry(addr & ~127u);
+    const uint8_t* src = vm::ptr(addr);
+    bool changed = false;
+    for (;;) {
+        uint64_t v1 = e.ver.load(std::memory_order_acquire);
+        if (v1 & 64) {
+            _mm_pause();
+            continue;
+        }
+        uint32_t i = 0;
+        for (; i + 32 <= size; i += 32) {
+            __m256i s = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+            __m256i d = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i));
+            if (static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(s, d))) != 0xFFFFFFFFu) {
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), s);
+                changed = true;
+            }
+        }
+        for (; i + 16 <= size; i += 16) {
+            __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+            __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst + i));
+            if (_mm_movemask_epi8(_mm_cmpeq_epi8(s, d)) != 0xFFFF) {
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), s);
+                changed = true;
+            }
+        }
+        for (; i < size; i++) {
+            if (dst[i] != src[i]) {
+                dst[i] = src[i];
+                changed = true;
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (e.ver.load(std::memory_order_acquire) == v1) return changed;
+    }
+}
+
+bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi) {
+    const uint8_t* src = vm::ptr(addr);
+    bool any = false;
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t a = addr + done;
+        uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+        Entry& e = entry(a & ~127u);
+        for (;;) {
+            uint64_t v1 = e.ver.load(std::memory_order_acquire);
+            if (v1 & 64) {
+                _mm_pause();
+                continue;
+            }
+            bool changed = false;
+            const uint8_t* s = src + done;
+            uint8_t* d = dst + done;
+            uint32_t i = 0;
+            for (; i + 32 <= chunk; i += 32) {
+                __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+                __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d + i));
+                if (static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y))) != 0xFFFFFFFFu) {
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i), x);
+                    changed = true;
+                }
+            }
+            for (; i < chunk; i++) {
+                if (d[i] != s[i]) {
+                    d[i] = s[i];
+                    changed = true;
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (e.ver.load(std::memory_order_acquire) != v1) continue;
+            if (changed) {
+                any = true;
+                dirty_lo = (std::min)(dirty_lo, done);
+                dirty_hi = (std::max)(dirty_hi, done + chunk);
+            }
+            break;
+        }
+        done += chunk;
+    }
+    return any;
+}
+
+bool copy_range_prefetch(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi) {
+    for (uint32_t a = (addr & ~127u) + 128; a < addr + size && a < (addr & ~127u) + 128 * 9; a += 128) _mm_prefetch(reinterpret_cast<const char*>(&entry(a).ver), _MM_HINT_T0);
+    const uint8_t* src = vm::ptr(addr);
+    bool any = false;
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t a = addr + done;
+        uint32_t chunk = (std::min)(size - done, 128 - (a & 127));
+        if (done + chunk + 1024 < size) {
+            _mm_prefetch(reinterpret_cast<const char*>(&entry(a + 1024).ver), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(src + done + 1024), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(src + done + 1024 + 64), _MM_HINT_T0);
+        }
+        Entry& e = entry(a & ~127u);
+        for (;;) {
+            uint64_t v1 = e.ver.load(std::memory_order_acquire);
+            if (v1 & 64) {
+                _mm_pause();
+                continue;
+            }
+            uint32_t diff = 0;
+            const uint8_t* s = src + done;
+            uint8_t* d = dst + done;
+            uint32_t i = 0;
+            for (; i + 32 <= chunk; i += 32) {
+                __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+                __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d + i));
+                diff |= ~static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)));
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i), x);
+            }
+            for (; i < chunk; i++) {
+                diff |= d[i] != s[i];
+                d[i] = s[i];
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (e.ver.load(std::memory_order_acquire) != v1) continue;
+            if (diff) {
+                any = true;
+                dirty_lo = (std::min)(dirty_lo, done);
+                dirty_hi = (std::max)(dirty_hi, done + chunk);
+            }
+            break;
+        }
+        done += chunk;
+    }
+    return any;
 }
 
 bool lost(uint32_t line, uint64_t rtime, const uint8_t* rdata) {
-    if (entry(line).ver.load(std::memory_order_acquire) != rtime) return true;
+    static const bool strict = std::getenv("GOWA_RSV_STRICT") != nullptr;
+    if (strict && entry(line).ver.load(std::memory_order_acquire) != rtime) return true;
     return std::memcmp(vm::ptr(line), rdata, 128) != 0;
 }
 
@@ -133,12 +331,23 @@ void wait_change(uint32_t line, uint64_t rtime, uint32_t micros) {
 }
 
 bool wait_lost(uint32_t line, uint64_t rtime, const uint8_t* rdata, uint32_t micros) {
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
-    do {
+    Entry& e = entry(line);
+    for (int i = 0; i < 200; i++) {
         if (lost(line, rtime, rdata)) return true;
         _mm_pause();
-    } while (std::chrono::steady_clock::now() < deadline);
-    return false;
+    }
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
+    for (;;) {
+        uint64_t v = e.ver.load(std::memory_order_acquire);
+        if (lost(line, rtime, rdata)) return true;
+        auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) return false;
+        static const long sleep_after = std::getenv("GOWA_RSV_SLEEP_US") ? std::atol(std::getenv("GOWA_RSV_SLEEP_US")) : -1;
+        static const long yield_after = std::getenv("GOWA_RSV_YIELD_US") ? std::atol(std::getenv("GOWA_RSV_YIELD_US")) : 30;
+        if (sleep_after >= 0 && micros - left >= sleep_after) WaitOnAddress(&e.ver, &v, sizeof v, static_cast<DWORD>((left + 999) / 1000));
+        else if (yield_after >= 0 && micros - left >= yield_after) SwitchToThread();
+        else _mm_pause();
+    }
 }
 
 }

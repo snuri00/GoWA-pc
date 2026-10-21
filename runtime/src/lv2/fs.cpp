@@ -1,9 +1,11 @@
 #include "object.h"
 #include "runtime/vfs.h"
 #include "runtime/trace.h"
+#include "runtime/hostsleep.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <vector>
 
@@ -135,6 +137,7 @@ int64_t do_read(Fd& fd, uint32_t buf, uint64_t n, uint64_t& got) {
     if (fd.is_dir || !fd.f) return CELL_EBADF;
     if ((fd.flags & O_ACCMODE) == O_WRONLY) return CELL_EBADF;
     int64_t pos = trace::on(trace::FS) ? _ftelli64(fd.f) : 0;
+    vm::host_write(buf, n);
     got = std::fread(vm::ptr(buf), 1, n, fd.f);
     if (trace::on(trace::FS)) {
         if (!fd.path_id) fd.path_id = trace::intern(fd.guest);
@@ -223,6 +226,8 @@ LV2_SYSCALL(802, sys_fs_read) {
         std::lock_guard io(fd->io);
         r = n ? do_read(*fd, buf, n, got) : CELL_OK;
     }
+    static const double us_per_kb = std::getenv("GOWA_FS_US_PER_KB") ? std::atof(std::getenv("GOWA_FS_US_PER_KB")) : 0.0;
+    if (us_per_kb > 0.0 && got) host::sleep_us(static_cast<uint64_t>(us_per_kb * double(got) / 1024.0));
     vm::write64(nread, got);
     return r;
 }

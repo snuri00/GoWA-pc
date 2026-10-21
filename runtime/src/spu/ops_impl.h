@@ -41,6 +41,25 @@ SPU_INLINE v128 load_ls(const Context& c, uint32_t addr) {
 
 SPU_INLINE void store_ls(Context& c, uint32_t addr, const v128& v) {
     _mm_storeu_si128(reinterpret_cast<__m128i*>(c.ls + (addr & LS_MASK)), ppu::bswap128(v.vi));
+    if (c.line_epoch) c.line_epoch[(addr & LS_MASK) >> 7].store(c.epoch->load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
+SPU_INLINE bool region_valid(Context& c, uint32_t id, uint32_t lsa, uint32_t words, const uint32_t* code) {
+    uint32_t v = c.block_valid[id];
+    if (v && c.all_epoch->load(std::memory_order_acquire) <= v) {
+        bool fresh = true;
+        for (uint32_t l = lsa >> 7, last = (lsa + words * 4 - 1) >> 7; l <= last; l++) {
+            if (c.line_epoch[l].load(std::memory_order_acquire) > v) {
+                fresh = false;
+                break;
+            }
+        }
+        if (fresh) return true;
+    }
+    uint32_t e = c.epoch->load(std::memory_order_acquire);
+    if (std::memcmp(c.ls + lsa, code, words * 4) != 0) return false;
+    c.block_valid[id] = e;
+    return true;
 }
 
 SPU_INLINE v128 splat32(uint32_t v) { v128 r; r.vi = _mm_set1_epi32(static_cast<int32_t>(v)); return r; }
@@ -189,8 +208,8 @@ SPU_INLINE bool op_sumb(Context& c, Host&, uint32_t w, uint32_t) {
     G(RT(w)) = r;
     return true;
 }
-SPU_INLINE bool op_xsbh(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)), r; for (int i = 0; i < 8; i++) r.s16[i] = int8_t(a.u16[i]); G(RT(w)) = r; return true; }
-SPU_INLINE bool op_xshw(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)), r; for (int i = 0; i < 4; i++) r.s32[i] = int16_t(a.u32[i]); G(RT(w)) = r; return true; }
+SPU_INLINE bool op_xsbh(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi = _mm_srai_epi16(_mm_slli_epi16(G(RA(w)).vi, 8), 8); return true; }
+SPU_INLINE bool op_xshw(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi = _mm_srai_epi32(_mm_slli_epi32(G(RA(w)).vi, 16), 16); return true; }
 SPU_INLINE bool op_xswd(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)), r; for (int i = 0; i < 2; i++) r.u64[i] = uint64_t(int64_t(int32_t(a.u64[i]))); G(RT(w)) = r; return true; }
 
 SPU_INLINE bool op_and(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi = _mm_and_si128(G(RA(w)).vi, G(RB(w)).vi); return true; }
@@ -222,6 +241,10 @@ SPU_INLINE bool op_shufb(Context& c, Host&, uint32_t w, uint32_t) {
     __m128i ra = _mm_shuffle_epi8(G(RA(w)).vi, idx);
     __m128i rb = _mm_shuffle_epi8(G(RB(w)).vi, idx);
     __m128i r = _mm_blendv_epi8(ra, rb, _mm_slli_epi16(ctl, 3));
+    if (_mm_movemask_epi8(ctl) == 0) [[likely]] {
+        G(RRR_T(w)).vi = r;
+        return true;
+    }
     __m128i t = _mm_and_si128(ctl, _mm_set1_epi8(static_cast<char>(0xE0)));
     __m128i special = _mm_or_si128(_mm_cmpeq_epi8(t, _mm_set1_epi8(static_cast<char>(0xC0))),
                                    _mm_and_si128(_mm_cmpeq_epi8(t, _mm_set1_epi8(static_cast<char>(0xE0))), _mm_set1_epi8(static_cast<char>(0x80))));
@@ -229,7 +252,13 @@ SPU_INLINE bool op_shufb(Context& c, Host&, uint32_t w, uint32_t) {
     return true;
 }
 
-SPU_INLINE bool op_fsmb(Context& c, Host&, uint32_t w, uint32_t) { uint32_t m = pref(G(RA(w))) & 0xFFFF; v128 r; for (int i = 0; i < 16; i++) set_be_byte(r, i, (m >> (15 - i)) & 1 ? 0xFF : 0); G(RT(w)) = r; return true; }
+SPU_INLINE bool op_fsmb(Context& c, Host&, uint32_t w, uint32_t) {
+    uint32_t mv = pref(G(RA(w))) & 0xFFFF;
+    __m128i b = _mm_shuffle_epi8(_mm_cvtsi32_si128(int(mv)), _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1));
+    __m128i bits = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+    G(RT(w)).vi = _mm_cmpeq_epi8(_mm_and_si128(b, bits), bits);
+    return true;
+}
 SPU_INLINE bool op_fsmh(Context& c, Host&, uint32_t w, uint32_t) { uint32_t m = pref(G(RA(w))) & 0xFF; v128 r; for (int i = 0; i < 8; i++) r.u16[7 - i] = (m >> (7 - i)) & 1 ? 0xFFFF : 0; G(RT(w)) = r; return true; }
 SPU_INLINE bool op_fsm(Context& c, Host&, uint32_t w, uint32_t) { uint32_t m = pref(G(RA(w))) & 0xF; v128 r; for (int i = 0; i < 4; i++) r.u32[3 - i] = (m >> (3 - i)) & 1 ? 0xFFFFFFFF : 0; G(RT(w)) = r; return true; }
 SPU_INLINE bool op_gbb(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)); uint32_t m = 0; for (int i = 0; i < 16; i++) m = (m << 1) | (be_byte(a, i) & 1); G(RT(w)) = pref_only(m); return true; }
@@ -237,25 +266,42 @@ SPU_INLINE bool op_gbh(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(
 SPU_INLINE bool op_gb(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)); uint32_t m = 0; for (int i = 0; i < 4; i++) m = (m << 1) | (a.u32[3 - i] & 1); G(RT(w)) = pref_only(m); return true; }
 
 SPU_INLINE bool op_shlh(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map16(G(RA(w)), G(RB(w)), [](uint16_t x, uint16_t y) { uint32_t s = y & 0x1F; return uint16_t(s > 15 ? 0 : x << s); }); return true; }
-SPU_INLINE bool op_shlhi(Context& c, Host&, uint32_t w, uint32_t) { uint32_t s = uint32_t(I7(w)) & 0x1F; G(RT(w)) = map16(G(RA(w)), G(RA(w)), [s](uint16_t x, uint16_t) { return uint16_t(s > 15 ? 0 : x << s); }); return true; }
-SPU_INLINE bool op_shl(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map32(G(RA(w)), G(RB(w)), [](uint32_t x, uint32_t y) { uint32_t s = y & 0x3F; return s > 31 ? 0u : x << s; }); return true; }
-SPU_INLINE bool op_shli(Context& c, Host&, uint32_t w, uint32_t) { uint32_t s = uint32_t(I7(w)) & 0x3F; G(RT(w)) = map32(G(RA(w)), G(RA(w)), [s](uint32_t x, uint32_t) { return s > 31 ? 0u : x << s; }); return true; }
+SPU_INLINE bool op_shlhi(Context& c, Host&, uint32_t w, uint32_t) { uint32_t s = uint32_t(I7(w)) & 0x1F; G(RT(w)).vi = s > 15 ? _mm_setzero_si128() : _mm_sll_epi16(G(RA(w)).vi, _mm_cvtsi32_si128(int(s))); return true; }
+SPU_INLINE bool op_shl(Context& c, Host&, uint32_t w, uint32_t) { __m128i s = _mm_and_si128(G(RB(w)).vi, _mm_set1_epi32(0x3F)); G(RT(w)).vi = _mm_sllv_epi32(G(RA(w)).vi, s); return true; }
+SPU_INLINE bool op_shli(Context& c, Host&, uint32_t w, uint32_t) { uint32_t s = uint32_t(I7(w)) & 0x3F; G(RT(w)).vi = s > 31 ? _mm_setzero_si128() : _mm_sll_epi32(G(RA(w)).vi, _mm_cvtsi32_si128(int(s))); return true; }
 SPU_INLINE bool op_roth(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map16(G(RA(w)), G(RB(w)), [](uint16_t x, uint16_t y) { return std::rotl(x, y & 0xF); }); return true; }
 SPU_INLINE bool op_rothi(Context& c, Host&, uint32_t w, uint32_t) { int s = I7(w) & 0xF; G(RT(w)) = map16(G(RA(w)), G(RA(w)), [s](uint16_t x, uint16_t) { return std::rotl(x, s); }); return true; }
-SPU_INLINE bool op_rot(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map32(G(RA(w)), G(RB(w)), [](uint32_t x, uint32_t y) { return std::rotl(x, int(y & 0x1F)); }); return true; }
-SPU_INLINE bool op_roti(Context& c, Host&, uint32_t w, uint32_t) { int s = I7(w) & 0x1F; G(RT(w)) = map32(G(RA(w)), G(RA(w)), [s](uint32_t x, uint32_t) { return std::rotl(x, s); }); return true; }
+SPU_INLINE bool op_rot(Context& c, Host&, uint32_t w, uint32_t) { __m128i s = _mm_and_si128(G(RB(w)).vi, _mm_set1_epi32(0x1F)); __m128i a = G(RA(w)).vi; G(RT(w)).vi = _mm_or_si128(_mm_sllv_epi32(a, s), _mm_srlv_epi32(a, _mm_sub_epi32(_mm_set1_epi32(32), s))); return true; }
+SPU_INLINE bool op_roti(Context& c, Host&, uint32_t w, uint32_t) { int s = I7(w) & 0x1F; __m128i a = G(RA(w)).vi; G(RT(w)).vi = _mm_or_si128(_mm_sll_epi32(a, _mm_cvtsi32_si128(s)), _mm_srl_epi32(a, _mm_cvtsi32_si128(32 - s))); return true; }
 SPU_INLINE bool op_rothm(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map16(G(RA(w)), G(RB(w)), [](uint16_t x, uint16_t y) { uint32_t s = (0u - y) & 0x1F; return uint16_t(s > 15 ? 0 : x >> s); }); return true; }
 SPU_INLINE bool op_rothmi(Context& c, Host&, uint32_t w, uint32_t) { uint32_t s = (0u - uint32_t(I7(w))) & 0x1F; G(RT(w)) = map16(G(RA(w)), G(RA(w)), [s](uint16_t x, uint16_t) { return uint16_t(s > 15 ? 0 : x >> s); }); return true; }
-SPU_INLINE bool op_rotm(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map32(G(RA(w)), G(RB(w)), [](uint32_t x, uint32_t y) { uint32_t s = (0u - y) & 0x3F; return s > 31 ? 0u : x >> s; }); return true; }
-SPU_INLINE bool op_rotmi(Context& c, Host&, uint32_t w, uint32_t) { uint32_t s = (0u - uint32_t(I7(w))) & 0x3F; G(RT(w)) = map32(G(RA(w)), G(RA(w)), [s](uint32_t x, uint32_t) { return s > 31 ? 0u : x >> s; }); return true; }
+SPU_INLINE bool op_rotm(Context& c, Host&, uint32_t w, uint32_t) { __m128i s = _mm_and_si128(_mm_sub_epi32(_mm_setzero_si128(), G(RB(w)).vi), _mm_set1_epi32(0x3F)); G(RT(w)).vi = _mm_srlv_epi32(G(RA(w)).vi, s); return true; }
+SPU_INLINE bool op_rotmi(Context& c, Host&, uint32_t w, uint32_t) { uint32_t s = (0u - uint32_t(I7(w))) & 0x3F; G(RT(w)).vi = s > 31 ? _mm_setzero_si128() : _mm_srl_epi32(G(RA(w)).vi, _mm_cvtsi32_si128(int(s))); return true; }
 SPU_INLINE bool op_rotmah(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map16(G(RA(w)), G(RB(w)), [](uint16_t x, uint16_t y) { uint32_t s = (0u - y) & 0x1F; return uint16_t(int16_t(x) >> (s > 15 ? 15 : s)); }); return true; }
 SPU_INLINE bool op_rotmahi(Context& c, Host&, uint32_t w, uint32_t) { uint32_t s = (0u - uint32_t(I7(w))) & 0x1F; G(RT(w)) = map16(G(RA(w)), G(RA(w)), [s](uint16_t x, uint16_t) { return uint16_t(int16_t(x) >> (s > 15 ? 15 : s)); }); return true; }
-SPU_INLINE bool op_rotma(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map32(G(RA(w)), G(RB(w)), [](uint32_t x, uint32_t y) { uint32_t s = (0u - y) & 0x3F; return uint32_t(int32_t(x) >> (s > 31 ? 31 : s)); }); return true; }
-SPU_INLINE bool op_rotmai(Context& c, Host&, uint32_t w, uint32_t) { uint32_t s = (0u - uint32_t(I7(w))) & 0x3F; G(RT(w)) = map32(G(RA(w)), G(RA(w)), [s](uint32_t x, uint32_t) { return uint32_t(int32_t(x) >> (s > 31 ? 31 : s)); }); return true; }
+SPU_INLINE bool op_rotma(Context& c, Host&, uint32_t w, uint32_t) { __m128i s = _mm_min_epu32(_mm_and_si128(_mm_sub_epi32(_mm_setzero_si128(), G(RB(w)).vi), _mm_set1_epi32(0x3F)), _mm_set1_epi32(31)); G(RT(w)).vi = _mm_srav_epi32(G(RA(w)).vi, s); return true; }
+SPU_INLINE bool op_rotmai(Context& c, Host&, uint32_t w, uint32_t) { uint32_t s = (0u - uint32_t(I7(w))) & 0x3F; G(RT(w)).vi = _mm_sra_epi32(G(RA(w)).vi, _mm_cvtsi32_si128(int(s > 31 ? 31 : s))); return true; }
 
-SPU_INLINE v128 qshl_bytes(const v128& a, uint32_t n) { v128 r{}; for (int i = 0; i < 16; i++) { int j = i - int(n); r.u8[i] = (j >= 0 && n < 16) ? a.u8[j] : 0; } return r; }
-SPU_INLINE v128 qshr_bytes(const v128& a, uint32_t n) { v128 r{}; for (int i = 0; i < 16; i++) { int j = i + int(n); r.u8[i] = (j < 16 && n < 16) ? a.u8[j] : 0; } return r; }
-SPU_INLINE v128 qrot_bytes(const v128& a, uint32_t n) { v128 r; for (int i = 0; i < 16; i++) r.u8[i] = a.u8[(i - int(n)) & 15]; return r; }
+SPU_INLINE __m128i iota8() { return _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
+SPU_INLINE v128 qshl_bytes(const v128& a, uint32_t n) {
+    v128 r;
+    if (n >= 16) { r.vi = _mm_setzero_si128(); return r; }
+    r.vi = _mm_shuffle_epi8(a.vi, _mm_sub_epi8(iota8(), _mm_set1_epi8(static_cast<char>(n))));
+    return r;
+}
+SPU_INLINE v128 qshr_bytes(const v128& a, uint32_t n) {
+    v128 r;
+    if (n >= 16) { r.vi = _mm_setzero_si128(); return r; }
+    __m128i idx = _mm_add_epi8(iota8(), _mm_set1_epi8(static_cast<char>(n)));
+    idx = _mm_or_si128(idx, _mm_cmpgt_epi8(idx, _mm_set1_epi8(15)));
+    r.vi = _mm_shuffle_epi8(a.vi, idx);
+    return r;
+}
+SPU_INLINE v128 qrot_bytes(const v128& a, uint32_t n) {
+    v128 r;
+    r.vi = _mm_shuffle_epi8(a.vi, _mm_and_si128(_mm_sub_epi8(iota8(), _mm_set1_epi8(static_cast<char>(n & 15))), _mm_set1_epi8(15)));
+    return r;
+}
 SPU_INLINE v128 qshl_bits(const v128& a, uint32_t n) { if (!n) return a; v128 r; r.u64[1] = (a.u64[1] << n) | (a.u64[0] >> (64 - n)); r.u64[0] = a.u64[0] << n; return r; }
 SPU_INLINE v128 qshr_bits(const v128& a, uint32_t n) { if (!n) return a; v128 r; r.u64[0] = (a.u64[0] >> n) | (a.u64[1] << (64 - n)); r.u64[1] = a.u64[1] >> n; return r; }
 SPU_INLINE v128 qrot_bits(const v128& a, uint32_t n) { if (!n) return a; v128 r; r.u64[1] = (a.u64[1] << n) | (a.u64[0] >> (64 - n)); r.u64[0] = (a.u64[0] << n) | (a.u64[1] >> (64 - n)); return r; }
@@ -277,13 +323,28 @@ SPU_INLINE bool op_rotqmbi(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) =
 SPU_INLINE bool op_rotqmbii(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = qshr_bits(G(RA(w)), (0u - uint32_t(I7(w))) & 7); return true; }
 
 SPU_INLINE v128 insert_mask(uint32_t t, int size) {
-    v128 r;
-    for (int i = 0; i < 16; i++) set_be_byte(r, i, uint8_t(0x10 + i));
-    uint32_t base = t & ~uint32_t(size - 1) & 0xF;
-    static const uint8_t pat[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-    if (size == 1) set_be_byte(r, int(t & 0xF), 0x03);
-    else if (size == 2) { set_be_byte(r, int(base), 0x02); set_be_byte(r, int(base) + 1, 0x03); }
-    else for (int k = 0; k < size; k++) set_be_byte(r, int(base) + k, pat[k]);
+    const __m128i base = _mm_setr_epi8(0x1F, 0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10);
+    __m128i pat, msk;
+    if (size == 1) {
+        pat = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3);
+        msk = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1);
+    } else if (size == 2) {
+        pat = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 2);
+        msk = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1);
+    } else if (size == 4) {
+        pat = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 2, 1, 0);
+        msk = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1);
+    } else {
+        pat = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 7, 6, 5, 4, 3, 2, 1, 0);
+        msk = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1);
+    }
+    uint32_t pos = (size == 1 ? t : (t & ~uint32_t(size - 1))) & 0xF;
+    v128 p, m, r;
+    p.vi = pat;
+    m.vi = msk;
+    p = qshr_bytes(p, pos);
+    m = qshr_bytes(m, pos);
+    r.vi = _mm_blendv_epi8(base, p.vi, m.vi);
     return r;
 }
 SPU_INLINE bool op_cbd(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = insert_mask(pref(G(RA(w))) + uint32_t(I7(w)), 1); return true; }
@@ -307,11 +368,11 @@ SPU_INLINE bool op_cgtb(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi =
 SPU_INLINE bool op_cgti(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi = _mm_cmpgt_epi32(G(RA(w)).vi, _mm_set1_epi32(I10(w))); return true; }
 SPU_INLINE bool op_cgthi(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi = _mm_cmpgt_epi16(G(RA(w)).vi, _mm_set1_epi16(static_cast<int16_t>(I10(w)))); return true; }
 SPU_INLINE bool op_cgtbi(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi = _mm_cmpgt_epi8(G(RA(w)).vi, _mm_set1_epi8(static_cast<int8_t>(I10(w)))); return true; }
-SPU_INLINE bool op_clgt(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map32(G(RA(w)), G(RB(w)), [](uint32_t x, uint32_t y) { return x > y ? 0xFFFFFFFFu : 0u; }); return true; }
-SPU_INLINE bool op_clgth(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map16(G(RA(w)), G(RB(w)), [](uint16_t x, uint16_t y) { return uint16_t(x > y ? 0xFFFF : 0); }); return true; }
+SPU_INLINE bool op_clgt(Context& c, Host&, uint32_t w, uint32_t) { __m128i f = _mm_set1_epi32(static_cast<int>(0x80000000u)); G(RT(w)).vi = _mm_cmpgt_epi32(_mm_xor_si128(G(RA(w)).vi, f), _mm_xor_si128(G(RB(w)).vi, f)); return true; }
+SPU_INLINE bool op_clgth(Context& c, Host&, uint32_t w, uint32_t) { __m128i f = _mm_set1_epi16(static_cast<short>(0x8000)); G(RT(w)).vi = _mm_cmpgt_epi16(_mm_xor_si128(G(RA(w)).vi, f), _mm_xor_si128(G(RB(w)).vi, f)); return true; }
 SPU_INLINE bool op_clgtb(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = map8(G(RA(w)), G(RB(w)), [](uint8_t x, uint8_t y) { return uint8_t(x > y ? 0xFF : 0); }); return true; }
-SPU_INLINE bool op_clgti(Context& c, Host&, uint32_t w, uint32_t) { uint32_t i = uint32_t(I10(w)); G(RT(w)) = map32(G(RA(w)), G(RA(w)), [i](uint32_t x, uint32_t) { return x > i ? 0xFFFFFFFFu : 0u; }); return true; }
-SPU_INLINE bool op_clgthi(Context& c, Host&, uint32_t w, uint32_t) { uint16_t i = uint16_t(I10(w)); G(RT(w)) = map16(G(RA(w)), G(RA(w)), [i](uint16_t x, uint16_t) { return uint16_t(x > i ? 0xFFFF : 0); }); return true; }
+SPU_INLINE bool op_clgti(Context& c, Host&, uint32_t w, uint32_t) { __m128i f = _mm_set1_epi32(static_cast<int>(0x80000000u)); G(RT(w)).vi = _mm_cmpgt_epi32(_mm_xor_si128(G(RA(w)).vi, f), _mm_xor_si128(_mm_set1_epi32(I10(w)), f)); return true; }
+SPU_INLINE bool op_clgthi(Context& c, Host&, uint32_t w, uint32_t) { __m128i f = _mm_set1_epi16(static_cast<short>(0x8000)); G(RT(w)).vi = _mm_cmpgt_epi16(_mm_xor_si128(G(RA(w)).vi, f), _mm_xor_si128(_mm_set1_epi16(static_cast<short>(I10(w))), f)); return true; }
 SPU_INLINE bool op_clgtbi(Context& c, Host&, uint32_t w, uint32_t) { uint8_t i = uint8_t(I10(w)); G(RT(w)) = map8(G(RA(w)), G(RA(w)), [i](uint8_t x, uint8_t) { return uint8_t(x > i ? 0xFF : 0); }); return true; }
 
 SPU_INLINE bool halt_if(Context& c, Host& h, bool cond, uint32_t w, uint32_t pc) {
@@ -332,47 +393,87 @@ SPU_INLINE bool op_hlgti(Context& c, Host& h, uint32_t w, uint32_t pc) { return 
 template <class F>
 SPU_INLINE v128 mapf(const v128& a, const v128& b, F f) { v128 r; for (int i = 0; i < 4; i++) r.f32[i] = f(a.f32[i], b.f32[i]); return r; }
 
-SPU_INLINE __m128 vclamp(__m128 r) {
-    __m128i ri = _mm_castps_si128(r);
-    __m128i inf = _mm_cmpeq_epi32(_mm_and_si128(ri, _mm_set1_epi32(0x7F800000)), _mm_set1_epi32(0x7F800000));
-    __m128i sat = _mm_or_si128(_mm_and_si128(ri, _mm_set1_epi32(static_cast<int>(0x80000000))), _mm_set1_epi32(0x7FFFFFFF));
-    return _mm_castsi128_ps(_mm_blendv_epi8(ri, sat, inf));
+SPU_INLINE double sfx_to_double(uint32_t bits) {
+    uint32_t e = (bits >> 23) & 0xFF;
+    if (!e) return 0.0;
+    uint64_t d = (uint64_t(bits >> 31) << 63) | (uint64_t(e - 127 + 1023) << 52) | (uint64_t(bits & 0x7FFFFF) << 29);
+    return std::bit_cast<double>(d);
 }
 
-SPU_INLINE __m128 vzero_any(__m128 a, __m128 b) {
-    __m128 z = _mm_setzero_ps();
-    return _mm_or_ps(_mm_cmpeq_ps(a, z), _mm_cmpeq_ps(b, z));
+SPU_INLINE uint32_t sfx_from_double(double v) {
+    uint64_t d = std::bit_cast<uint64_t>(v);
+    uint32_t sign = uint32_t(d >> 63) << 31;
+    int32_t e = int32_t((d >> 52) & 0x7FF);
+    if (e == 0) return 0;
+    if (e == 0x7FF) return sign | 0x7FFFFFFF;
+    int32_t se = e - 1023 + 127;
+    if (se <= 0) return 0;
+    if (se > 255) return sign | 0x7FFFFFFF;
+    return sign | (uint32_t(se) << 23) | uint32_t((d >> 29) & 0x7FFFFF);
+}
+
+SPU_INLINE __m128i sfx_special(__m128 r) {
+    __m128 mag = _mm_and_ps(r, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
+    return _mm_castps_si128(_mm_cmp_ps(mag, _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF)), _CMP_NLT_UQ));
+}
+
+SPU_INLINE __m128i sfx_exp255(__m128 a) {
+    __m128i ai = _mm_castps_si128(a);
+    return _mm_cmpeq_epi32(_mm_and_si128(ai, _mm_set1_epi32(0x7F800000)), _mm_set1_epi32(0x7F800000));
+}
+
+SPU_INLINE __m128 sfx_pos_zero(__m128 r) {
+    __m128i ri = _mm_castps_si128(r);
+    return _mm_castsi128_ps(_mm_andnot_si128(_mm_cmpeq_epi32(ri, _mm_set1_epi32(int(0x80000000u))), ri));
+}
+
+template <class F>
+__attribute__((noinline, cold)) inline __m128 sfx_slow(__m128 a, __m128 b, __m128 c, __m128 r, __m128i lanes, F f) {
+    alignas(16) uint32_t av[4], bv[4], cv[4], rv[4], lv[4];
+    _mm_store_si128(reinterpret_cast<__m128i*>(av), _mm_castps_si128(a));
+    _mm_store_si128(reinterpret_cast<__m128i*>(bv), _mm_castps_si128(b));
+    _mm_store_si128(reinterpret_cast<__m128i*>(cv), _mm_castps_si128(c));
+    _mm_store_si128(reinterpret_cast<__m128i*>(rv), _mm_castps_si128(r));
+    _mm_store_si128(reinterpret_cast<__m128i*>(lv), lanes);
+    for (int i = 0; i < 4; i++) {
+        if (lv[i]) rv[i] = sfx_from_double(f(sfx_to_double(av[i]), sfx_to_double(bv[i]), sfx_to_double(cv[i])));
+    }
+    return _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i*>(rv)));
+}
+
+template <class Fast, class Slow>
+SPU_INLINE __m128 sfx_op(__m128 a, __m128 b, __m128 c, Fast fast, Slow slow) {
+    __m128 r = fast(a, b, c);
+    __m128i bad = sfx_special(r);
+    if (!_mm_testz_si128(bad, bad)) r = sfx_slow(a, b, c, r, bad, slow);
+    return sfx_pos_zero(r);
 }
 
 SPU_INLINE bool op_fa(Context& c, Host&, uint32_t w, uint32_t) {
-    G(RT(w)).vf = vclamp(_mm_add_ps(G(RA(w)).vf, G(RB(w)).vf));
+    __m128 z = _mm_setzero_ps();
+    G(RT(w)).vf = sfx_op(G(RA(w)).vf, G(RB(w)).vf, z, [](__m128 x, __m128 y, __m128) { return _mm_add_ps(x, y); }, [](double x, double y, double) { return x + y; });
     return true;
 }
 SPU_INLINE bool op_fs(Context& c, Host&, uint32_t w, uint32_t) {
-    G(RT(w)).vf = vclamp(_mm_sub_ps(G(RA(w)).vf, vclamp(G(RB(w)).vf)));
+    __m128 z = _mm_setzero_ps();
+    G(RT(w)).vf = sfx_op(G(RA(w)).vf, G(RB(w)).vf, z, [](__m128 x, __m128 y, __m128) { return _mm_sub_ps(x, y); }, [](double x, double y, double) { return x - y; });
     return true;
 }
 SPU_INLINE bool op_fm(Context& c, Host&, uint32_t w, uint32_t) {
-    __m128 a = G(RA(w)).vf, b = G(RB(w)).vf;
-    __m128 r = vclamp(_mm_mul_ps(a, b));
-    __m128 zero = _mm_and_ps(_mm_xor_ps(a, b), _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000))));
-    G(RT(w)).vf = _mm_blendv_ps(r, zero, vzero_any(a, b));
+    __m128 z = _mm_setzero_ps();
+    G(RT(w)).vf = sfx_op(G(RA(w)).vf, G(RB(w)).vf, z, [](__m128 x, __m128 y, __m128) { return _mm_mul_ps(x, y); }, [](double x, double y, double) { return x * y; });
     return true;
 }
 SPU_INLINE bool op_fma(Context& c, Host&, uint32_t w, uint32_t) {
-    __m128 a = G(RA(w)).vf, b = G(RB(w)).vf, cc = G(RRR_C(w)).vf;
-    G(RRR_T(w)).vf = _mm_blendv_ps(vclamp(_mm_fmadd_ps(a, b, cc)), cc, vzero_any(a, b));
+    G(RRR_T(w)).vf = sfx_op(G(RA(w)).vf, G(RB(w)).vf, G(RRR_C(w)).vf, [](__m128 x, __m128 y, __m128 z) { return _mm_fmadd_ps(x, y, z); }, [](double x, double y, double z) { return std::fma(x, y, z); });
     return true;
 }
 SPU_INLINE bool op_fms(Context& c, Host&, uint32_t w, uint32_t) {
-    __m128 a = G(RA(w)).vf, b = G(RB(w)).vf, cc = G(RRR_C(w)).vf;
-    __m128 neg = _mm_xor_ps(cc, _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000))));
-    G(RRR_T(w)).vf = _mm_blendv_ps(vclamp(_mm_fmadd_ps(a, b, neg)), neg, vzero_any(a, b));
+    G(RRR_T(w)).vf = sfx_op(G(RA(w)).vf, G(RB(w)).vf, G(RRR_C(w)).vf, [](__m128 x, __m128 y, __m128 z) { return _mm_fmsub_ps(x, y, z); }, [](double x, double y, double z) { return std::fma(x, y, -z); });
     return true;
 }
 SPU_INLINE bool op_fnms(Context& c, Host&, uint32_t w, uint32_t) {
-    __m128 a = G(RA(w)).vf, b = G(RB(w)).vf, cc = G(RRR_C(w)).vf;
-    G(RRR_T(w)).vf = _mm_blendv_ps(vclamp(_mm_fnmadd_ps(a, b, cc)), cc, vzero_any(a, b));
+    G(RRR_T(w)).vf = sfx_op(G(RA(w)).vf, G(RB(w)).vf, G(RRR_C(w)).vf, [](__m128 x, __m128 y, __m128 z) { return _mm_fnmadd_ps(x, y, z); }, [](double x, double y, double z) { return std::fma(-x, y, z); });
     return true;
 }
 SPU_INLINE bool op_frest(Context& c, Host&, uint32_t w, uint32_t) {
@@ -396,42 +497,54 @@ SPU_INLINE bool op_frsqest(Context& c, Host&, uint32_t w, uint32_t) {
     return true;
 }
 SPU_INLINE bool op_fi(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)) = G(RB(w)); return true; }
-SPU_INLINE bool op_fcgt(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)), b = G(RB(w)), r; for (int i = 0; i < 4; i++) r.u32[i] = a.f32[i] > b.f32[i] ? 0xFFFFFFFF : 0; G(RT(w)) = r; return true; }
-SPU_INLINE bool op_fcmgt(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)), b = G(RB(w)), r; for (int i = 0; i < 4; i++) r.u32[i] = std::fabs(a.f32[i]) > std::fabs(b.f32[i]) ? 0xFFFFFFFF : 0; G(RT(w)) = r; return true; }
-SPU_INLINE bool op_fceq(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)), b = G(RB(w)), r; for (int i = 0; i < 4; i++) r.u32[i] = a.f32[i] == b.f32[i] ? 0xFFFFFFFF : 0; G(RT(w)) = r; return true; }
-SPU_INLINE bool op_fcmeq(Context& c, Host&, uint32_t w, uint32_t) { v128 a = G(RA(w)), b = G(RB(w)), r; for (int i = 0; i < 4; i++) r.u32[i] = std::fabs(a.f32[i]) == std::fabs(b.f32[i]) ? 0xFFFFFFFF : 0; G(RT(w)) = r; return true; }
+SPU_INLINE __m128i sfx_key(__m128i v) {
+    __m128i mag = _mm_and_si128(v, _mm_set1_epi32(0x7FFFFFFF));
+    __m128i zero = _mm_cmpeq_epi32(_mm_and_si128(v, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+    mag = _mm_andnot_si128(zero, mag);
+    __m128i neg = _mm_srai_epi32(v, 31);
+    return _mm_sub_epi32(_mm_xor_si128(mag, neg), neg);
+}
+SPU_INLINE __m128i sfx_mag(__m128i v) {
+    __m128i mag = _mm_and_si128(v, _mm_set1_epi32(0x7FFFFFFF));
+    __m128i zero = _mm_cmpeq_epi32(_mm_and_si128(v, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+    return _mm_andnot_si128(zero, mag);
+}
+SPU_INLINE bool op_fcgt(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi = _mm_cmpgt_epi32(sfx_key(G(RA(w)).vi), sfx_key(G(RB(w)).vi)); return true; }
+SPU_INLINE bool op_fcmgt(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi = _mm_cmpgt_epi32(sfx_mag(G(RA(w)).vi), sfx_mag(G(RB(w)).vi)); return true; }
+SPU_INLINE bool op_fceq(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi = _mm_cmpeq_epi32(sfx_key(G(RA(w)).vi), sfx_key(G(RB(w)).vi)); return true; }
+SPU_INLINE bool op_fcmeq(Context& c, Host&, uint32_t w, uint32_t) { G(RT(w)).vi = _mm_cmpeq_epi32(sfx_mag(G(RA(w)).vi), sfx_mag(G(RB(w)).vi)); return true; }
 
 SPU_INLINE bool op_cflts(Context& c, Host&, uint32_t w, uint32_t) {
-    double scale = std::ldexp(1.0, int(173 - I8(w)));
+    double scale = std::bit_cast<double>(uint64_t(1023 + 173 - int(I8(w))) << 52);
     v128 a = G(RA(w)), r;
     for (int i = 0; i < 4; i++) {
-        double v = double(a.f32[i]) * scale;
+        double v = sfx_to_double(a.u32[i]) * scale;
         r.s32[i] = v >= 2147483647.0 ? INT32_MAX : v <= -2147483648.0 ? INT32_MIN : int32_t(v);
     }
     G(RT(w)) = r;
     return true;
 }
 SPU_INLINE bool op_cfltu(Context& c, Host&, uint32_t w, uint32_t) {
-    double scale = std::ldexp(1.0, int(173 - I8(w)));
+    double scale = std::bit_cast<double>(uint64_t(1023 + 173 - int(I8(w))) << 52);
     v128 a = G(RA(w)), r;
     for (int i = 0; i < 4; i++) {
-        double v = double(a.f32[i]) * scale;
+        double v = sfx_to_double(a.u32[i]) * scale;
         r.u32[i] = v >= 4294967295.0 ? UINT32_MAX : v <= 0.0 ? 0 : uint32_t(v);
     }
     G(RT(w)) = r;
     return true;
 }
 SPU_INLINE bool op_csflt(Context& c, Host&, uint32_t w, uint32_t) {
-    double scale = std::ldexp(1.0, int(I8(w)) - 155);
+    double scale = std::bit_cast<double>(uint64_t(1023 + int(I8(w)) - 155) << 52);
     v128 a = G(RA(w)), r;
-    for (int i = 0; i < 4; i++) r.f32[i] = float(double(a.s32[i]) * scale);
+    for (int i = 0; i < 4; i++) r.u32[i] = sfx_from_double(double(a.s32[i]) * scale);
     G(RT(w)) = r;
     return true;
 }
 SPU_INLINE bool op_cuflt(Context& c, Host&, uint32_t w, uint32_t) {
-    double scale = std::ldexp(1.0, int(I8(w)) - 155);
+    double scale = std::bit_cast<double>(uint64_t(1023 + int(I8(w)) - 155) << 52);
     v128 a = G(RA(w)), r;
-    for (int i = 0; i < 4; i++) r.f32[i] = float(double(a.u32[i]) * scale);
+    for (int i = 0; i < 4; i++) r.u32[i] = sfx_from_double(double(a.u32[i]) * scale);
     G(RT(w)) = r;
     return true;
 }
