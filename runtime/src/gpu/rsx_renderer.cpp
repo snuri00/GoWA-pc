@@ -3604,7 +3604,12 @@ bool present(uint32_t buffer_id) {
                 uint32_t cw, ch;
                 transition(sp, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 if (dlssnr::compose(frame_cmd(), sp->view, sp->layout, rw, rh, ci, cl, cw, ch)) {
-                    if (snap) schedule_image_snapshot(ci, cw, ch, snap_dir + name);
+                    if (snap) {
+                        schedule_image_snapshot(ci, cw, ch, snap_dir + name);
+                        char hname[64];
+                        std::snprintf(hname, sizeof hname, "/nrhud_%07.1f.ppm", elapsed);
+                        schedule_image_snapshot(ci, cw, ch, snap_dir + hname);
+                    }
                     uint64_t pt = ticks();
                     present_image(ci, *cl, cw, ch);
                     g_stats.present_ticks += ticks() - pt;
