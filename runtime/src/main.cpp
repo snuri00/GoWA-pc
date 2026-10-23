@@ -15,10 +15,12 @@
 
 namespace spu {
 void status_dump();
+void lowfps_tick(uint64_t flips);
 }
 
 namespace lv2 {
 void rsx_status();
+uint64_t rsx_flip_count();
 }
 
 #include <chrono>
@@ -200,6 +202,7 @@ int main(int argc, char** argv) {
     for (int tick = 0;; tick++) {
         if (census > 0 && tick % census == 0) thread_census(census);
         hooks::tick_patches();
+        spu::lowfps_tick(lv2::rsx_flip_count());
         if (!peeks.empty()) {
             std::string line;
             for (uint32_t addr : peeks) {

@@ -72,6 +72,7 @@ def main():
     ap.add_argument("--fps-unlock", action="store_true")
     ap.add_argument("--fresh-save", action="store_true")
     ap.add_argument("--env", action="append")
+    ap.add_argument("--lowfps-capture", default="22:6:90:4", help="fps:secs:cooldown:max, 0 disables")
     args = ap.parse_args()
     if running():
         print("gowa.exe is already running; close it first")
@@ -79,10 +80,16 @@ def main():
     if os.path.isdir(PLAY_SAVE) and not args.fresh_save:
         copy_saves(PLAY_SAVE, SAVE_DIR)
         print("restored your save from", PLAY_SAVE)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = os.path.join(SESSIONS, stamp)
+    os.makedirs(out, exist_ok=True)
     env = dict(os.environ)
     env["GOWA_ROOT"] = ROOT
     for k in ("GOWA_AUTOPAD", "GOWA_SNAP_EVERY", "GOWA_SNAP_FROM", "GOWA_SNAP_DIR"):
         env.pop(k, None)
+    if args.lowfps_capture != "0":
+        env["GOWA_SPU_CAPTURE_LOWFPS"] = args.lowfps_capture
+        env["GOWA_SPU_CAPTURE_DIR"] = os.path.join(out, "spucap")
     if args.scale:
         env["GOWA_RES_SCALE"] = str(args.scale)
     if args.fps_unlock:
@@ -94,9 +101,6 @@ def main():
         if os.path.exists(os.path.join(RUN_DIR, f)):
             os.remove(os.path.join(RUN_DIR, f))
     shutil.rmtree(os.path.join(RUN_DIR, "blackbox"), ignore_errors=True)
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = os.path.join(SESSIONS, stamp)
-    os.makedirs(out, exist_ok=True)
     print("starting the game; close its window to end the session")
     t0 = time.time()
     proc = subprocess.Popen([EXE], cwd=RUN_DIR, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -176,6 +176,8 @@ private:
 
 void register_thread(SpuThread* t);
 void status_dump();
+void request_capture(const std::string& dir);
+void lowfps_tick(uint64_t flips);
 
 struct Group {
     uint32_t id = 0;

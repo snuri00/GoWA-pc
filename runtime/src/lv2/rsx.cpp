@@ -458,6 +458,8 @@ void vblank_thread() {
 
 uint32_t rsx_address(uint32_t offset, uint32_t loc) { return get_address(offset, loc); }
 
+uint64_t rsx_flip_count() { return std::atomic_ref<uint64_t>(g_rsx.flips).load(std::memory_order_relaxed); }
+
 void rsx_status() {
     if (!g_rsx.dma_control) return;
     if (g_fifo_handle) LOG_INFO("status", "rsx fifo stack: %s", crash::sample_stack(g_fifo_handle, 16).c_str());
