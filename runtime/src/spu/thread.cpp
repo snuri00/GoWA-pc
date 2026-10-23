@@ -1473,7 +1473,7 @@ void SpuThread::run() {
     };
     static const bool hle_cache_on = [] {
         const char* e = std::getenv("GOWA_SPU_HLE_CACHE");
-        return e && e[0] == '1';
+        return !e || e[0] != '0';
     }();
     std::vector<HleSlot> hle_cache(hle_cache_on ? LS_SIZE / 4 : 0, HleSlot{});
     auto hle_find = [&](uint32_t pc) -> const hle::Function* {
@@ -1824,7 +1824,7 @@ void occupancy_sampler(double period_s, int periods, std::string out_path) {
                 uint64_t ins = t->insns.load();
                 auto& pv = prev_cpu[t];
                 char b[96];
-                if (pv.first) std::snprintf(b, sizeof b, " [%u cpu %.0f%% %.0fM insn/s]", t->slot, 100.0 * double(cyc - pv.first) / double(tsc - prev_tsc), double(ins - pv.second) / secs / 1e6);
+                if (pv.first && cyc >= pv.first && ins >= pv.second) std::snprintf(b, sizeof b, " [%u cpu %.0f%% %.0fM insn/s]", t->slot, 100.0 * double(cyc - pv.first) / double(tsc - prev_tsc), double(ins - pv.second) / secs / 1e6);
                 else b[0] = 0;
                 u += b;
                 pv = {cyc, ins};

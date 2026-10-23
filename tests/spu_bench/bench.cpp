@@ -797,7 +797,7 @@ Result run(State& s, const Capture& cap, bool regions) {
     };
     static const bool hle_cache_on = [] {
         const char* e = std::getenv("GOWA_SPU_HLE_CACHE");
-        return e && e[0] == '1';
+        return !e || e[0] != '0';
     }();
     std::vector<HleSlot> hcache(hle_cache_on ? spu::LS_SIZE / 4 : 0, HleSlot{});
     auto hle_find = [&](uint32_t pc) -> const spu::hle::Function* {
