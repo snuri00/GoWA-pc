@@ -1377,7 +1377,7 @@ void SpuThread::run() {
     wchar_t w[64];
     swprintf(w, 64, L"SPU %u %hs", slot, name.c_str());
     SetThreadDescription(GetCurrentThread(), w);
-    if (!std::getenv("GOWA_SPU_NORMAL_PRIO")) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    if (std::getenv("GOWA_SPU_LOW_PRIO")) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     if (const char* aff = std::getenv("GOWA_SPU_AFFINITY")) {
         int stride = std::atoi(aff);
         if (stride > 0) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << ((slot * stride) % 12));
