@@ -28,6 +28,8 @@ inline uint64_t code_hash(const uint8_t* p, uint32_t words) {
 void register_function(const Function& f);
 const Function* lookup(const uint8_t* ls, uint32_t pc);
 extern uint16_t g_first[LS_SIZE / 4];
+extern uint8_t g_max_words[LS_SIZE / 4];
+inline uint32_t max_sig_words(uint32_t pc) { return g_max_words[(pc & PC_MASK) >> 2]; }
 inline bool any_at(uint32_t pc) { return g_first[(pc & PC_MASK) >> 2] != 0; }
 void install_builtin();
 

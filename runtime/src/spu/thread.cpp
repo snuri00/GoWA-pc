@@ -1467,6 +1467,26 @@ void SpuThread::run() {
         uint32_t valid;
     };
     std::vector<Slot> block_cache(aot_on ? LS_SIZE / 4 : 0, Slot{});
+    struct HleSlot {
+        const hle::Function* f;
+        uint32_t valid;
+    };
+    static const bool hle_cache_on = [] {
+        const char* e = std::getenv("GOWA_SPU_HLE_CACHE");
+        return e && e[0] == '1';
+    }();
+    std::vector<HleSlot> hle_cache(hle_cache_on ? LS_SIZE / 4 : 0, HleSlot{});
+    auto hle_find = [&](uint32_t pc) -> const hle::Function* {
+        if (!hle_cache_on) return hle::lookup(ls, pc);
+        HleSlot& hs = hle_cache[pc >> 2];
+        uint32_t w = hle::max_sig_words(pc);
+        if (hs.valid && ls_fresh(pc, w, hs.valid)) return hs.f;
+        uint32_t e = ls_epoch.load(std::memory_order_acquire);
+        const hle::Function* f = hle::lookup(ls, pc);
+        hs.f = f;
+        hs.valid = w < 255 ? e : 0;
+        return f;
+    };
     static const bool no_fresh = std::getenv("GOWA_SPU_NO_FRESH") != nullptr;
     const bool use_regions = !verify && !std::getenv("GOWA_SPU_NO_REGIONS");
     uint32_t irq_countdown = 256;
@@ -1507,7 +1527,7 @@ void SpuThread::run() {
                 }
             }
             if (!cap && hle::any_at(ctx.pc)) {
-                if (const hle::Function* f = hle::lookup(ls, ctx.pc)) {
+                if (const hle::Function* f = hle_find(ctx.pc)) {
                     if (f->host_handler) {
                         ctx.executed = 0;
                         uint32_t pc_before = ctx.pc;
