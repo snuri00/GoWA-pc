@@ -31,6 +31,7 @@ struct Stats {
 Stats stats();
 
 extern thread_local bool t_armed;
+extern const bool g_active;
 bool on_put(uint8_t* ls, uint32_t lsa, uint32_t ea, uint32_t size);
 
 void job_start();

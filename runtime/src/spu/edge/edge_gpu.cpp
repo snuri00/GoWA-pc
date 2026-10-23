@@ -6,7 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <unordered_map>
+#include <map>
 
 namespace edge::gpu {
 
@@ -26,7 +26,22 @@ std::atomic<uint64_t> s_deferred{0}, s_confirmed{0}, s_published{0}, s_put_skipp
 std::atomic<uint64_t> s_mat[8]{};
 
 std::mutex g_m;
-std::unordered_map<uint32_t, std::shared_ptr<const Record>> g_records;
+std::map<uint32_t, std::shared_ptr<const Record>> g_records;
+std::atomic<uint32_t> g_lo{0xFFFFFFFFu}, g_hi{0};
+
+void erase_range_locked(uint32_t ea, uint32_t size) {
+    auto it = g_records.lower_bound(ea >= 0x10000 ? ea - 0x10000 : 0);
+    while (it != g_records.end() && it->first < ea + size) {
+        if (it->first + 12 * it->second->nv > ea) it = g_records.erase(it);
+        else ++it;
+    }
+}
+
+void invalidate(uint32_t ea, uint32_t size) {
+    if (ea >= g_hi.load(std::memory_order_relaxed) || ea + size <= g_lo.load(std::memory_order_relaxed)) return;
+    std::lock_guard lk(g_m);
+    erase_range_locked(ea, size);
+}
 std::atomic<uint64_t> g_stamp{0};
 
 enum State { kNone, kDecoded, kTransformed, kAwaitPut };
@@ -110,6 +125,7 @@ void materialize(uint8_t* ls, int reason) {
 }
 
 thread_local bool t_armed = false;
+const bool g_active = g_mode != kOff;
 
 void* state_save() { return new Pending(t_p); }
 
@@ -279,19 +295,26 @@ void touch_all(uint8_t* ls, int reason) {
 bool on_put(uint8_t* ls, uint32_t lsa, uint32_t ea, uint32_t size) {
     Pending& p = t_p;
     if (p.st != kAwaitPut) {
-        t_armed = false;
+        invalidate(ea, size);
         return false;
     }
     uint32_t lo = p.out_lsa, hi = p.out_lsa + p.out_bytes;
-    if (!(lsa < hi && lsa + size > lo)) return false;
+    if (!(lsa < hi && lsa + size > lo)) {
+        invalidate(ea, size);
+        return false;
+    }
     if (lsa != lo || size < p.out_bytes || size > ((p.out_bytes + 15) & ~15u) + 16) {
         materialize(ls, 3);
+        invalidate(ea, size);
         return false;
     }
     p.rec->ea = ea;
     p.rec->stamp = g_stamp.fetch_add(1, std::memory_order_relaxed) + 1;
     {
         std::lock_guard lk(g_m);
+        erase_range_locked(ea, size);
+        if (ea < g_lo.load(std::memory_order_relaxed)) g_lo.store(ea, std::memory_order_relaxed);
+        if (ea + size > g_hi.load(std::memory_order_relaxed)) g_hi.store(ea + size, std::memory_order_relaxed);
         g_records[ea] = std::move(p.rec);
     }
     s_published.fetch_add(1, std::memory_order_relaxed);

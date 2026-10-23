@@ -848,7 +848,7 @@ void SpuThread::dma(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size) {
     }
     lsa &= 0x3FFFF;
     bool put = (cmd & 0xF0) == 0x20 || (cmd & 0xF0) == 0x30 || (cmd & 0xF0) == 0xA0;
-    if (put && edge::gpu::t_armed && edge::gpu::on_put(ls, lsa, ea, size)) return;
+    if (put && edge::gpu::g_active && edge::gpu::on_put(ls, lsa, ea, size)) return;
     if (dma_watched(ea, size)) log_watched_dma(put ? "PUT" : "GET", cmd, ea, lsa, size, put ? ls + lsa : nullptr);
     if (ea < 0xF0000000u && (ea < 0x10000 || !vm::is_mapped(ea) || !vm::is_mapped(ea + size - 1))) {
         static std::atomic<int> reported{0};
