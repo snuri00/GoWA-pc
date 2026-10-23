@@ -791,6 +791,26 @@ Result run(State& s, const Capture& cap, bool regions) {
     std::unique_ptr<Replay> host_ptr = make_host(s, cap);
     Replay& host = *host_ptr;
     std::vector<Slot> cache(spu::LS_SIZE / 4);
+    struct HleSlot {
+        const spu::hle::Function* f;
+        uint32_t valid;
+    };
+    static const bool hle_cache_on = [] {
+        const char* e = std::getenv("GOWA_SPU_HLE_CACHE");
+        return !e || e[0] != '0';
+    }();
+    std::vector<HleSlot> hcache(hle_cache_on ? spu::LS_SIZE / 4 : 0, HleSlot{});
+    auto hle_find = [&](uint32_t pc) -> const spu::hle::Function* {
+        if (!hle_cache_on) return spu::hle::lookup(s.ls, pc);
+        HleSlot& hs = hcache[pc >> 2];
+        uint32_t w = spu::hle::max_sig_words(pc);
+        if (hs.valid && s.fresh(pc, w, hs.valid)) return hs.f;
+        uint32_t e = s.epoch.load();
+        const spu::hle::Function* f = spu::hle::lookup(s.ls, pc);
+        hs.f = f;
+        hs.valid = w < 255 ? e : 0;
+        return f;
+    };
     uint64_t n = 0;
     ULONG64 t0 = 0;
     QueryThreadCycleTime(GetCurrentThread(), &t0);
@@ -831,7 +851,7 @@ Result run(State& s, const Capture& cap, bool regions) {
             jp_top = __rdtsc();
         }
         if (g_hle && spu::hle::any_at(s.c.pc)) {
-            const spu::hle::Function* f = spu::hle::lookup(s.ls, s.c.pc);
+            const spu::hle::Function* f = hle_find(s.c.pc);
             if (f && f->host_handler) {
                 if (cap.insns - n > g_host_budget + 200000) {
                     uint32_t pc0 = s.c.pc;

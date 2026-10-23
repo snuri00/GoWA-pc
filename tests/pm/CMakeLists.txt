@@ -19,9 +19,9 @@ add_library(pm_spu STATIC
 target_include_directories(pm_spu PUBLIC ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(pm_spu PRIVATE ${PM_FLAGS})
 
-file(GLOB PM_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/pm/*.cpp ${GOWA_ROOT}/runtime/src/spu/edgejob/*.cpp ${GOWA_ROOT}/runtime/src/spu/meshhier/*.cpp ${GOWA_ROOT}/runtime/src/spu/anim/*.cpp ${GOWA_GEN}/pm/*.cpp ${GOWA_GEN}/edgejob/*.cpp ${GOWA_GEN}/meshhier/*.cpp ${GOWA_GEN}/anim/*.cpp)
+file(GLOB PM_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/pm/*.cpp ${GOWA_ROOT}/runtime/src/spu/edgejob/*.cpp ${GOWA_ROOT}/runtime/src/spu/meshhier/*.cpp ${GOWA_ROOT}/runtime/src/spu/anim/*.cpp ${GOWA_GEN}/pm/*.cpp ${GOWA_GEN}/edgejob/*.cpp ${GOWA_GEN}/meshhier/*.cpp ${GOWA_GEN}/anim/*.cpp ${GOWA_ROOT}/runtime/src/spu/mpjob/*.cpp ${GOWA_GEN}/mpjob/*.cpp)
 add_library(pm_native STATIC ${PM_NATIVE_SRC})
-target_include_directories(pm_native PUBLIC ${GOWA_GEN}/pm ${GOWA_GEN}/edgejob ${GOWA_GEN}/meshhier ${GOWA_GEN}/anim ${GOWA_ROOT}/runtime/src/spu/pm ${GOWA_ROOT}/runtime/src/spu/edgejob ${GOWA_ROOT}/runtime/src/spu/meshhier ${GOWA_ROOT}/runtime/src/spu/anim ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
+target_include_directories(pm_native PUBLIC ${GOWA_GEN}/pm ${GOWA_GEN}/edgejob ${GOWA_GEN}/meshhier ${GOWA_GEN}/anim ${GOWA_GEN}/mpjob ${GOWA_ROOT}/runtime/src/spu/pm ${GOWA_ROOT}/runtime/src/spu/edgejob ${GOWA_ROOT}/runtime/src/spu/meshhier ${GOWA_ROOT}/runtime/src/spu/anim ${GOWA_ROOT}/runtime/src/spu/mpjob ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(pm_native PRIVATE ${PM_FLAGS})
 
 add_executable(pm_harness harness.cpp ${EDGE_DIR}/capture.cpp)

@@ -11,6 +11,7 @@
 namespace spu::hle {
 
 uint16_t g_first[LS_SIZE / 4] = {};
+uint8_t g_max_words[LS_SIZE / 4] = {};
 
 namespace {
 
@@ -34,6 +35,8 @@ void register_function(const Function& f) {
     uint32_t slot = (f.lsa & PC_MASK) >> 2;
     g_next.push_back(g_first[slot]);
     g_first[slot] = static_cast<uint16_t>(g_functions.size());
+    uint32_t words = f.sig_words > 255 ? 255 : f.sig_words;
+    if (words > g_max_words[slot]) g_max_words[slot] = static_cast<uint8_t>(words);
     LOG_INFO("spuhle", "registered native SPU function %s at LS 0x%05x", f.name, f.lsa);
 }
 
