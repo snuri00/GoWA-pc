@@ -1379,7 +1379,7 @@ void SpuThread::run() {
     wchar_t w[64];
     swprintf(w, 64, L"SPU %u %hs", slot, name.c_str());
     SetThreadDescription(GetCurrentThread(), w);
-    if (!std::getenv("GOWA_SPU_NORMAL_PRIO")) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    if (std::getenv("GOWA_SPU_LOW_PRIO")) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     if (const char* aff = std::getenv("GOWA_SPU_AFFINITY")) {
         int stride = std::atoi(aff);
         if (stride > 0) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << ((slot * stride) % 12));
@@ -1901,6 +1901,19 @@ void register_thread(SpuThread* t) {
     if (std::find(g_reg.begin(), g_reg.end(), t) == g_reg.end()) g_reg.push_back(t);
     static std::once_flag once;
     if (std::getenv("GOWA_SPU_OCC")) std::call_once(once, [] { std::thread(occupancy_sampler, 10.0, 0, std::string()).detach(); });
+}
+
+std::string brief() {
+    std::string out;
+    std::lock_guard lk(g_reg_lock);
+    for (SpuThread* t : g_reg) {
+        char b[96];
+        uint32_t wid;
+        std::memcpy(&wid, t->ls + 0x1dc, 4);
+        std::snprintf(b, sizeof b, " [%x pc %05x wid %u ra %08x]", t->id >> 24, t->ctx.pc, __builtin_bswap32(wid), t->raddr);
+        out += b;
+    }
+    return out;
 }
 
 void status_dump() {

@@ -5,6 +5,7 @@
 #include "runtime/reservation.h"
 #include "runtime/trace.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -23,6 +24,7 @@
 
 namespace spu {
 void status_dump();
+std::string brief();
 }
 
 namespace lv2 {
@@ -221,6 +223,93 @@ void impl(ppu::Context& ctx, uint8_t* base, uint32_t addr, ppu::BodyFn fn) {
     fn(ctx, base);
     t_depth--;
     LOG_INFO("hook", "%*s<- %s #%u r3=%llx f1=%g%s", t_depth * 2, "", name.c_str(), n, static_cast<unsigned long long>(ctx.gpr[3]), ctx.fpr[1], ctx.gpr[1] != r1 ? " (stack mismatch)" : "");
+}
+
+std::string batch_state(uint32_t obj) {
+    std::string s;
+    char b[160];
+    std::snprintf(b, sizeof b, "added %u done %u cur %u lists %u mode %u per %u", vm::read32(obj + 0xcc), vm::read32(obj + 0xd0), vm::read32(obj + 0xd4), vm::read32(obj + 0xd8), vm::read32(obj + 0xdc), vm::read32(obj + 0xc8));
+    s += b;
+    uint32_t hdr = vm::read32(obj);
+    if (hdr && vm::range_mapped(hdr, 0x80)) {
+        for (uint32_t i = 0; i < 4; i++) {
+            uint32_t st = hdr + 0x40 + i * 0x10;
+            std::snprintf(b, sizeof b, " | L%u n%u st", i, vm::read32(obj + 0x2c + i * 0x14));
+            s += b;
+            for (uint32_t k = 0; k < 8; k++) {
+                std::snprintf(b, sizeof b, " %04x", vm::read16(st + k * 2));
+                s += b;
+            }
+        }
+        std::snprintf(b, sizeof b, " | hdr %08x %08x %08x %08x", vm::read32(hdr), vm::read32(hdr + 4), vm::read32(hdr + 8), vm::read32(hdr + 12));
+        s += b;
+    }
+    const uint32_t spurs = 0x3001ad00;
+    uint32_t wid = vm::read32(obj + 8) & 31;
+    std::snprintf(b, sizeof b, " | wid %u ready %u cont %02x pend %02x idling %02x ssm %02x sig %04x flagrecv %02x", wid, vm::g_base[spurs + (wid & 15) + (wid < 16 ? 0 : 0x10)], vm::g_base[spurs + 0x20 + (wid & 15)],
+                  vm::g_base[spurs + 0x30 + (wid & 15)], vm::g_base[spurs + 0x73], vm::g_base[spurs + 0x72], vm::read16(spurs + 0x70), vm::g_base[spurs + 0x77]);
+    s += b;
+    return s;
+}
+
+void batch_diag_thread() {
+    using clk = std::chrono::steady_clock;
+    std::vector<uint8_t> last;
+    auto since = clk::now();
+    auto wait_since = clk::now();
+    int wait_kind = 0;
+    bool reported = false, wait_reported = false;
+    int samples = 0;
+    double thresh = 20.0;
+    if (const char* e = std::getenv("GOWA_BATCH_DIAG")) thresh = (std::max)(1.0, std::atof(e));
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        uint32_t obj = vm::is_mapped(0x858c2c) ? vm::read32(0x858c2c) : 0;
+        if (!obj || !vm::range_mapped(obj, 0xe0)) continue;
+        uint32_t hdr = vm::read32(obj);
+        if (!hdr || !vm::range_mapped(hdr, 0x80)) continue;
+        uint32_t added = vm::read32(obj + 0xcc), done = vm::read32(obj + 0xd0), mode = vm::read32(obj + 0xdc);
+        uint32_t per = vm::read32(obj + 0xc8), lists = vm::read32(obj + 0xd8);
+        int kind = 0;
+        if (mode == 2 && added != done) kind = 2;
+        else if (mode == 1 && per && int32_t((lists + 4) * per - added) <= 0) kind = 1;
+        auto now = clk::now();
+        if (kind != wait_kind) {
+            double ms = std::chrono::duration<double, std::milli>(now - wait_since).count();
+            if (wait_kind && ms > thresh) LOG_WARN("batchdiag", "ppu %s wait ended after %.1f ms: %s", wait_kind == 2 ? "finish" : "addjob", ms, batch_state(obj).c_str());
+            wait_kind = kind;
+            wait_since = now;
+            wait_reported = false;
+            samples = 0;
+        } else if (kind) {
+            double ms = std::chrono::duration<double, std::milli>(now - wait_since).count();
+            if (ms > thresh && samples < 8 && ms > thresh * (1 << samples)) {
+                samples++;
+                LOG_WARN("batchdiag", "ppu %s wait %.1f ms: %s |%s", kind == 2 ? "finish" : "addjob", ms, batch_state(obj).c_str(), spu::brief().c_str());
+                if (!wait_reported) {
+                    wait_reported = true;
+                    static std::atomic<int> dumps{0};
+                    if (dumps.fetch_add(1) < 4) spu::status_dump();
+                }
+            }
+        }
+        std::vector<uint8_t> sig(vm::g_base + hdr + 0x40, vm::g_base + hdr + 0x80);
+        sig.push_back(uint8_t(added));
+        sig.push_back(uint8_t(done));
+        bool pending = added != done;
+        if (!pending || sig != last) {
+            if (reported) LOG_WARN("batchdiag", "resolved after %.1f ms: %s", std::chrono::duration<double, std::milli>(now - since).count(), batch_state(obj).c_str());
+            reported = false;
+            last = sig;
+            since = now;
+            continue;
+        }
+        double ms = std::chrono::duration<double, std::milli>(now - since).count();
+        if (!reported && ms > thresh) {
+            reported = true;
+            LOG_WARN("batchdiag", "no progress for %.1f ms (mode %u): %s |%s", ms, mode, batch_state(obj).c_str(), spu::brief().c_str());
+        }
+    }
 }
 
 void summary_thread() {
@@ -438,7 +527,38 @@ void install_patches() {
     }
 }
 
+void hog_thread(int lp, int on_ms, int off_ms, double from) {
+    SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << lp);
+    SetThreadDescription(GetCurrentThread(), L"test hog");
+    while (logging::uptime() < from) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    LOG_WARN("hog", "normal-priority hog on lp %d (%d ms on, %d ms off)", lp, on_ms, off_ms);
+    volatile uint64_t x = 0;
+    for (;;) {
+        auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(on_ms);
+        while (std::chrono::steady_clock::now() < end) {
+            for (int i = 0; i < 1000; i++) x = x + 1;
+        }
+        if (off_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(off_ms));
+    }
+}
+
+void start_hogs(const char* spec) {
+    double from = std::getenv("GOWA_TEST_HOG_FROM") ? std::atof(std::getenv("GOWA_TEST_HOG_FROM")) : 90.0;
+    std::string s = spec;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t end = s.find(';', pos);
+        if (end == std::string::npos) end = s.size();
+        int lp = -1, on = 1000, off = 0;
+        std::sscanf(s.substr(pos, end - pos).c_str(), "%d:%d:%d", &lp, &on, &off);
+        if (lp >= 0 && lp < 64) std::thread(hog_thread, lp, on, off, from).detach();
+        pos = end + 1;
+    }
+}
+
 void init() {
+    if (std::getenv("GOWA_BATCH_DIAG")) std::thread(batch_diag_thread).detach();
+    if (const char* h = std::getenv("GOWA_TEST_HOG")) start_hogs(h);
     if (const char* n = std::getenv("GOWA_SYMBOLS")) load_names(n);
     else load_names("../docs/re/symbols.txt");
     std::string combined = std::getenv("GOWA_HOOK") ? std::getenv("GOWA_HOOK") : "";
