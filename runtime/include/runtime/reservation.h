@@ -25,6 +25,7 @@ uint32_t park_word(int slot);
 void park_kick(int slot);
 int wait_parked(uint32_t line, uint64_t rtime, const uint8_t* rdata, int slot, uint32_t w0, int64_t limit_us, const std::atomic<bool>& stop);
 void wake(uint32_t addr);
+uint32_t group_wrap_addr(uint32_t from);
 bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size);
 bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi);
 bool copy_range_prefetch(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi);

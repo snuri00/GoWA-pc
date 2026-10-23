@@ -649,4 +649,9 @@ int wait_parked_impl(uint32_t line, uint64_t rtime, const uint8_t* rdata, int sl
 }
 }
 
+uint32_t group_wrap_addr(uint32_t from) {
+    for (uint32_t l = from >> 7;; l++)
+        if (((l / PER_GROUP) & GROUP_MASK) == GROUP_MASK && l % PER_GROUP == PER_GROUP - 1) return (l + 1) << 7;
+}
+
 }

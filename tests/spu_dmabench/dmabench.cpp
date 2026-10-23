@@ -58,13 +58,8 @@ void tagwait(spu::Host& h, uint32_t mask) {
     g_sink += h.read_channel(24);
 }
 
-uint32_t wrap_addr(uint32_t base) {
-    for (uint32_t l = base >> 7;; l++)
-        if (((l / 7) & 0x3FFF) == 0x3FFF && l % 7 == 6) return (l + 1) << 7;
-}
-
 int stress(uint32_t base, int iters, bool tight, bool wrap) {
-    const uint32_t shared = wrap ? wrap_addr(base) - 0x400 : base + 0xC10000;
+    const uint32_t shared = wrap ? rsv::group_wrap_addr(base) - 0x400 : base + 0xC10000;
     const uint32_t counter = tight ? shared - 0x80 : base + 0xC00000;
     const uint32_t ppu_word = tight ? shared + 0x800 : base + 0xC20000;
     vm::write32(counter, 0);
