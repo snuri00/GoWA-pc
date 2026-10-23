@@ -1,6 +1,7 @@
 #include "spu/aot.h"
 #include "spu/context.h"
 #include "hle.h"
+#include "edge/edge_gpu.h"
 #ifdef SPU_BENCH_LIVE
 #include "runtime/memory.h"
 #include "thread.h"
@@ -469,7 +470,13 @@ public:
                 uint32_t cmd = value & 0xFF, lsa = g_mfc[0] & 0x3FFFF, ea = g_mfc[2], size = g_mfc[3];
                 bool put = (cmd & 0xF0) == 0x20 || (cmd & 0xF0) == 0x30;
                 std::fprintf(g_dma_log, "%s cmd %02x pc %05x lsa %05x ea %08x size %x", put ? "PUT" : "GET", cmd, s.c.pc, lsa, ea, size);
-                if (put && size && lsa + size <= spu::LS_SIZE && size <= 0x4000) {
+                if ((cmd & 0x04) && cmd < 0x50 && std::getenv("SPU_BENCH_DMA_LIST")) {
+                    uint32_t la = ea & 0x3FFF8;
+                    for (uint32_t i = 0; i + 8 <= size && la + i + 8 <= spu::LS_SIZE; i += 8) {
+                        const uint8_t* e = s.ls + la + i;
+                        std::fprintf(g_dma_log, " elem %08x %x", (uint32_t(e[4]) << 24) | (uint32_t(e[5]) << 16) | (uint32_t(e[6]) << 8) | e[7], ((uint32_t(e[2]) << 8) | e[3]) & 0x7FFF);
+                    }
+                } else if (put && size && lsa + size <= spu::LS_SIZE && size <= 0x4000 && !std::getenv("SPU_BENCH_DMA_LIST")) {
                     std::fprintf(g_dma_log, " data");
                     for (uint32_t i = 0; i < size; i++) std::fprintf(g_dma_log, "%s%02x", (i & 63) ? "" : " ", s.ls[lsa + i]);
                 }
@@ -493,7 +500,7 @@ public:
         if (g_dma_log && ch == 21) {
             uint32_t cmd = value & 0xFF, lsa = g_mfc[0] & 0x3FFFF, size = g_mfc[3];
             bool get = (cmd & 0xF0) == 0x40;
-            if (get && size && size <= 0x4000 && lsa + size <= spu::LS_SIZE) {
+            if (get && size && size <= 0x4000 && lsa + size <= spu::LS_SIZE && !std::getenv("SPU_BENCH_DMA_LIST")) {
                 std::fprintf(g_dma_log, "GETDATA lsa %05x size %x data", lsa, size);
                 for (uint32_t i = 0; i < size; i++) std::fprintf(g_dma_log, "%s%02x", (i & 63) ? "" : " ", s.ls[lsa + i]);
                 std::fprintf(g_dma_log, "\n");
@@ -914,7 +921,9 @@ Result run(State& s, const Capture& cap, bool regions) {
                     spu::Context probe = s.c;
                     probe.ls = probe_ls.data();
                     probe.line_epoch = nullptr;
+                    void* gs = edge::gpu::mode() ? edge::gpu::state_save() : nullptr;
                     iso_ok = f->handler(probe);
+                    if (gs) edge::gpu::state_restore(gs);
                     exit_pc = probe.gpr[0].u32[3] & spu::PC_MASK;
                     if (iso_ok) iso_ok = iso_count(s, k, exit_pc, probe.gpr[1].u32[3]);
                     g_counts.push_back(iso_ok && n + k < cap.insns ? k : UINT64_MAX);
@@ -1349,6 +1358,12 @@ int main(int argc, char** argv) {
         for (auto& [pc, c] : by_exit) v.push_back({c, pc});
         std::sort(v.rbegin(), v.rend());
         for (size_t i = 0; i < v.size() && i < 40; i++) std::printf("  exit %05x %llu\n", v[i].second, (unsigned long long)v[i].first);
+    }
+    if (edge::gpu::mode()) {
+        edge::gpu::Stats st = edge::gpu::stats();
+        std::printf("edge gpu: deferred %llu confirmed %llu published %llu dropped %llu materialized", (unsigned long long)st.deferred, (unsigned long long)st.confirmed, (unsigned long long)st.published, (unsigned long long)st.dropped);
+        for (int i = 0; i < 8; i++) std::printf(" %llu", (unsigned long long)st.materialized[i]);
+        std::printf("\n");
     }
     std::printf("total %.3f cycles/insn over %llu insns, %d mismatching\n", total_insns ? double(total_cycles) / total_insns : 0.0, static_cast<unsigned long long>(total_insns), failures);
     return failures ? 1 : 0;

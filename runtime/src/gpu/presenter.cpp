@@ -43,6 +43,8 @@ struct State {
     std::vector<VkImage> swap_images;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBuffer pre = VK_NULL_HANDLE;
+    bool pre_recording = false;
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore acquired = VK_NULL_HANDLE;
     VkSemaphore rendered = VK_NULL_HANDLE;
@@ -373,6 +375,8 @@ bool init() {
     f2.features.textureCompressionBC = avail.textureCompressionBC;
     f2.features.shaderClipDistance = avail.shaderClipDistance;
     f2.features.occlusionQueryPrecise = avail.occlusionQueryPrecise;
+    f2.features.shaderFloat64 = avail.shaderFloat64;
+    f2.features.shaderInt64 = avail.shaderInt64;
     g.features = f2.features;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2;
@@ -396,6 +400,7 @@ bool init() {
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cai.commandBufferCount = 1;
     vkAllocateCommandBuffers(g.device, &cai, &g.cmd);
+    vkAllocateCommandBuffers(g.device, &cai, &g.pre);
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     vkCreateFence(g.device, &fci, nullptr, &g.fence);
@@ -431,6 +436,18 @@ VkCommandBuffer frame_cmd() {
     return g.cmd;
 }
 
+VkCommandBuffer pre_cmd() {
+    begin_frame();
+    if (!g.pre_recording) {
+        vkResetCommandBuffer(g.pre, 0);
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(g.pre, &begin);
+        g.pre_recording = true;
+    }
+    return g.pre;
+}
+
 uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags flags) { return find_memory_impl(bits, flags); }
 
 void image_barrier(VkCommandBuffer cmd, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to) {
@@ -449,18 +466,34 @@ void image_barrier(VkCommandBuffer cmd, VkImage img, VkImageAspectFlags aspect, 
 
 namespace {
 
+uint32_t gather_cmds(VkCommandBuffer out[2]) {
+    uint32_t n = 0;
+    if (g.pre_recording) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g.pre, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        vkEndCommandBuffer(g.pre);
+        g.pre_recording = false;
+        out[n++] = g.pre;
+    }
+    out[n++] = g.cmd;
+    return n;
+}
+
 void submit_and_present(uint32_t index) {
     dlssg::pre_submit(g.cmd, g.swap_extent.width, g.swap_extent.height);
     vkEndCommandBuffer(g.cmd);
     g.recording = false;
     vkResetFences(g.device, 1, &g.fence);
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkCommandBuffer cmds[2];
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.waitSemaphoreCount = 1;
     si.pWaitSemaphores = &g.acquired;
     si.pWaitDstStageMask = &wait_stage;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &g.cmd;
+    si.commandBufferCount = gather_cmds(cmds);
+    si.pCommandBuffers = cmds;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &g.rendered;
     if (VkResult sr = vkQueueSubmit(g.queue, 1, &si, g.fence); sr != VK_SUCCESS) {
@@ -485,9 +518,10 @@ void flush_without_present() {
     vkEndCommandBuffer(g.cmd);
     g.recording = false;
     vkResetFences(g.device, 1, &g.fence);
+    VkCommandBuffer cmds[2];
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &g.cmd;
+    si.commandBufferCount = gather_cmds(cmds);
+    si.pCommandBuffers = cmds;
     if (VkResult sr = vkQueueSubmit(g.queue, 1, &si, g.fence); sr != VK_SUCCESS) {
         static int reported = 0;
         if (reported++ < 5) LOG_ERROR("gpu", "vkQueueSubmit failed %d", int(sr));

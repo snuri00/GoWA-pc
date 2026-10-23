@@ -10,6 +10,8 @@
 #include "runtime/memory.h"
 #include "fp_decompiler.h"
 #include "ring.h"
+#include "edge_compute.h"
+#include "../spu/edge/edge_gpu.h"
 #include "shader_compiler.h"
 #include "texture_decode.h"
 #include "vk_context.h"
@@ -2509,6 +2511,8 @@ bool draw() {
     };
     PendingDecode pending[16];
     uint32_t npending = 0;
+    const float* gpu_check[16] = {};
+    uint32_t check_ea[16] = {};
     for (uint32_t i = 0; i < 16; i++) {
         uint32_t f = R(VERTEX_ARRAY_FORMAT + i * 4);
         uint32_t type = f & 7, size = (f >> 4) & 0xF, stride = (f >> 8) & 0xFF, freq = f >> 16;
@@ -2533,6 +2537,21 @@ bool draw() {
             vstrides[i] = 0;
             vdata[i] = reinterpret_cast<const float*>(a.ptr);
             continue;
+        }
+        if (!constant && !inline_draw && type == 2 && size == 3 && stride == 12 && freq <= 1 && edge_compute::enabled()) {
+            std::shared_ptr<const edge::gpu::Record> rec = edge::gpu::find(base);
+            RingAlloc ga;
+            if (rec && vmax < rec->nv && edge_compute::expand(*rec, ga)) {
+                if (!edge_compute::verify()) {
+                    vbufs[i] = ga.buffer;
+                    voffs[i] = ga.offset + VkDeviceSize(vmin) * 16;
+                    vstrides[i] = 16;
+                    vdata[i] = nullptr;
+                    continue;
+                }
+                gpu_check[i] = reinterpret_cast<const float*>(ga.ptr) + size_t(vmin) * 4;
+                check_ea[i] = base;
+            }
         }
         if (!ring_alloc(uint64_t(vcount) * 16, 16, a)) return skip(__LINE__);
         float* out = reinterpret_cast<float*>(a.ptr);
@@ -2572,6 +2591,8 @@ bool draw() {
             decode_vertices(d.type, d.size, d.src + size_t(v0) * d.stride, d.stride, nv, d.out + size_t(v0) * 4);
         }
     }
+    for (uint32_t i = 0; i < 16; i++)
+        if (gpu_check[i] && vdata[i]) edge_compute::add_check(gpu_check[i], vdata[i], vcount, check_ea[i]);
     g_stats.phase[3] += ticks() - ph;
     ph = ticks();
     RingAlloc ib;
@@ -3316,6 +3337,7 @@ void frame_complete() {
         LOG_INFO("rsx", "vertex recheck: %u of %zu arrays changed after their draw", changed, g_vb_checks.size());
         g_vb_checks.clear();
     }
+    edge_compute::frame_complete();
     resolve_zpass();
     complete_writebacks();
     complete_dumps();
