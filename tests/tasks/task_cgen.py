@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import pm_cgen as G
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-OUT = os.path.join(ROOT, "runtime", "src", "spu", "tasks")
+OUT = os.path.join((os.environ.get("GOWA_GEN_DIR") or os.path.join(ROOT, "out", "gen", "spu")), "tasks")
 
 TASKS = (
     ("zlib", 0x6E5900),
@@ -18,7 +18,7 @@ TASKS = (
 
 def recorded_starts(img_ls, img):
     out = set()
-    for path in glob.glob(os.path.join(ROOT, "recomp", "spu", "blocks", "run*.bin")):
+    for path in glob.glob(os.path.join(os.environ.get("GOWA_SPU_BLOCKS") or os.path.join(ROOT, "recomp", "spu", "blocks"), "run*.bin")):
         data = open(path, "rb").read()
         words = struct.unpack("<%dI" % (len(data) // 4), data[: len(data) // 4 * 4])
         i = 0
@@ -69,7 +69,7 @@ G.loop_heads = every_leader
 
 
 def generate(name, ea):
-    elf = open(os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf"), "rb").read()
+    elf = open((os.environ.get("GOWA_ELF") or os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf")), "rb").read()
     entry, text_ea, ls, size = text_segment(elf, ea)
     img = elf[text_ea - 0x10000: text_ea - 0x10000 + size]
     G.configure(

@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 get_filename_component(GOWA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(GOWA_GEN "${GOWA_ROOT}/out/gen/spu" CACHE PATH "Generated native SPU sources (tools/setup.py)")
 set(EDGE_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-frounding-math /EHsc /O2)
 
 add_library(edge_spu STATIC
@@ -17,10 +18,10 @@ add_library(edge_spu STATIC
 target_include_directories(edge_spu PUBLIC ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(edge_spu PRIVATE ${EDGE_FLAGS})
 
-file(GLOB EDGE_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/edge/*.cpp)
+file(GLOB EDGE_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/edge/*.cpp ${GOWA_GEN}/edge/*.cpp)
 file(GLOB EDGE_ADAPTER_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/nat_*.cpp)
 add_library(edge_native STATIC ${EDGE_NATIVE_SRC})
-target_include_directories(edge_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/edge ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(edge_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/edge ${GOWA_GEN}/edge ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(edge_native PRIVATE ${EDGE_FLAGS})
 
 add_executable(edge_harness harness.cpp capture.cpp unit.cpp ${EDGE_ADAPTER_SRC})

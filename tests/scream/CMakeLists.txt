@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 get_filename_component(GOWA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(GOWA_GEN "${GOWA_ROOT}/out/gen/spu" CACHE PATH "Generated native SPU sources (tools/setup.py)")
 set(EDGE_DIR ${GOWA_ROOT}/tests/edge)
 set(SC_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-frounding-math /EHsc /O2)
 
@@ -19,9 +20,9 @@ target_include_directories(sc_spu PUBLIC ${GOWA_ROOT}/runtime/include ${GOWA_ROO
 target_compile_options(sc_spu PRIVATE ${SC_FLAGS})
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-file(GLOB SC_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/scream/*.cpp)
+file(GLOB SC_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/scream/*.cpp ${GOWA_GEN}/scream/*.cpp)
 add_library(sc_native STATIC ${SC_NATIVE_SRC})
-target_include_directories(sc_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/scream ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
+target_include_directories(sc_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/scream ${GOWA_GEN}/scream ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(sc_native PRIVATE ${SC_FLAGS})
 
 set(SC_GEN_DEPS ${CMAKE_CURRENT_SOURCE_DIR}/sc_cgen.py ${CMAKE_CURRENT_SOURCE_DIR}/sc_indirect.py ${CMAKE_CURRENT_SOURCE_DIR}/sc_kernels.py ${GOWA_ROOT}/tests/renjob/rj_cgen.py)

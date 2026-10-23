@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import spu_dis as D
 from sc_cgen import IMAGES
 
-ELF = open(os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf"), "rb").read()
+ELF = open((os.environ.get("GOWA_ELF") or os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf")), "rb").read()
 
 
 def main():
