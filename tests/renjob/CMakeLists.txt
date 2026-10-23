@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 get_filename_component(GOWA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(GOWA_GEN "${GOWA_ROOT}/out/gen/spu" CACHE PATH "Generated native SPU sources (tools/setup.py)")
 set(EDGE_DIR ${GOWA_ROOT}/tests/edge)
 set(RJ_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-frounding-math /EHsc /O2)
 
@@ -19,9 +20,9 @@ target_include_directories(rj_spu PUBLIC ${GOWA_ROOT}/runtime/include ${GOWA_ROO
 target_compile_options(rj_spu PRIVATE ${RJ_FLAGS})
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-file(GLOB RJ_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/renjob/*.cpp)
+file(GLOB RJ_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/renjob/*.cpp ${GOWA_GEN}/renjob/*.cpp)
 if(RJ_PROF)
-    list(REMOVE_ITEM RJ_NATIVE_SRC ${GOWA_ROOT}/runtime/src/spu/renjob/renjob_gen.cpp)
+    list(REMOVE_ITEM RJ_NATIVE_SRC ${GOWA_GEN}/renjob/renjob_gen.cpp)
     add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/prof/renjob_gen.cpp ${CMAKE_CURRENT_BINARY_DIR}/prof/renjob_gen.h
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/prof
         COMMAND ${CMAKE_COMMAND} -E env RJ_PROF=1 ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/rj_cgen.py @${CMAKE_CURRENT_SOURCE_DIR}/roots.txt ${CMAKE_CURRENT_BINARY_DIR}/prof/renjob_gen.cpp ${CMAKE_CURRENT_BINARY_DIR}/prof/renjob_gen.h
@@ -33,7 +34,7 @@ add_library(rj_native STATIC ${RJ_NATIVE_SRC})
 if(RJ_PROF)
     target_include_directories(rj_native BEFORE PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/prof ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
-target_include_directories(rj_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/renjob ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
+target_include_directories(rj_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/renjob ${GOWA_GEN}/renjob ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(rj_native PRIVATE ${RJ_FLAGS})
 
 set(RJ_GEN_DEPS ${CMAKE_CURRENT_SOURCE_DIR}/rj_cgen.py ${CMAKE_CURRENT_SOURCE_DIR}/rj_kernels.py)

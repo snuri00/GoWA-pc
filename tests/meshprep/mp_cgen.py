@@ -8,7 +8,7 @@ import rj_cgen as G
 from mp_jobs import JOBS, ROOT
 from mp_kernels import KERNELS
 
-RUNTIME = os.path.join(ROOT, "runtime", "src", "spu", "meshprep")
+RUNTIME = os.path.join((os.environ.get("GOWA_GEN_DIR") or os.path.join(ROOT, "out", "gen", "spu")), "meshprep")
 
 
 def load_icalls(job):

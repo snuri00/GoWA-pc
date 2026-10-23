@@ -4,7 +4,7 @@ import struct
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-ELF = open(os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf"), "rb").read()
+ELF = open((os.environ.get("GOWA_ELF") or os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf")), "rb").read()
 MODS = {0x7e1c00: "mp3pack", 0x7aae00: "synth_submix", 0x7bfc80: "aux_master", 0x7ff280: "mp3_sampler_surround", 0x705680: "renjob"}
 HDR = {ELF[ea - 0x10000:ea - 0x10000 + 16]: n for ea, n in MODS.items()}
 

@@ -11,7 +11,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 def recorded_starts(img_ls, img):
     out = set()
-    for path in glob.glob(os.path.join(ROOT, "recomp", "spu", "blocks", "run*.bin")):
+    for path in glob.glob(os.path.join(os.environ.get("GOWA_SPU_BLOCKS") or os.path.join(ROOT, "recomp", "spu", "blocks"), "run*.bin")):
         data = open(path, "rb").read()
         words = struct.unpack("<%dI" % (len(data) // 4), data[: len(data) // 4 * 4])
         i = 0
@@ -30,7 +30,7 @@ def recorded_starts(img_ls, img):
 
 
 def generate(ea, size, ns, out_cpp, out_h, exits=frozenset(), ls=0x4000):
-    elf = open(os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf"), "rb").read()
+    elf = open((os.environ.get("GOWA_ELF") or os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf")), "rb").read()
     img = elf[ea - 0x10000: ea - 0x10000 + size]
     entry = ls + struct.unpack_from(">I", img, 0x10)[0]
     G.configure(
