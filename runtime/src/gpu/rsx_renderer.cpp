@@ -2338,7 +2338,7 @@ bool skip(int line) {
 
 bool g_mv_done = false;
 std::string g_mv_hudless;
-void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h);
+void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h, uint64_t fp_hash, uint64_t vp_hash, uint32_t verts);
 
 bool draw() {
     VkCommandBuffer cmd = frame_cmd();
@@ -2695,7 +2695,7 @@ bool draw() {
             g_qreset_needed = false;
         }
     }
-    if (mv::enabled()) mv_draw(colors, w, h);
+    if (mv::enabled()) mv_draw(colors, w, h, fp->hash, vp->hash, vcount);
     begin_pass(colors, depth, w, h);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
@@ -3449,8 +3449,18 @@ bool display_target(uint32_t offset) {
     return false;
 }
 
-void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h) {
+void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h, uint64_t fp_hash, uint64_t vp_hash, uint32_t verts) {
     if (colors.empty() || !display_target(colors[0]->offset)) return;
+    static int hud_log = std::getenv("GOWA_HUD_LOG") ? std::atoi(std::getenv("GOWA_HUD_LOG")) : 0;
+    static uint32_t hud_draw = 0;
+    if (!g_mv_done) hud_draw = 0;
+    static const double hud_from = std::getenv("GOWA_HUD_LOG_FROM") ? std::atof(std::getenv("GOWA_HUD_LOG_FROM")) : 0.0;
+    if (hud_log > 0 && mv::elapsed() >= hud_from) {
+        LOG_INFO("hud", "display draw %u fp %016llx vp %016llx verts %u blend %u/0x%x/0x%x depth %u/%u", hud_draw, static_cast<unsigned long long>(fp_hash), static_cast<unsigned long long>(vp_hash), verts, R(BLEND_ENABLE),
+                 R(BLEND_SFACTOR), R(BLEND_DFACTOR), R(DEPTH_TEST_ENABLE), R(DEPTH_MASK));
+        if (hud_draw == 0) hud_log--;
+    }
+    hud_draw++;
     if (!g_mv_done) {
         g_mv_done = true;
         mv_frame();
