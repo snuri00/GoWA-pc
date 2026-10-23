@@ -42,7 +42,8 @@ const Function* lookup(const uint8_t* ls, uint32_t pc) {
         const Function& f = g_functions[i - 1];
         if (f.lsa != pc || pc + f.sig_words * 4 > LS_SIZE) continue;
         bool match = true;
-        for (uint32_t i = 0; i < f.sig_words && match; i++) match = load_word(ls, pc + i * 4) == f.signature[i];
+        if (!f.signature) match = code_hash(ls + pc, f.sig_words) == f.sig_hash;
+        for (uint32_t i = 0; f.signature && i < f.sig_words && match; i++) match = load_word(ls, pc + i * 4) == f.signature[i];
         if (match) return &f;
     }
     return nullptr;

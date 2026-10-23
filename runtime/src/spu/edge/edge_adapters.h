@@ -13,7 +13,7 @@ using AdapterFn = bool (*)(uint8_t* ls, spu::Context& c, Outputs& outs);
 struct Adapter {
     uint32_t lsa;
     uint32_t sig_words;
-    const uint32_t* signature;
+    uint64_t sig_hash;
     AdapterFn handler;
     const char* name;
 };
