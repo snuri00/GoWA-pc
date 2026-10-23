@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/critpath.h"
 #include "runtime/reservation.h"
 
 #include "spu/context.h"
@@ -41,6 +42,7 @@ struct SpuThread : Host {
     void clear_snap(uint32_t k);
     std::unique_ptr<uint32_t[]> line_src{new uint32_t[0x40000 / 128]()};
     uint32_t cur_src = 0;
+    critpath::SpuState cp;
     uint64_t src_insn_mark = 0;
     uint32_t dma_snap_next = 0;
     void remember_get(uint32_t ea, uint32_t size, uint32_t lsa);

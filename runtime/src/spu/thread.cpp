@@ -999,9 +999,11 @@ void SpuThread::process_mfc(uint32_t cmd) {
     case 0x20: case 0x21: case 0x22: case 0x30: case 0x31: case 0x32:
     case 0x40: case 0x41: case 0x42: case 0x89:
         dma(cmd, lsa, ea, size);
+        if (cmd < 0x40) critpath::spu_stored(cp, slot, ea, size);
         break;
     case 0xA0: case 0xA1: case 0xA2:
         dma(0x20, lsa, ea, 4);
+        critpath::spu_stored(cp, slot, ea, 4);
         break;
     case 0x24: case 0x25: case 0x26: case 0x34: case 0x35: case 0x36:
     case 0x44: case 0x45: case 0x46:
@@ -1041,6 +1043,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
             set_events(EV_LR);
         }
         if (job_stats) (ok ? g_putllc_ok : g_putllc_fail).fetch_add(1, std::memory_order_relaxed);
+        if (ok) critpath::spu_stored(cp, slot, line, 128);
         raddr = 0;
         atomic_stat = ok ? 0 : 1;
         atomic_stat_count = true;
@@ -1050,6 +1053,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
     case 0xB8: {
         uint32_t line = ea & ~127u;
         rsv::store_unconditional(line, ls + (lsa & 0x3FF80));
+        critpath::spu_stored(cp, slot, line, 128);
         if (trace::on(trace::ATOMIC)) trace::emit(trace::T_ATOMIC, slot | (cmd << 16), line, lsa & 0x3FF80, 128, ctx.pc, id);
         if (cmd == 0xB0) {
             atomic_stat = 2;
@@ -1512,10 +1516,14 @@ void SpuThread::run() {
     bool block_start = true;
     uint32_t block_len = 0;
     static const int job_log = std::getenv("GOWA_SPU_JOBS") ? std::atoi(std::getenv("GOWA_SPU_JOBS")) : 0;
+    const bool cp_on = critpath::g_on;
+    if (cp_on) critpath::spu_init_sig();
+    const uint32_t* cp_src = line_src.get();
     for (;;) {
         if (block_start) {
             block_start = false;
             block_len = 0;
+            if (cp_on) critpath::spu_block(cp, slot, ls, cp_src, ctx.pc);
             if (job_log) {
                 uint32_t src = line_src[ctx.pc >> 7];
                 if (src != cur_src) {

@@ -3,6 +3,7 @@
 #include "runtime/loader.h"
 #include "runtime/log.h"
 #include "runtime/trace.h"
+#include "runtime/critpath.h"
 #include "runtime/hooks.h"
 #include "runtime/memory.h"
 #include "gpu/presenter.h"
@@ -125,6 +126,7 @@ void thread_census(int period) {
 int main(int argc, char** argv) {
     crash::install();
     trace::init();
+    critpath::init();
     hooks::init();
     timeBeginPeriod(1);
     gpu::init();

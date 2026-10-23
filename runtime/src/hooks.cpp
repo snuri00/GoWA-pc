@@ -1,4 +1,5 @@
 #include "ppu/ops.h"
+#include "runtime/critpath.h"
 #include "runtime/hooks.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
@@ -50,6 +51,8 @@ struct Hook {
     uint32_t addr = 0;
     bool ring = false;
     bool panic = false;
+    uint8_t cp = 0;
+    bool quiet = false;
     bool (*guard)(ppu::Context&) = nullptr;
     std::vector<Dump> dumps;
     std::atomic<uint64_t> calls{0};
@@ -168,6 +171,10 @@ void load_names(const char* path) {
     }
 }
 
+bool benign_game_error(const std::string& msg) { return msg.rfind("BATCHJOB: AddJob: waiting for room", 0) == 0; }
+
+void impl_body(Hook* h, ppu::Context& ctx, uint8_t* base, uint32_t addr, ppu::BodyFn fn);
+
 void impl(ppu::Context& ctx, uint8_t* base, uint32_t addr, ppu::BodyFn fn) {
     auto found = g_hooks.find(addr);
     Hook* h = found != g_hooks.end() ? found->second : nullptr;
@@ -175,15 +182,30 @@ void impl(ppu::Context& ctx, uint8_t* base, uint32_t addr, ppu::BodyFn fn) {
         fn(ctx, base);
         return;
     }
+    if (h->cp) {
+        critpath::Call c;
+        critpath::enter(h->cp, ctx, c);
+        impl_body(h, ctx, base, addr, fn);
+        critpath::leave(h->cp, ctx, c);
+        return;
+    }
+    impl_body(h, ctx, base, addr, fn);
+}
+
+void impl_body(Hook* h, ppu::Context& ctx, uint8_t* base, uint32_t addr, ppu::BodyFn fn) {
     h->calls.fetch_add(1, std::memory_order_relaxed);
     if (h->guard && h->guard(ctx)) return;
+    if (h->quiet) {
+        fn(ctx, base);
+        return;
+    }
     if (h->panic) {
         record(h, ctx);
         std::string msg = guest_string(static_cast<uint32_t>(ctx.gpr[3]));
         LOG_WARN("blackbox", "game error call %s lr %08x: '%s' r4=%llx r5=%llx r6=%llx", name_of(addr).c_str(), static_cast<uint32_t>(ctx.lr), msg.c_str(), static_cast<unsigned long long>(ctx.gpr[4]),
                  static_cast<unsigned long long>(ctx.gpr[5]), static_cast<unsigned long long>(ctx.gpr[6]));
         guest_backtrace(ctx);
-        if (g_panics.fetch_add(1) < 2) capture("game error");
+        if (!benign_game_error(msg) && g_panics.fetch_add(1) < 2) capture("game error");
         fn(ctx, base);
         return;
     }
@@ -403,6 +425,7 @@ bool wait_previous_edge_list_started(ppu::Context& ctx) {
     if (!state || !vm::range_mapped(state + 0x70, 2)) return false;
     if (vm::read16(state + 0x70)) return false;
     auto start = std::chrono::steady_clock::now();
+    uint64_t cp0 = critpath::g_on ? __rdtsc() : 0;
     for (uint32_t i = 0; !vm::read16(state + 0x70); i++) {
         if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(200)) {
             LOG_WARN("patch", "edge list %u did not start within 200 ms", prev);
@@ -411,6 +434,7 @@ bool wait_previous_edge_list_started(ppu::Context& ctx) {
         if (i < 256) std::this_thread::yield();
         else std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
+    if (cp0) critpath::emit_wait(critpath::K_EDGE_GUARD, cp0, __rdtsc(), prev, list, 0);
     static std::atomic<uint32_t> logged{0};
     if (logged.fetch_add(1) < 8) {
         LOG_WARN("patch", "waited %.3f ms for edge list %u to pass its MeshPrep barrier", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), prev);
@@ -508,6 +532,22 @@ void tick_patches() {
     }
 }
 
+void install_critpath() {
+    if (!critpath::g_on) return;
+    int n = 0;
+    const critpath::Hook* t = critpath::hook_table(n);
+    for (int i = 0; i < n; i++) {
+        Hook*& h = g_hooks[t[i].addr];
+        if (!h) {
+            h = new Hook;
+            h->addr = t[i].addr;
+            h->quiet = true;
+        }
+        h->cp = t[i].kind;
+        ppu::hook_flags[t[i].addr >> 2] = 1;
+    }
+}
+
 void install_patches() {
     if (const char* e = std::getenv("GOWA_GAME_PATCHES"); e && std::string(e) == "0") return;
     struct Patch {
@@ -568,6 +608,7 @@ void init() {
     const char* spec = combined.c_str();
     if (!*spec) {
         install_patches();
+        install_critpath();
         if (!g_hooks.empty()) ppu::hook_impl = impl;
         return;
     }
@@ -627,6 +668,7 @@ void init() {
         if (!h->ring && !h->panic) LOG_INFO("hook", "hooked %s at 0x%08x", name_of(addr).c_str(), addr);
     }
     install_patches();
+    install_critpath();
     if (g_hooks.empty()) return;
     ppu::hook_impl = impl;
     if (g_count_only) std::thread(summary_thread).detach();

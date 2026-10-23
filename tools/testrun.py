@@ -230,6 +230,8 @@ def cmd_run(args):
     time.sleep(1)
     if os.path.exists(os.path.join(RUN_DIR, "gowa.log")):
         shutil.copy(os.path.join(RUN_DIR, "gowa.log"), os.path.join(out, "gowa.log"))
+    if env.get("GOWA_CRITPATH", "0") not in ("", "0") and os.path.exists(os.path.join(RUN_DIR, "critpath.bin")):
+        shutil.move(os.path.join(RUN_DIR, "critpath.bin"), os.path.join(out, "critpath.bin"))
     keep_blackbox(out)
     shots = convert_snaps(out)
     summary = summarize(out, duration, rc, wall)

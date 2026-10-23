@@ -73,6 +73,7 @@ def main():
     ap.add_argument("--fresh-save", action="store_true")
     ap.add_argument("--env", action="append")
     ap.add_argument("--lowfps-capture", default="22:6:90:4", help="fps:secs:cooldown:max, 0 disables")
+    ap.add_argument("--critpath", action="store_true", help="record PPU waits and SPU jobs (critpath.bin + critpath.txt report)")
     args = ap.parse_args()
     if running():
         print("gowa.exe is already running; close it first")
@@ -94,6 +95,9 @@ def main():
         env["GOWA_RES_SCALE"] = str(args.scale)
     if args.fps_unlock:
         env["GOWA_FPS_UNLOCK"] = "1"
+    if args.critpath:
+        env["GOWA_CRITPATH"] = "1"
+        env["GOWA_CRITPATH_FILE"] = os.path.join(out, "critpath.bin")
     for kv in args.env or []:
         k, _, v = kv.partition("=")
         env[k] = v
@@ -140,6 +144,8 @@ def main():
     box = os.path.join(RUN_DIR, "blackbox")
     if os.path.isdir(box):
         shutil.copytree(box, os.path.join(out, "blackbox"), dirs_exist_ok=True)
+    if args.critpath and os.path.exists(os.path.join(out, "critpath.bin")):
+        subprocess.run([sys.executable, os.path.join(ROOT, "tools", "critpath_report.py"), out, "--from", "60", "--out", os.path.join(out, "critpath.txt")], stdout=subprocess.DEVNULL)
     print("session ended (exit code %d, %.0f s); log and captures in %s" % (code, time.time() - t0, out))
     return 0
 

@@ -1,3 +1,4 @@
+#include "runtime/critpath.h"
 #include "runtime/placement.h"
 #include "runtime/hostsleep.h"
 #include "event.h"
@@ -108,6 +109,7 @@ void flip_done(uint32_t buffer) {
     vm::write32(h + 0x10, buffer);
     std::memset(vm::ptr(g_rsx.reports + 0x10), 0, 16);
     g_rsx.flips++;
+    if (critpath::g_on) critpath::flip(g_rsx.flips);
     if (trace::on(trace::RSX)) trace::emit(trace::T_FLIP, buffer, g_rsx.flips);
     static auto last = std::chrono::steady_clock::now();
     static double worst = 0.0;
