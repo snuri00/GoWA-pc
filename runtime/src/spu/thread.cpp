@@ -1901,6 +1901,19 @@ void register_thread(SpuThread* t) {
     if (std::getenv("GOWA_SPU_OCC")) std::call_once(once, [] { std::thread(occupancy_sampler, 10.0, 0, std::string()).detach(); });
 }
 
+std::string brief() {
+    std::string out;
+    std::lock_guard lk(g_reg_lock);
+    for (SpuThread* t : g_reg) {
+        char b[96];
+        uint32_t wid;
+        std::memcpy(&wid, t->ls + 0x1dc, 4);
+        std::snprintf(b, sizeof b, " [%x pc %05x wid %u ra %08x]", t->id >> 24, t->ctx.pc, __builtin_bswap32(wid), t->raddr);
+        out += b;
+    }
+    return out;
+}
+
 void status_dump() {
     if (const char* e = std::getenv("GOWA_DUMP")) {
         std::string list = e;
