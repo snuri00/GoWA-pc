@@ -28,6 +28,7 @@ GENERATORS = (
     ("meshhier", "meshhier", ["tests/meshhier/mh_cgen.py", "{gen}/meshhier/mh_gen.cpp", "{gen}/meshhier/mh_gen.h"]),
     ("anim", "anim", ["tests/anim/an_cgen.py", "{gen}/anim/an_gen.cpp", "{gen}/anim/an_gen.h"]),
     ("tasks", "tasks", ["tests/tasks/task_cgen.py"]),
+    ("mpjob", "mpjob", ["tests/mpjob/mpj_cgen.py", "{gen}/mpjob"]),
 )
 
 STAMP = "generated.txt"
