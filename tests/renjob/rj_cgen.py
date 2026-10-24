@@ -134,6 +134,8 @@ def ie_idiom(pc):
     if d["op"] not in ("bi", "biz", "binz", "bihz", "bihnz") or d["ra"] == 0:
         return False
     a, b = decode(pc - 8), decode(pc - 4)
+    if WHOLE_PM and b["op"] == "ila" and b["rt"] == d["ra"] and (b["imm"] & 0x3FFFC) == pc + 4 and (d["rb"] >> 4) & 3 in (1, 2):
+        return True
     return a["op"] == "brsl" and a["rt"] == d["ra"] and ((pc - 8 + a["imm"] * 4) & 0x3FFFC) == pc - 4 and b["op"] == "ai" and b["rt"] == d["ra"] and b["ra"] == d["ra"] and b["imm"] == 8
 
 
