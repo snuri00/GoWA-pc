@@ -36,7 +36,7 @@ std::atomic<uint64_t> g_hle_calls{0};
 }
 
 bool hle_call(renjob::xo::V* R, uint8_t* ls, renjob::xo::Ctl& ctl, uint32_t pc) {
-    if (!spu::hle::any_at(pc) || !t_ctx) return false;
+    if (pc < 0x4000 || !spu::hle::any_at(pc) || !t_ctx) return false;
     spu::Context& c = *t_ctx;
     if (reinterpret_cast<renjob::xo::V*>(c.gpr) != R || c.ls != ls) return false;
     for (const spu::hle::Function* f = spu::hle::lookup(ls, pc); f; f = spu::hle::lookup_next(ls, pc, f)) {

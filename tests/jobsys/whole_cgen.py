@@ -18,6 +18,10 @@ MODULES = [
     (0x71c500, "WaterProc"),
 ]
 
+EXTRA_ROOTS = {
+    0x6f7200: (0x04038,),
+}
+
 PM_CALLS = {0x017b8: "renjob::wh::pm_gettag(R, ls, ctl);", 0x017c0: "renjob::wh::pm_releasetag(R, ls, ctl);", 0x017e0: ""}
 CALL_RE = re.compile(r"(r0 = pref_only\(0x[0-9a-f]+\); \{\s*)f_([0-9a-f]{5})\(R, ls, ctl\); if \(ctl\.out\) return;")
 
@@ -58,7 +62,7 @@ def gen_module(ea, name, gen_dir):
     G.RR2.update({"fesd", "frds"})
     G.HINTS = False
     G.PC_COUNTS = {}
-    known = {entry}
+    known = {entry} | set(EXTRA_ROOTS.get(ea, ()))
     root = G.discover(entry, known, frozenset())
     conts = [c for c in continuations(root, set()) if c < entry + 0x400 and c > entry]
     multi = {entry: tuple([entry] + conts)} if conts else {}
@@ -86,7 +90,7 @@ def gen_module(ea, name, gen_dir):
     out = ['#include "%s"' % base, '#include "jwhole_rt.h"', '#include "jw_dops.h"', "", "namespace %s {" % ns, "", "using namespace renjob::xo;", "", "#define FAIL(pc) do { ctl.fail = true; ctl.out = true; ctl.fail_pc = pc; return; } while (0)", ""]
     inline_max = 120
     for e in sorted(funcs):
-        if e != entry and len(funcs[e].insns) <= inline_max and not (funcs[e].calls & set(funcs)):
+        if e != entry and e not in EXTRA_ROOTS.get(ea, ()) and len(funcs[e].insns) <= inline_max and not (funcs[e].calls & set(funcs)):
             G.SPEC[e] = "static inline __attribute__((always_inline)) "
     out.append("void icall(V* R, uint8_t* ls, Ctl& ctl, uint32_t t, uint32_t pc);")
     for e in sorted(funcs):
