@@ -486,6 +486,8 @@ bool run_verified(Executor& x, const JobDesc& j, Tier tier) {
             Outcome o;
             if (!r.done || h.abort) {
                 note(j.module_ea, 0x2000u | mask, 2);
+                static std::atomic<int> sk{0};
+                if (sk.fetch_add(1) < 6) LOG_INFO("jobsys", "sandbox skipped %s: done %d abort %d fail 0x%05x icall 0x%05x", m->name, r.done ? 1 : 0, h.abort ? 1 : 0, r.fail_pc, r.icall_miss);
                 continue;
             }
             compare_maps(in.writes, h.r.writes, o);

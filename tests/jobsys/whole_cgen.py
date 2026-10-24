@@ -42,9 +42,10 @@ def continuations(f, funcs):
     out = set()
     for pc, d in f.insns.items():
         if d["op"] in ("ila", "il") and d["rt"] == 0:
-            t = (d["imm"] if d["op"] == "ila" else d["imm"] & 0xFFFF) & 0x3FFFC
-            if 0x4000 <= t < G.CODE_END and t not in funcs and t != pc + 4:
-                out.add(t)
+            t0 = (d["imm"] if d["op"] == "ila" else d["imm"] & 0xFFFF) & 0x3FFFC
+            for t in (t0, t0 + 0x4000):
+                if 0x4000 <= t < G.CODE_END and t not in funcs and t != pc + 4:
+                    out.add(t)
     return sorted(out)
 
 
