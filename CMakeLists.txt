@@ -18,7 +18,7 @@ add_library(gowa_ppu_ops STATIC runtime/src/ppu_ops.cpp runtime/src/reservation.
 target_include_directories(gowa_ppu_ops PUBLIC runtime/include "${CMAKE_SOURCE_DIR}/out/include")
 target_compile_options(gowa_ppu_ops PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
 
-file(GLOB GOWA_RUNTIME_SOURCES CONFIGURE_DEPENDS runtime/src/*.cpp runtime/src/lv2/*.cpp runtime/src/hle/*.cpp runtime/src/spu/*.cpp runtime/src/spu/edge/*.cpp runtime/src/spu/renjob/*.cpp runtime/src/spu/scream/*.cpp runtime/src/spu/cloth/*.cpp runtime/src/spu/shadows/*.cpp runtime/src/spu/meshprep/*.cpp runtime/src/spu/pm/*.cpp runtime/src/spu/edgejob/*.cpp runtime/src/spu/meshhier/*.cpp runtime/src/spu/anim/*.cpp runtime/src/spu/tasks/*.cpp runtime/src/spu/mpjob/*.cpp runtime/src/rsx/*.cpp runtime/src/gpu/*.cpp)
+file(GLOB GOWA_RUNTIME_SOURCES CONFIGURE_DEPENDS runtime/src/*.cpp runtime/src/lv2/*.cpp runtime/src/hle/*.cpp runtime/src/media/*.cpp runtime/src/spu/*.cpp runtime/src/spu/edge/*.cpp runtime/src/spu/renjob/*.cpp runtime/src/spu/scream/*.cpp runtime/src/spu/cloth/*.cpp runtime/src/spu/shadows/*.cpp runtime/src/spu/meshprep/*.cpp runtime/src/spu/pm/*.cpp runtime/src/spu/edgejob/*.cpp runtime/src/spu/meshhier/*.cpp runtime/src/spu/anim/*.cpp runtime/src/spu/tasks/*.cpp runtime/src/spu/mpjob/*.cpp runtime/src/rsx/*.cpp runtime/src/gpu/*.cpp)
 list(REMOVE_ITEM GOWA_RUNTIME_SOURCES "${CMAKE_SOURCE_DIR}/runtime/src/ppu_ops.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/main.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/reservation.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/memory.cpp" "${CMAKE_SOURCE_DIR}/runtime/src/log.cpp")
 
 set(GOWA_SPU_NATIVE_GEN_DIR "${CMAKE_SOURCE_DIR}/out/gen/spu" CACHE PATH "Directory with generated native SPU sources (tools/setup.py)")
@@ -142,6 +142,11 @@ if(EXISTS "${GOWA_NGX_INCLUDE}/nvsdk_ngx_params.h" AND EXISTS "${GOWA_NGX_INCLUD
 else()
     message(STATUS "NGX SDK headers not found, DLSS neural rendering disabled")
 endif()
+
+file(GLOB GOWA_MEDIA_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/runtime/src/media/*.cpp")
+add_executable(vdec_test tests/vdec_test/main.cpp ${GOWA_MEDIA_SOURCES} runtime/src/log.cpp)
+target_include_directories(vdec_test PRIVATE runtime/include)
+target_compile_options(vdec_test PRIVATE ${GOWA_ARCH_FLAGS} /EHsc)
 
 add_executable(spu_conformance tests/spu_conformance/harness.cpp runtime/src/spu/interpreter.cpp)
 target_include_directories(spu_conformance PRIVATE runtime/include)
