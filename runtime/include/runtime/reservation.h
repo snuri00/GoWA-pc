@@ -6,6 +6,14 @@
 
 namespace rsv {
 
+extern std::atomic<uint32_t> g_watch_line;
+extern std::atomic<uint32_t> g_watch_word;
+extern std::atomic<uint32_t> g_watch_sleepers;
+void watch_kick();
+inline void watch_note(uint32_t line) {
+    if ((line & ~127u) == g_watch_line.load(std::memory_order_relaxed) && g_watch_sleepers.load(std::memory_order_seq_cst)) watch_kick();
+}
+
 std::atomic<uint64_t>& version(uint32_t addr);
 uint64_t snapshot(uint32_t line, uint8_t* out);
 bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uint8_t* data, uint32_t offset, uint32_t size, bool data_only = false);

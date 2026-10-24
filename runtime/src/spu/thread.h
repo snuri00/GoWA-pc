@@ -26,6 +26,7 @@ struct SpuThread : Host {
     uint32_t id = 0;
     uint32_t slot = 0;
     uint32_t order = 0;
+    bool aux = false;
     std::string name;
     Group* group = nullptr;
     Context ctx{};
@@ -193,6 +194,7 @@ struct Group {
     uint32_t state = 0;
     uint32_t init = 0;
     std::vector<std::shared_ptr<SpuThread>> threads;
+    std::vector<std::shared_ptr<SpuThread>> aux;
     uint32_t running = 0;
     uint32_t join_state = 0;
     uint32_t exit_status = 0;

@@ -526,8 +526,11 @@ void shutdown() {
 namespace gpu::dlssg {
 
 bool requested() {
-    const char* v = std::getenv("GOWA_DLSSG");
-    return v && std::atoi(v) != 0;
+    static const bool r = [] {
+        const char* v = std::getenv("GOWA_DLSSG");
+        return v && std::atoi(v) != 0;
+    }();
+    return r;
 }
 bool load_vulkan() {
     if (requested()) LOG_WARN("dlssg", "GOWA_DLSSG set but this build has no Streamline SDK");
