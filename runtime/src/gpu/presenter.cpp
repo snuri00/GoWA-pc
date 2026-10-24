@@ -4,11 +4,13 @@
 #include "vk_context.h"
 #include "dlssg.h"
 #include "dlssnr.h"
+#include "osd.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
 #include "runtime/hooks.h"
 
 #include <atomic>
+#include <cstdio>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -115,7 +117,7 @@ bool create_swapchain() {
     ci.imageColorSpace = space;
     ci.imageExtent = g.swap_extent;
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -189,6 +191,93 @@ bool ensure_frame(uint32_t w, uint32_t h) {
 
 uint64_t g_frame_serial = 0;
 
+struct PresentSnap {
+    double every = 0.0;
+    double next = 0.0;
+    LARGE_INTEGER freq{}, start{};
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    void* ptr = nullptr;
+    VkDeviceSize size = 0;
+    uint32_t w = 0, h = 0;
+    bool pending = false;
+    char path[512] = {};
+};
+
+PresentSnap g_snap;
+
+void snap_write() {
+    if (!g_snap.pending) return;
+    g_snap.pending = false;
+    FILE* f = std::fopen(g_snap.path, "wb");
+    if (!f) return;
+    std::fprintf(f, "P6\n%u %u\n255\n", g_snap.w, g_snap.h);
+    const uint8_t* src = static_cast<const uint8_t*>(g_snap.ptr);
+    bool bgra = g.swap_format == VK_FORMAT_B8G8R8A8_UNORM || g.swap_format == VK_FORMAT_B8G8R8A8_SRGB;
+    std::vector<uint8_t> row(size_t(g_snap.w) * 3);
+    for (uint32_t y = 0; y < g_snap.h; y++) {
+        const uint8_t* p = src + size_t(y) * g_snap.w * 4;
+        for (uint32_t x = 0; x < g_snap.w; x++) {
+            row[x * 3 + 0] = p[x * 4 + (bgra ? 2 : 0)];
+            row[x * 3 + 1] = p[x * 4 + 1];
+            row[x * 3 + 2] = p[x * 4 + (bgra ? 0 : 2)];
+        }
+        std::fwrite(row.data(), 1, row.size(), f);
+    }
+    std::fclose(f);
+    LOG_INFO("gpu", "present snapshot %s", g_snap.path);
+}
+
+bool snap_due() {
+    if (!g_snap.freq.QuadPart) {
+        QueryPerformanceFrequency(&g_snap.freq);
+        QueryPerformanceCounter(&g_snap.start);
+        const char* e = std::getenv("GOWA_PRESENT_SNAP");
+        g_snap.every = e ? std::atof(e) : 0.0;
+        g_snap.next = g_snap.every;
+    }
+    if (g_snap.every <= 0.0) return false;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double t = double(now.QuadPart - g_snap.start.QuadPart) / double(g_snap.freq.QuadPart);
+    if (t < g_snap.next) return false;
+    while (g_snap.next <= t) g_snap.next += g_snap.every;
+    const char* d = std::getenv("GOWA_SNAP_DIR");
+    std::snprintf(g_snap.path, sizeof g_snap.path, "%s/present_%07.1f.ppm", d ? d : ".", t);
+    return true;
+}
+
+void snap_record(VkImage img) {
+    VkDeviceSize need = VkDeviceSize(g.swap_extent.width) * g.swap_extent.height * 4;
+    if (g_snap.size < need) {
+        if (g_snap.buf) {
+            vkDestroyBuffer(g.device, g_snap.buf, nullptr);
+            vkFreeMemory(g.device, g_snap.mem, nullptr);
+        }
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = need;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        vkCreateBuffer(g.device, &bi, nullptr, &g_snap.buf);
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(g.device, g_snap.buf, &req);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = find_memory_impl(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (ai.memoryTypeIndex == UINT32_MAX) ai.memoryTypeIndex = find_memory_impl(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(g.device, &ai, nullptr, &g_snap.mem);
+        vkBindBufferMemory(g.device, g_snap.buf, g_snap.mem, 0);
+        vkMapMemory(g.device, g_snap.mem, 0, need, 0, &g_snap.ptr);
+        g_snap.size = need;
+    }
+    VkBufferImageCopy c{};
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {g.swap_extent.width, g.swap_extent.height, 1};
+    vkCmdCopyImageToBuffer(g.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_snap.buf, 1, &c);
+    g_snap.w = g.swap_extent.width;
+    g_snap.h = g.swap_extent.height;
+    g_snap.pending = true;
+}
+
 void begin_frame() {
     if (g.recording) return;
     LARGE_INTEGER a, b, f;
@@ -198,6 +287,7 @@ void begin_frame() {
         if (reported++ < 5) LOG_ERROR("gpu", "vkWaitForFences failed %d", int(wr));
     }
     QueryPerformanceCounter(&b);
+    snap_write();
     QueryPerformanceFrequency(&f);
     static double total = 0;
     static uint64_t n = 0;
@@ -554,6 +644,15 @@ void blit_to_swapchain(VkImage src, uint32_t w, uint32_t h, uint32_t index) {
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.dstOffsets[1] = {int32_t(g.swap_extent.width), int32_t(g.swap_extent.height), 1};
     vkCmdBlitImage(g.cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    osd::game_frame();
+    osd::draw(g.cmd, dst, g.swap_format, g.swap_extent.width, g.swap_extent.height);
+    if (snap_due()) {
+        barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        snap_record(dst);
+        barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT, 0);
+        return;
+    }
     barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
 }
 
