@@ -214,4 +214,94 @@ int cmd_ovlfuzz(const std::vector<std::string>& args) {
 
 CommandReg reg_ovlfuzz("ovlfuzz", cmd_ovlfuzz);
 
+int cmd_vfuzz(const std::vector<std::string>& args) {
+    int per = args.size() > 1 ? std::atoi(args[1].c_str()) : 50;
+    uint32_t seed = args.size() > 2 ? uint32_t(std::strtoul(args[2].c_str(), nullptr, 0)) : 1;
+    std::string only = args.size() > 3 ? args[3] : "smDecompressVertices_";
+    std::vector<std::string> caps = harness::cap_list(args, 4);
+    _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
+    std::vector<edgeunit::Hit> tm;
+    edgeunit::for_each_call(caps, 0xdbc8, [&](edgeunit::Hit& h) {
+        if (h.job % 5 != 0 && tm.size() > 2) return true;
+        tm.push_back(h);
+        return tm.size() < 16;
+    }, harness::edge_loaded);
+    std::printf("templates: %zu\n", tm.size());
+    NativeFn nat = natives()[0xdbc8];
+    std::mt19937 rng(seed);
+    std::vector<uint8_t> la(spu::LS_SIZE + 16), lb(spu::LS_SIZE + 16);
+    int total_bad = 0;
+    for (size_t ei = 0; ei < edge::ovl::kEntryCount; ei++) {
+        const edge::ovl::Entry& e = edge::ovl::kEntries[ei];
+        if (std::string(e.name).find(only) == std::string::npos) continue;
+        if (only.back() == '_' && std::strncmp(e.name, "smDecompressVertices_", 21) != 0) continue;
+        int id = name_id(e.name, "smDecompressVertices_");
+        if (id < 0) continue;
+        int cases = 0, declined = 0, bad = 0;
+        for (int k = 0; k < per; k++) {
+            const edgeunit::Hit& t = tm[rng() % tm.size()];
+            std::memcpy(la.data(), t.before.ls.data(), spu::LS_SIZE);
+            spu::Context c = t.before.regs;
+            c.ls = la.data();
+            c.line_epoch = nullptr;
+            c.halted = false;
+            uint32_t B = 0x38000 + 16 * (rng() % 64);
+            std::memcpy(la.data() + B, e.code, e.size);
+            uint8_t* L = la.data();
+            uint32_t ctx = c.gpr[3].u32[3] & 0x3fff0;
+            uint32_t nv = (L[ctx + 8] << 8) | L[ctx + 9];
+            c.gpr[8].u32[3] = B;
+            L[ctx + 2] = uint8_t(id);
+            c.gpr[6].u32[3] = (c.gpr[6].u32[3] & ~0xffu) | uint32_t(id);
+            uint32_t src = c.gpr[4].u32[3] & 0x3fff0;
+            uint32_t len = (std::min)(uint32_t(32 * (nv + 2)), 0x38000u - src);
+            if (rng() % 4) for (uint32_t i = 0; i + 4 <= len; i += 4) wbe(L + src + i, rng() % 3 ? uint32_t(rng()) : rand_float(rng));
+            uint32_t d = c.gpr[5].u32[3] & 0x3fff0;
+            if (rng() % 3 == 0) {
+                for (int i = 0; i < 3; i++) wbe(L + d + 4 * i, uint32_t(rng() % 65536) - 32768);
+                for (int i = 0; i < 3; i++) {
+                    uint32_t ib = rng() % 17, fb = rng() % (17 - ib);
+                    L[d + 16 + 2 * i] = uint8_t(ib);
+                    L[d + 17 + 2 * i] = uint8_t(fb);
+                }
+            }
+            if (rng() % 4 == 0) {
+                uint32_t nn = 1 + rng() % (nv ? nv : 1);
+                L[ctx + 8] = uint8_t(nn >> 8);
+                L[ctx + 9] = uint8_t(nn);
+            }
+            cases++;
+            std::memcpy(lb.data(), la.data(), spu::LS_SIZE + 16);
+            spu::Context n = c;
+            n.ls = lb.data();
+            edge::Outputs outs;
+            if (!nat(lb.data(), n, outs)) {
+                declined++;
+                continue;
+            }
+            edgeunit::Snapshot s;
+            s.ls.assign(la.begin(), la.begin() + spu::LS_SIZE);
+            s.regs = c;
+            edgeunit::IsoResult ir = edgeunit::run_isolated(s, t.ret, t.sp);
+            if (!ir.ok) {
+                std::printf("  %s case %d: interpreter %s\n", e.name, cases, ir.error.c_str());
+                bad++;
+                continue;
+            }
+            edgeunit::LsDiff df = edgeunit::diff_ls(s.ls.data(), lb.data(), t.sp, 0);
+            bool r3 = std::memcmp(&s.regs.gpr[3], &n.gpr[3], 16) == 0;
+            if (df.bytes || !r3) {
+                bad++;
+                if (bad <= 3) std::printf("  %s case %d MISMATCH: ls bytes %zu first %05x last %05x r3 %d nv %u\n", e.name, cases, df.bytes, df.first, df.last, r3, nv);
+            }
+        }
+        total_bad += bad;
+        std::printf("%-26s cases %3d native %3d declined %3d bad %d\n", e.name, cases, cases - declined, declined, bad);
+    }
+    std::printf("total mismatches %d\n", total_bad);
+    return total_bad ? 1 : 0;
+}
+
+CommandReg reg_vfuzz("vfuzz", cmd_vfuzz);
+
 }

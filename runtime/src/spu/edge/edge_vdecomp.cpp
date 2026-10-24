@@ -1,4 +1,5 @@
 #include "edge_vdecomp.h"
+#include "edge_ovl.h"
 #include "spu_float.h"
 
 #include <immintrin.h>
@@ -659,6 +660,17 @@ bool overlay_matches(const uint8_t* p, uint32_t n, uint64_t hash) {
     return true;
 }
 
+int variant_id(const uint8_t* ls, uint32_t entry) {
+    const ovl::Entry* e = ovl::find(ls, entry);
+    if (!e) return -1;
+    const char* n = ovl::entry_name(size_t(ovl::index_of(e)));
+    static const char* const kVariants[] = {"smDecompressVertices_8", "smDecompressVertices_18", "smDecompressVertices_22", "smDecompressVertices_23"};
+    static const int kIds[] = {8, 18, 22, 23};
+    for (int i = 0; i < 4; i++)
+        if (std::strcmp(n, kVariants[i]) == 0) return kIds[i];
+    return -1;
+}
+
 int vdecomp_identify(const uint8_t* ls, uint32_t entry) {
     entry &= 0x3fff0;
     uint64_t head;
@@ -668,7 +680,7 @@ int vdecomp_identify(const uint8_t* ls, uint32_t entry) {
             if (s.head != head || entry + s.size > kLs) continue;
             if (overlay_matches(ls + entry, s.size, s.hash)) return s.id;
         }
-        return -1;
+        return variant_id(ls, entry);
     }
     uint32_t last = 0;
     uint64_t h = 0;
@@ -680,21 +692,22 @@ int vdecomp_identify(const uint8_t* ls, uint32_t entry) {
         }
         if (h == s.hash) return s.id;
     }
-    return -1;
+    return variant_id(ls, entry);
 }
 
 bool vdecomp_run(uint8_t* ls, int overlay, uint32_t ctx, uint32_t verts, uint32_t nv, uint32_t desc, uint32_t, const VdRegs& regs, Outputs* outs) {
     uint32_t sp = spuf::ld32(regs.r1) & 0x3fff0;
     if (sp + 64 > kLs || sp < 0x400) return false;
-    if (overlay != 0 && overlay != 1 && overlay != 3 && overlay != 9 && overlay != 10 && overlay != 11 && overlay != 12) return false;
+    bool raw = overlay == 0 || overlay == 1 || overlay == 3 || overlay == 8 || overlay == 18 || overlay == 22;
+    if (!raw && overlay != 9 && overlay != 10 && overlay != 11 && overlay != 12 && overlay != 23) return false;
     ctx &= 0x3fff0;
     if (ctx + 368 > kLs || ctx < 0x10000) return false;
     {
-        uint32_t stride = overlay == 10 || overlay == 12 ? 12 : overlay == 9 || overlay == 11 ? 9 : overlay == 0 ? 15 : 18;
+        uint32_t stride = overlay == 10 || overlay == 12 || overlay == 8 ? 12 : overlay == 9 || overlay == 11 ? 9 : overlay == 0 ? 15 : overlay == 18 ? 22 : overlay == 22 ? 19 : overlay == 23 ? 13 : 18;
         uint32_t n2 = (nv + 1) & ~1u;
         uint64_t lim = sp > 0x1000 ? sp - 0x1000 : 0;
         if (!n2 || verts < 0x10c80 || uint64_t(verts) + uint64_t(stride) * n2 + 16 > lim) return false;
-        if (overlay != 0 && overlay != 1 && overlay != 3 && ((desc & 15) || desc < 0x10000 || uint64_t(desc) + 0x40 > lim)) return false;
+        if (!raw && ((desc & 15) || desc < 0x10000 || uint64_t(desc) + 0x40 > lim)) return false;
         int need = overlay == 12 || overlay == 3 ? 3 : overlay == 11 ? 2 : 1;
         uint8_t fl[16];
         std::memcpy(fl, ls + ctx + 352, 16);
@@ -712,7 +725,7 @@ bool vdecomp_run(uint8_t* ls, int overlay, uint32_t ctx, uint32_t verts, uint32_
         }
     }
     PosFmt pf;
-    if (overlay != 0 && overlay != 1 && overlay != 3) {
+    if (!raw) {
         pf.load(ls, desc);
         if (!pf.supported()) return false;
     }
@@ -727,6 +740,10 @@ bool vdecomp_run(uint8_t* ls, int overlay, uint32_t ctx, uint32_t verts, uint32_
         std::memcpy(spill, ls + sp - 160, 64);
     } else std::memcpy(spill, ls + sp, 64);
     if (overlay == 10) return run_pos(ls, ctx, verts, nv, pf, 12, outs);
+    if (overlay == 23) return run_pos(ls, ctx, verts, nv, pf, 13, outs);
+    if (overlay == 8) return run_copy(ls, ctx, verts, nv, 12, outs);
+    if (overlay == 18) return run_copy(ls, ctx, verts, nv, 22, outs);
+    if (overlay == 22) return run_copy(ls, ctx, verts, nv, 19, outs);
     if (overlay == 9) return run_pos(ls, ctx, verts, nv, pf, 9, outs);
     if (overlay == 12) {
         const uint32_t attrs[2] = {3, 4}, slots[2] = {100, 104};

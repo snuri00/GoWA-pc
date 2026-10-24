@@ -115,7 +115,7 @@ bool stats_on() {
 }
 
 const Entry* find(const uint8_t* ls, uint32_t pc) {
-    if (pc < kLo || pc >= kHi || (pc & 3)) return nullptr;
+    if ((pc & 3) || pc + 8 > spu::LS_SIZE) return nullptr;
     uint64_t head;
     std::memcpy(&head, ls + pc, 8);
     const Table& t = table();
