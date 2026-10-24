@@ -190,7 +190,7 @@ def discover(entry, known_entries, stops=frozenset(), entries=None):
             if WHOLE_PM and op == "ila":
                 f.ila = getattr(f, "ila", {})
                 f.ila.setdefault(d["rt"], set()).add(d["imm"] & 0x3FFFC)
-            if WHOLE_PM and op == "bi" and d["rb"] & 0x30 == 0 and not ie_idiom(pc):
+            if WHOLE_PM and op == "bi" and (d["rb"] >> 4) & 3 != 3 and not ie_idiom(pc):
                 f.ibr = getattr(f, "ibr", {})
                 f.ibr[pc] = d["ra"]
             if op in ("bi", "bra", "brasl") or op in FAILOPS - {"rdch", "wrch", "rchcnt", "mfspr", "mtspr", "fscrrd", "fscrwr"}:
@@ -436,6 +436,11 @@ def find_promotable(f):
     return res
 
 
+def ie_act(d):
+    fl = (d["rb"] >> 4) & 3
+    return "*ctl.ie = true; " if fl == 1 else "*ctl.ie = false; " if fl == 2 else ""
+
+
 def retcheck(rt, ret):
     r = "r%s" % rt if str(rt).isdigit() else rt
     return "if (__builtin_expect((pref(%s) & 0x3fffc) != 0x%x, 0)) { ctl.fail = true; ctl.out = true; ctl.fail_pc = pref(%s) & 0x3fffc; return; }" % (r, ret, r)
@@ -551,8 +556,8 @@ def emit_func(f, out):
             s = "R[%d] = pref_only(ctl.host->cnt(%d));" % (rt, ra)
         elif WHOLE and op == "wrch":
             s = "ctl.host->wr(%d, pref(R[%d])); if (__builtin_expect(ctl.host->abort, 0)) FAIL(@PC@);" % (ra, rt)
-        elif WHOLE and op == "bisl" and d["rb"] & 0x30 == 0 and rt != ra:
-            s = "{ uint32_t it_ = pref(R[%d]); R[%d] = pref_only(0x%x); icall(R, ls, ctl, it_, 0x%05x); if (ctl.out) return; }" % (ra, rt, pc + 4, pc)
+        elif WHOLE and op == "bisl" and (d["rb"] & 0x30 == 0 or WHOLE_PM and (d["rb"] >> 4) & 3 in (1, 2)) and rt != ra:
+            s = "{ uint32_t it_ = pref(R[%d]); R[%d] = pref_only(0x%x); %sicall(R, ls, ctl, it_, 0x%05x); if (ctl.out) return; }" % (ra, rt, pc + 4, ie_act(d), pc)
             if WHOLE_RETCHECK:
                 s = s[:-1] + " " + retcheck(rt, pc + 4) + " }"
         elif op in FAILOPS:
@@ -629,9 +634,9 @@ def emit_func(f, out):
             s = "switch (pref(R[%d]) & 0x3fffc) { %s default: FAIL(@PC@); }" % (ra, " ".join("case 0x%05x: goto L_%05x;" % (t, t) for t in sorted(set(f.switches[pc]))))
         elif WHOLE and op == "bi" and ra == 0 and (d["rb"] >> 4) & 3 in (1, 2):
             s = "*ctl.ie = %s; @RET@" % ("true" if (d["rb"] >> 4) & 3 == 1 else "false")
-        elif op == "bi" and WHOLE_PM and d["rb"] & 0x30 == 0 and [t for t in getattr(f, "ila", {}).get(ra, ()) if t in f.insns]:
-            dflt = "@RET@" if ra == 0 or ra in LINK.get(f.entry, ()) else "FAIL(@PC@);"
-            s = "switch (pref(R[%d]) & 0x3fffc) { %s default: %s }" % (ra, " ".join("case 0x%05x: goto L_%05x;" % (t, t) for t in sorted(t for t in f.ila[ra] if t in f.insns)), dflt)
+        elif op == "bi" and WHOLE_PM and (d["rb"] >> 4) & 3 != 3 and [t for t in getattr(f, "ila", {}).get(ra, ()) if t in f.insns]:
+            dflt = "@RET@" if (ra == 0 or ra in LINK.get(f.entry, ())) and d["rb"] & 0x30 == 0 else "FAIL(@PC@);"
+            s = ie_act(d) + "switch (pref(R[%d]) & 0x3fffc) { %s default: %s }" % (ra, " ".join("case 0x%05x: goto L_%05x;" % (t, t) for t in sorted(t for t in f.ila[ra] if t in f.insns)), dflt)
         elif op == "bi" and WHOLE and ra != 0 and d["rb"] & 0x30 == 0 and ra in LINK.get(f.entry, ()):
             s = "@RET@"
         elif op == "bi":

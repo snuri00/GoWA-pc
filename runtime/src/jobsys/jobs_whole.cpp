@@ -10,7 +10,10 @@
 #include "wj_sm_gen.h"
 #include "wj_sp_gen.h"
 
+#include "runtime/log.h"
+
 #include <atomic>
+#include <mutex>
 #include <cstring>
 #include <xmmintrin.h>
 
@@ -56,6 +59,20 @@ std::atomic<uint64_t> g_ext_calls{0}, g_ext_steps{0};
 
 }
 
+void note_target(uint32_t target, const uint8_t* ls) {
+    static std::mutex m;
+    static uint32_t seen[32];
+    static uint32_t n = 0;
+    std::lock_guard lk(m);
+    for (uint32_t i = 0; i < n; i++)
+        if (seen[i] == target) return;
+    if (n >= 32) return;
+    seen[n++] = target;
+    uint32_t w[4];
+    for (int k = 0; k < 4; k++) w[k] = rbe32(ls + ((target + 4 * k) & 0x3fffc));
+    LOG_INFO("wj", "external call target 0x%05x (job image %s): %08x %08x %08x %08x", target, job_in_ls(ls) >= 0 ? info(job_in_ls(ls)).name : "?", w[0], w[1], w[2], w[3]);
+}
+
 uint32_t ext_call(void* R, uint8_t* ls, uint32_t target, uint32_t ret) {
     spu::Context* c = t_ctx;
     if (!c || static_cast<void*>(c->gpr) != R || c->ls != ls || !t_host) return target;
@@ -63,6 +80,7 @@ uint32_t ext_call(void* R, uint8_t* ls, uint32_t target, uint32_t ret) {
     c->pc = target & spu::PC_MASK;
     uint64_t n = 0;
     g_ext_calls.fetch_add(1, std::memory_order_relaxed);
+    note_target(target, ls);
     while (n < kBudget) {
         if (c->pc == ret) break;
         if (c->halted || (t_chan && t_chan->abort)) break;
