@@ -4,6 +4,7 @@
 #include "runtime/log.h"
 #include "runtime/memory.h"
 #include "runtime/jobsys.h"
+#include "jobsys/jobs_graph.h"
 #include "runtime/reservation.h"
 #include "runtime/trace.h"
 
@@ -580,7 +581,10 @@ void add_guard(uint32_t addr, bool (*guard)(ppu::Context&)) {
     ppu::hook_flags[addr >> 2] = 1;
 }
 
-void install_ppujobs() { jobsys::wws::install(add_guard); }
+void install_ppujobs() {
+    jobsys::wws::install(add_guard);
+    wj::install(add_guard);
+}
 
 void hog_thread(int lp, int on_ms, int off_ms, double from) {
     SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << lp);
