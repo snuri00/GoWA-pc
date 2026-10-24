@@ -5,7 +5,9 @@
 #include "runtime/log.h"
 #include "runtime/memory.h"
 
+#include <cstdio>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <immintrin.h>
@@ -60,7 +62,14 @@ void note_fallback(uint32_t mod, Decode d, uint64_t header) {
     for (auto& [a, b] : seen)
         if (a == mod && b == static_cast<uint32_t>(d)) return;
     seen.push_back({mod, static_cast<uint32_t>(d)});
-    LOG_INFO("jobsys", "left on the WWS list: module 0x%06x header 0x%016llx (%s, tier %s)", mod, static_cast<unsigned long long>(header), decode_name(d), tier_name(tier_for(mod)));
+    std::string words;
+    uint32_t ea = static_cast<uint32_t>(header), n = static_cast<uint32_t>(header >> 48);
+    for (uint32_t off = 0; off + 8 <= n && off < 0x100 && vm::range_mapped(ea, n); off += 8) {
+        char b[24];
+        std::snprintf(b, sizeof b, " %08x%08x", vm::read32(ea + off), vm::read32(ea + off + 4));
+        words += b;
+    }
+    LOG_INFO("jobsys", "left on the WWS list: module 0x%06x header 0x%016llx (%s, tier %s, enabled %d):%s", mod, static_cast<unsigned long long>(header), decode_name(d), tier_name(tier_for(mod)), module_enabled(mod) ? 1 : 0, words.c_str());
 }
 
 bool accept(const JobDesc& j) {

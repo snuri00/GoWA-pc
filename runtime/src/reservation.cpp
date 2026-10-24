@@ -78,6 +78,7 @@ void spin_wait(uint32_t& n) {
         if ((n & 7) == 0) SwitchToThread();
         else _mm_pause();
     } else {
+        if (n == 1024) g_hard_waits.fetch_add(1, std::memory_order_relaxed);
         Sleep(1);
     }
 }
@@ -122,6 +123,8 @@ const bool g_logged = std::getenv("GOWA_RSV_LOG") != nullptr;
 }
 
 std::atomic<uint64_t>& version(uint32_t addr) { return entry(addr).ver; }
+
+std::atomic<uint64_t> g_hard_waits{0};
 
 void set_hard_relax(bool on) { t_hard_relax = on; }
 

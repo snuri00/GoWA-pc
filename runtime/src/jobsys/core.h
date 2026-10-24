@@ -77,6 +77,7 @@ struct Stats {
     std::atomic<uint64_t> wait_n{0}, wait_cyc{0}, park_n{0};
     std::atomic<uint64_t> max_job_cyc{0}, max_wait_cyc{0};
     std::atomic<uint64_t> decl[8]{};
+    std::atomic<uint64_t> relax_sleeps{0};
 };
 Stats& stats();
 double tsc_hz();

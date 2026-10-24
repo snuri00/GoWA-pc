@@ -318,17 +318,24 @@ void dep_decrement(uint32_t ea, uint32_t spurs) {
 thread_local bool t_donor_prio = false;
 
 void set_relax_hard(bool on) {
-    t_donor_prio = on;
-    rsv::set_hard_relax(on);
+    static const bool allowed = env_on("GOWA_JOBSYS_HARDRELAX", true);
+    t_donor_prio = on && allowed;
+    rsv::set_hard_relax(on && allowed);
 }
 
 void relax_spin(uint32_t& n) {
     n++;
     if (n < 64) _mm_pause();
     else if (n < 512) SwitchToThread();
-    else if (t_donor_prio) Sleep(1);
-    else if (n < 4096) SwitchToThread();
-    else Sleep(1);
+    else if (t_donor_prio) {
+        if (n == 512) stats().relax_sleeps.fetch_add(1, std::memory_order_relaxed);
+        Sleep(1);
+    } else if (n < 4096) {
+        SwitchToThread();
+    } else {
+        if (n == 4096) stats().relax_sleeps.fetch_add(1, std::memory_order_relaxed);
+        Sleep(1);
+    }
 }
 
 void JobCtx::relax() { relax_spin(spins); }

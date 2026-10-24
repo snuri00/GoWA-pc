@@ -2,6 +2,7 @@
 #include "verify.h"
 
 #include "runtime/log.h"
+#include "runtime/reservation.h"
 
 #include <windows.h>
 
@@ -76,10 +77,10 @@ void stats_thread() {
             lt[k] = t;
             ltc[k] = tc;
         }
-        LOG_INFO("jobsys", "5s: %llu jobs [%s ], waiter %llu, donated %llu, sites %llu/%llu jobs, waits %llu %.2f ms/s max %.2f ms, max job %.2f ms, captured %llu, fallback %llu, resumed %llu, slow dma %llu, parks %llu, queued %u",
+        LOG_INFO("jobsys", "5s: %llu jobs [%s ], waiter %llu, donated %llu, sites %llu/%llu jobs, waits %llu %.2f ms/s max %.2f ms, max job %.2f ms, captured %llu, fallback %llu, resumed %llu, slow dma %llu, parks %llu, gated %llu, drains %llu, lock sleeps %llu, poll sleeps %llu, queued %u",
                  (unsigned long long)(j - lj), tiers.c_str(), (unsigned long long)(h - lh), (unsigned long long)(d - ld), (unsigned long long)(ws - lws), (unsigned long long)(wj - lwj), (unsigned long long)(wn - lwn),
                  double(wc - lwc) / hz * 1e3 / 5.0, double(mw) / hz * 1e3, double(mj) / hz * 1e3, (unsigned long long)(cap - lcap), (unsigned long long)(fb - lfb), (unsigned long long)(res - lres), (unsigned long long)(slow - lslow),
-                 (unsigned long long)(park - lpark), queued());
+                 (unsigned long long)(park - lpark), (unsigned long long)s.gated.load(), (unsigned long long)s.ordered_waits.load(), (unsigned long long)rsv::g_hard_waits.load(), (unsigned long long)s.relax_sleeps.load(), queued());
         std::string mods;
         for (int i = 0; i < 64; i++) {
             ModStat& m = g_mods[i];
