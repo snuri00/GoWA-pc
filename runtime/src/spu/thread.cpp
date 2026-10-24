@@ -74,6 +74,8 @@ SpuThread::~SpuThread() {
 
 template <class Pred>
 bool SpuThread::block(std::unique_lock<std::mutex>& lk, Pred pred) {
+    if (pred()) return true;
+    const uint64_t cp0 = critpath::g_on ? __rdtsc() : 0;
     while (!pred()) {
         if (stop_flag.load(std::memory_order_relaxed)) {
             ctx.halted = true;
@@ -83,6 +85,7 @@ bool SpuThread::block(std::unique_lock<std::mutex>& lk, Pred pred) {
         cv.wait_for(lk, std::chrono::microseconds(100));
         waiting.store(0, std::memory_order_relaxed);
     }
+    if (cp0) critpath::spu_waited(cp, cp0, critpath::SW_BLOCK);
     return true;
 }
 
@@ -263,6 +266,7 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
             if (!event_count) g_ev_waits.fetch_add(1, std::memory_order_relaxed);
         }
         auto wait_start = job_stats && !event_count ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const uint64_t cp0 = critpath::g_on && !event_count ? __rdtsc() : 0;
         while (!event_count) {
             if (stop_flag.load(std::memory_order_relaxed)) {
                 ctx.halted = true;
@@ -299,6 +303,7 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
             }
             collect_events();
         }
+        if (cp0) critpath::spu_waited(cp, cp0, critpath::SW_LR);
         if (job_stats && wait_start.time_since_epoch().count()) g_ev_wait_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_start).count(), std::memory_order_relaxed);
         event_count = false;
         return events & event_mask;
@@ -1000,6 +1005,7 @@ void SpuThread::process_mfc(uint32_t cmd) {
     case 0x40: case 0x41: case 0x42: case 0x89:
         dma(cmd, lsa, ea, size);
         if (cmd < 0x40) critpath::spu_stored(cp, slot, ea, size);
+        else critpath::spu_label_get(cp, ea);
         break;
     case 0xA0: case 0xA1: case 0xA2:
         dma(0x20, lsa, ea, 4);
@@ -1072,9 +1078,12 @@ void SpuThread::process_mfc(uint32_t cmd) {
 
 bool SpuThread::stop_and_signal(uint32_t code) {
     switch (code) {
-    case 0x001:
+    case 0x001: {
+        const uint64_t cp0 = critpath::g_on ? __rdtsc() : 0;
         Sleep(1);
+        if (cp0) critpath::spu_waited(cp, cp0, critpath::SW_BLOCK);
         return true;
+    }
     case 0x100:
         return true;
     case 0x101: {

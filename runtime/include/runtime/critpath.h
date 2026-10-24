@@ -74,7 +74,7 @@ struct Call {
 void enter(uint8_t kind, ppu::Context& ctx, Call& c);
 void leave(uint8_t kind, ppu::Context& ctx, Call& c);
 void emit_wait(uint8_t kind, uint64_t t0, uint64_t t1, uint32_t a, uint32_t b, uint32_t c);
-void syscall_done(uint32_t n, uint64_t t0, uint32_t lr);
+void syscall_done(uint32_t n, uint64_t t0, uint32_t lr, uint32_t arg, uint32_t sp);
 void flip(uint64_t count);
 
 struct SpuState {
@@ -83,7 +83,25 @@ struct SpuState {
     uint32_t src = 0, wid = 0;
     uint64_t start = 0, pick = 0;
     uint32_t last_src = 0, last_wid = 0;
+    uint64_t lr_wait = 0, blk_wait = 0, idle_wait = 0, idle_blk = 0;
+    uint64_t lab_first = 0, lab_last = 0;
+    uint32_t lab_n = 0;
 };
+
+enum SpuWait : uint8_t { SW_LR = 0, SW_BLOCK = 1 };
+
+inline void spu_waited(SpuState& s, uint64_t t0, SpuWait w) {
+    uint64_t d = __rdtsc() - t0;
+    if (s.open) (w == SW_LR ? s.lr_wait : s.blk_wait) += d;
+    else (w == SW_LR ? s.idle_wait : s.idle_blk) += d;
+}
+
+inline void spu_label_get(SpuState& s, uint32_t ea) {
+    if (!s.open || ea - 0x50300C80u >= 0xA0u) return;
+    uint64_t t = __rdtsc();
+    if (!s.lab_n++) s.lab_first = t;
+    s.lab_last = t;
+}
 
 void spu_init_sig();
 void spu_job_begin(SpuState& s, uint32_t slot, const uint8_t* ls, const uint32_t* line_src, uint32_t pc, bool wws);

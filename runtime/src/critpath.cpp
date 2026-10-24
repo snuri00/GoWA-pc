@@ -137,6 +137,7 @@ struct Agg {
     uint64_t wait[16] = {};
     uint64_t sys = 0;
     uint64_t t_first = 0, t_last = 0;
+    uint64_t win0 = 0;
 };
 
 FILE* g_out = nullptr;
@@ -188,6 +189,7 @@ const char* kind_name(int k) {
 void writer() {
     SetThreadDescription(GetCurrentThread(), L"critpath writer");
     Agg agg;
+    agg.win0 = __rdtsc();
     auto last_log = std::chrono::steady_clock::now();
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -196,11 +198,13 @@ void writer() {
         if (now - last_log < std::chrono::seconds(5)) continue;
         last_log = now;
         std::fflush(g_out);
+        uint64_t win1 = __rdtsc();
         if (agg.frames < 2) {
             agg = Agg{};
+            agg.win0 = win1;
             continue;
         }
-        double span = double(agg.t_last - agg.t_first);
+        double span = double(win1 - agg.win0);
         std::string s;
         char b[64];
         double total = 0;
@@ -216,9 +220,10 @@ void writer() {
             std::lock_guard lk(g_rings_lock);
             for (Ring* r : g_rings) dropped += r->dropped.load();
         }
-        LOG_INFO("critpath", "ppu frames %.1f/s, main waits %.1f%% of frame time:%s | other blocking syscalls %.1f%% | dropped %llu", double(agg.frames - 1) * g_tsc_hz / span, total, s.c_str(),
+        LOG_INFO("critpath", "ppu frames %.1f/s, main waits %.1f%% of wall time:%s | main blocking syscalls outside waits %.1f%% | dropped %llu", double(agg.frames) * g_tsc_hz / span, total, s.c_str(),
                  100.0 * double(agg.sys) / span, static_cast<unsigned long long>(dropped));
         agg = Agg{};
+        agg.win0 = win1;
     }
 }
 
@@ -254,7 +259,7 @@ void init() {
     }
     g_tsc_hz = calibrate();
     g_sys_min = static_cast<uint32_t>(g_tsc_hz * 20e-6);
-    char magic[8] = {'C', 'P', 'A', 'T', 'H', '1', 0, 0};
+    char magic[8] = {'C', 'P', 'A', 'T', 'H', '2', 0, 0};
     std::fwrite(magic, 1, 8, g_out);
     std::fwrite(&g_tsc_hz, 8, 1, g_out);
     g_on = true;
@@ -434,19 +439,29 @@ void emit_wait(uint8_t kind, uint64_t t0, uint64_t t1, uint32_t a, uint32_t b, u
     push(e);
 }
 
-void syscall_done(uint32_t n, uint64_t t0, uint32_t lr) {
+uint32_t back_ra(uint32_t& sp) {
+    if (!sp || (sp & 7) || !vm::range_mapped(sp, 8)) return sp = 0;
+    uint32_t up = static_cast<uint32_t>(vm::read64(sp));
+    if (!up || (up & 7) || up <= sp || !vm::range_mapped(up + 16, 8)) return sp = 0;
+    sp = up;
+    return static_cast<uint32_t>(vm::read64(up + 16));
+}
+
+void syscall_done(uint32_t n, uint64_t t0, uint32_t lr, uint32_t arg, uint32_t sp) {
     if (n == 141) t_sleeps++;
-    Ring* r = ring();
-    if (!r->main) return;
     uint64_t t1 = __rdtsc();
     if (t1 - t0 < g_sys_min) return;
     Ev e{};
     e.type = EV_SYSCALL;
-    e.depth = static_cast<uint8_t>(t_depth);
+    e.depth = static_cast<uint8_t>(t_depth + (t_seg_open ? 1 : 0));
     e.t0 = t0;
     e.t1 = t1;
     e.a = n;
     e.d = lr;
+    e.b = back_ra(sp);
+    e.c = back_ra(sp);
+    e.e = back_ra(sp);
+    e.f = arg | (uint64_t(back_ra(sp)) << 32);
     push(e);
 }
 
@@ -470,6 +485,8 @@ void spu_job_begin(SpuState& s, uint32_t slot, const uint8_t* ls, const uint32_t
     s.open = true;
     s.wws = wws;
     s.start = __rdtsc();
+    s.lr_wait = s.blk_wait = 0;
+    s.lab_n = 0;
     s.src = line_src[(wws ? 0x4000 : 0x3000) >> 7];
     (void)pc;
     uint32_t wid;
@@ -482,15 +499,19 @@ void spu_job_end(SpuState& s, uint32_t slot) {
     s.open = false;
     s.last_src = s.src;
     s.last_wid = s.wid;
+    auto sat = [](uint64_t v, uint64_t m) { return static_cast<uint32_t>(v > m ? m : v); };
     Ev e{};
     e.type = EV_JOB;
     e.t0 = s.start;
     e.t1 = t1;
     e.a = s.src;
-    e.b = s.wid;
-    e.c = slot | (uint32_t(s.wws) << 8);
+    e.b = (s.wid & 0xFF) | (sat(s.lab_n, 0xFFFFFF) << 8);
+    e.c = (slot & 0xFF) | (uint32_t(s.wws) << 8) | (sat((s.idle_wait + s.idle_blk) >> 8, 0x7FFFFF) << 9);
     uint64_t q = s.pick && s.pick <= s.start ? s.start - s.pick : 0;
-    e.d = q > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(q);
+    e.d = sat(q, 0xFFFFFFFFu);
+    e.e = s.lab_n > 1 ? sat(s.lab_last - s.lab_first, 0xFFFFFFFFu) : 0;
+    e.f = sat(s.lr_wait, 0xFFFFFFFFu) | (uint64_t(sat(s.blk_wait, 0xFFFFFFFFu)) << 32);
+    s.idle_wait = s.idle_blk = 0;
     push(e);
 }
 

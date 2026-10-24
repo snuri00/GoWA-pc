@@ -48,6 +48,12 @@ IMAGES = [
 IMG_STARTS = [s for s, _, _ in IMAGES]
 
 
+def site(d, s):
+    if d.version < 2:
+        return "sc%d@%08x" % (s[2], s[5])
+    return "sc%d@%08x<%08x<%08x" % (s[2], s[5], s[3], s[4])
+
+
 def image_name(src, wid):
     i = bisect.bisect_right(IMG_STARTS, src) - 1
     if i >= 0:
@@ -63,8 +69,9 @@ class Data:
         self.ev = collections.defaultdict(list)
         with open(path, "rb") as f:
             blob = f.read()
-        if blob[:6] != b"CPATH1":
+        if blob[:5] != b"CPATH" or blob[5:6] not in (b"1", b"2"):
             raise SystemExit("not a critpath file: %s" % path)
+        self.version = int(blob[5:6])
         self.hz = struct.unpack_from("<d", blob, 8)[0]
         pos = 16
         n = len(blob)
@@ -82,9 +89,7 @@ class Data:
                 end = pos + 12 + cnt * EV.size
                 if end > n:
                     break
-                lst = self.ev[rid]
-                for i in range(cnt):
-                    lst.append(EV.unpack_from(blob, pos + 12 + i * EV.size))
+                self.ev[rid].extend(EV.iter_unpack(blob[pos + 12:end]))
                 pos = end
             else:
                 break
@@ -127,8 +132,37 @@ def build(d, args):
         by_slot[e[4] & 0xFF].append(e)
     slot_end = {s: [e[1] for e in lst] for s, lst in by_slot.items()}
     waits = [e for e in main if e[7] == EV_WAIT and e[9] == 0 and e[1] > e[0]]
-    sysc = [e for e in main if e[7] == EV_SYSCALL and e[9] == 0]
+    sysc = outside(waits, [e for e in main if e[7] == EV_SYSCALL and e[9] == 0])
     return frames, jobs, job_end, stores, st_t, by_slot, slot_end, waits, sysc, t_origin
+
+
+def outside(waits, sysc):
+    merged = []
+    for a, b in sorted((w[0], w[1]) for w in waits):
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    starts = [a for a, _ in merged]
+    out = []
+    for s in sysc:
+        i = bisect.bisect_right(starts, s[0]) - 1
+        if i >= 0 and merged[i][1] >= s[1]:
+            continue
+        out.append(s)
+    return out
+
+
+def job_split(d, j):
+    wall = j[1] - j[0]
+    if d.version < 2:
+        return wall, 0, 0, 0, 0, 0
+    lr = j[11] & 0xFFFFFFFF
+    blk = j[11] >> 32
+    ring = j[6]
+    labn = j[3] >> 8
+    idle = (j[4] >> 9) << 8
+    return wall, lr, blk, ring, labn, idle
 
 
 def job_for_store(st, by_slot, slot_end, hz):
@@ -179,7 +213,7 @@ def completer(w, ctx, d):
     k = bisect.bisect_right(job_end, t1) - 1
     if k >= 0 and job_end[k] >= t0:
         j = jobs[k]
-        return j[1], j, image_name(j[2], j[3])
+        return j[1], j, image_name(j[2], j[3] & 0xFF)
     return None
 
 
@@ -196,6 +230,11 @@ def analyze(d, args):
             "wtype": collections.Counter(),
             "q": 0.0, "r": 0.0, "n": 0.0, "u": 0.0,
             "run": collections.Counter(),
+            "busy": collections.Counter(),
+            "lrw": collections.Counter(),
+            "blkw": collections.Counter(),
+            "ringw": collections.Counter(),
+            "spin": collections.Counter(),
             "cnt": collections.Counter(),
             "sys": 0.0,
             "sysk": collections.Counter(),
@@ -209,7 +248,7 @@ def analyze(d, args):
 
     def frame_of(t):
         i = bisect.bisect_right(starts, t) - 1
-        return i if 0 <= i < nf else None
+        return i if 0 <= i < nf and t < frames[i + 1] else None
 
     long_batch = []
     for w in waits:
@@ -248,14 +287,21 @@ def analyze(d, args):
         fi = frame_of(s[0])
         if fi is not None:
             fr[fi]["sys"] += d.ms(s[1] - s[0])
-            fr[fi]["sysk"]["sc%d@%08x" % (s[2], s[5])] += d.ms(s[1] - s[0])
+            fr[fi]["sysk"][site(d, s)] += d.ms(s[1] - s[0])
     for j in jobs:
         fi = frame_of(j[0])
         if fi is None:
             continue
-        nm = image_name(j[2], j[3])
-        fr[fi]["run"][nm] += d.ms(j[1] - j[0])
-        fr[fi]["cnt"][nm] += 1
+        nm = image_name(j[2], j[3] & 0xFF)
+        wall, lr, blk, ring, labn, _ = job_split(d, j)
+        F = fr[fi]
+        F["run"][nm] += d.ms(wall)
+        F["busy"][nm] += d.ms(max(0, wall - lr - blk - ring))
+        F["lrw"][nm] += d.ms(lr)
+        F["blkw"][nm] += d.ms(blk)
+        F["ringw"][nm] += d.ms(ring)
+        F["spin"][nm] += 1 if labn > 1 else 0
+        F["cnt"][nm] += 1
     return fr, long_batch, ctx
 
 
@@ -282,7 +328,7 @@ def table(d, fr, title, out):
         sy += F["sys"]
     tw = sum(wait.values()) / n
     out.append("## %s: %d frames, avg frame %.2f ms (%.1f fps)" % (title, n, ft, 1000.0 / ft if ft else 0))
-    out.append("PPU main thread waits: %.2f ms/frame = %.1f %% of frame time; other blocking syscalls %.2f ms (%.1f %%)" % (tw, 100 * tw / ft, sy / n, 100 * sy / n / ft))
+    out.append("PPU main thread waits: %.2f ms/frame = %.1f %% of frame time; main-thread blocking syscalls outside wait sites %.2f ms (%.1f %%)" % (tw, 100 * tw / ft, sy / n, 100 * sy / n / ft))
     out.append("  decomposition (ms/frame): queue %.2f, run %.2f, notify %.2f, unattributed %.2f" % (q / n, r / n, no / n, u / n))
     out.append("  | wait site | ms/frame | % frame |")
     out.append("  |---|---|---|")
@@ -300,11 +346,77 @@ def table(d, fr, title, out):
     for k, v in wtype.most_common(14):
         out.append("  | %s | %.2f | %.1f | %.2f | %.2f | %.2f |" % (k, v / n, 100 * v / n / ft, dq[k] / n, dr[k] / n, dn[k] / n))
     out.append("  notify by wait site (ms/frame): " + ", ".join("%s %.2f" % (k, v / n) for k, v in dns.most_common()))
-    out.append("  blocking syscalls outside wait sites (ms/frame): " + ", ".join("%s %.2f" % (k, v / n) for k, v in sysk.most_common(6)))
-    out.append("  | job type | SPU ms/frame | jobs/frame | avg us/job |")
-    out.append("  |---|---|---|---|")
+    out.append("  main-thread blocking syscalls outside wait sites (ms/frame, site = lr<caller<caller): " + ", ".join("%s %.2f" % (k, v / n) for k, v in sysk.most_common(6)))
+    busy, lrw, blkw, ringw, spin = (collections.Counter() for _ in range(5))
+    for F in fr:
+        busy.update(F["busy"])
+        lrw.update(F["lrw"])
+        blkw.update(F["blkw"])
+        ringw.update(F["ringw"])
+        spin.update(F["spin"])
+    out.append("  SPU job time (ms/frame): wall = busy + event wait (rdch ch0: LR/SPURS events) + block wait (mailbox/signal/stop) + Edge ring spin (repeated RSX label 0x50300c80.. reads)")
+    out.append("  | job type | wall | busy | event wait | block wait | ring spin | jobs/frame | busy us/job | ring-spin jobs/frame |")
+    out.append("  |---|---|---|---|---|---|---|---|---|")
     for k, v in run.most_common(16):
-        out.append("  | %s | %.2f | %.1f | %.0f |" % (k, v / n, cnt[k] / n, 1000 * v / cnt[k] if cnt[k] else 0))
+        c = cnt[k] or 1
+        out.append("  | %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.1f | %.0f | %.2f |" % (k, v / n, busy[k] / n, lrw[k] / n, blkw[k] / n, ringw[k] / n, cnt[k] / n, 1000 * busy[k] / c, spin[k] / n))
+    tb, tl, tk, tr = (sum(x.values()) / n for x in (busy, lrw, blkw, ringw))
+    out.append("  all jobs: wall %.1f ms/frame = %.2f SPUs (busy %.2f, event wait %.2f, block wait %.2f, ring spin %.2f SPUs)" % (
+        sum(run.values()) / n, sum(run.values()) / n / ft, tb / ft, tl / ft, tk / ft, tr / ft))
+
+
+def slot_table(d, ctx, out):
+    frames, jobs, job_end, stores, st_t, by_slot, slot_end, waits, sysc, t_origin = ctx
+    if len(frames) < 2:
+        return
+    lo, hi = frames[0], frames[-1]
+    span = hi - lo
+    out.append("## SPU threads (%.1f s window)" % (span / d.hz))
+    out.append("| slot | in jobs % | job busy % | job event wait % | job block wait % | job ring spin % | idle wait between jobs % | kernel/PM (rest) % | jobs/s |")
+    out.append("|---|---|---|---|---|---|---|---|---|")
+    for slot in sorted(by_slot):
+        acc = [0, 0, 0, 0, 0, 0]
+        k = 0
+        for j in by_slot[slot]:
+            if j[0] < lo or j[0] >= hi:
+                continue
+            k += 1
+            wall, lr, blk, ring, labn, idle = job_split(d, j)
+            acc[0] += wall
+            acc[1] += max(0, wall - lr - blk - ring)
+            acc[2] += lr
+            acc[3] += blk
+            acc[4] += ring
+            acc[5] += idle
+        p = [100.0 * x / span for x in acc]
+        out.append("| %d | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.0f |" % (slot, p[0], p[1], p[2], p[3], p[4], p[5], max(0.0, 100 - p[0] - p[5]), k * d.hz / span))
+
+
+def thread_table(d, ctx, out):
+    frames = ctx[0]
+    if len(frames) < 2:
+        return
+    lo, hi = frames[0], frames[-1]
+    span = hi - lo
+    out.append("## PPU threads: blocking syscalls >= 20 us (% of wall time; the main thread total includes syscalls inside wait sites)")
+    out.append("| thread | blocked % | top sites (lr<caller<caller: %) |")
+    out.append("|---|---|---|")
+    rows = []
+    for rid, lst in d.ev.items():
+        if rid in d.spu:
+            continue
+        tot = 0
+        sites = collections.Counter()
+        for e in lst:
+            if e[7] != EV_SYSCALL or e[1] <= lo or e[0] >= hi:
+                continue
+            dt = min(e[1], hi) - max(e[0], lo)
+            tot += dt
+            sites[site(d, e)] += dt
+        if tot:
+            rows.append((tot, d.names.get(rid, str(rid)), sites))
+    for tot, name, sites in sorted(rows, key=lambda r: -r[0]):
+        out.append("| %s | %.1f | %s |" % (name, 100.0 * tot / span, ", ".join("%s %.1f" % (k, 100.0 * v / span) for k, v in sites.most_common(3))))
 
 
 def main():
@@ -329,6 +441,8 @@ def main():
     table(d, fr, "all frames", out)
     table(d, slow, "slow frames (< %.0f fps)" % args.slow, out)
     table(d, fast, "fast frames (>= %.0f fps)" % args.slow, out)
+    slot_table(d, ctx, out)
+    thread_table(d, ctx, out)
     if long_batch:
         out.append("## batch waits > %.1f ms" % args.batch_ms)
         t_origin = ctx[-1]

@@ -216,6 +216,7 @@ void syscall(Context& ctx, uint8_t* base) {
         LOG_TRACE("lv2", "%s(0x%llx, 0x%llx, 0x%llx, 0x%llx)", slot.name, static_cast<unsigned long long>(ctx.gpr[3]), static_cast<unsigned long long>(ctx.gpr[4]),
                   static_cast<unsigned long long>(ctx.gpr[5]), static_cast<unsigned long long>(ctx.gpr[6]));
         uint64_t cp0 = critpath::g_on ? __rdtsc() : 0;
+        uint32_t cp_arg = static_cast<uint32_t>(ctx.gpr[3]);
         guest::Thread* t = guest::current();
         if (t) {
             t->in_syscall.store(n + 1, std::memory_order_relaxed);
@@ -233,7 +234,7 @@ void syscall(Context& ctx, uint8_t* base) {
             ctx.gpr[3] = static_cast<uint64_t>(slot.fn(ctx, base));
         }
         if (t) t->in_syscall.store(0, std::memory_order_relaxed);
-        if (cp0) critpath::syscall_done(n, cp0, static_cast<uint32_t>(ctx.lr));
+        if (cp0) critpath::syscall_done(n, cp0, static_cast<uint32_t>(ctx.lr), cp_arg, static_cast<uint32_t>(ctx.gpr[1]));
         return;
     }
     if (!lv2::g_warned[n].exchange(1)) {
