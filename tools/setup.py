@@ -32,6 +32,7 @@ GENERATORS = (
     ("anim", "anim", ["tests/anim/an_cgen.py", "{gen}/anim/an_gen.cpp", "{gen}/anim/an_gen.h"]),
     ("tasks", "tasks", ["tests/tasks/task_cgen.py"]),
     ("mpjob", "mpjob", ["tests/mpjob/mpj_cgen.py", "{gen}/mpjob"]),
+    ("jwhole", "jwhole", ["tests/jobsys/whole_cgen.py", "{gen}/jwhole"]),
 )
 
 STAMP = "generated.txt"

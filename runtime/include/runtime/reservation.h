@@ -15,6 +15,8 @@ inline void watch_note(uint32_t line) {
 }
 
 std::atomic<uint64_t>& version(uint32_t addr);
+void set_hard_relax(bool on);
+extern std::atomic<uint64_t> g_hard_waits;
 uint64_t snapshot(uint32_t line, uint8_t* out);
 bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uint8_t* data, uint32_t offset, uint32_t size, bool data_only = false);
 void store_unconditional(uint32_t line, const uint8_t* data);
