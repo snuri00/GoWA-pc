@@ -2,6 +2,8 @@
 
 #include "hle.h"
 #include "thread.h"
+#include "renjob/renjob_adapters.h"
+#include "renjob/renjob_whole.h"
 
 #include "ppu/context.h"
 #include "runtime/critpath.h"
@@ -54,6 +56,11 @@ struct Config {
     std::vector<uint32_t> mods;
     std::vector<int> cpus;
     uint32_t poison = 0;
+    bool native = false;
+    bool spu_host = false;
+    bool ab = false;
+    int worker_prio = 0;
+    bool worker_prio_set = false;
 };
 
 std::vector<uint32_t> parse_hex_list(const char* e) {
@@ -83,6 +90,15 @@ const Config& cfg() {
         for (uint32_t x : parse_hex_list(std::getenv("GOWA_PPU_JOBS_CPUS"))) c.cpus.push_back(static_cast<int>(x));
         if (const char* p = std::getenv("GOWA_PPU_JOBS_POISON")) c.poison = static_cast<uint32_t>(std::strtoul(p, nullptr, 16));
         if (!c.help && c.threads == 0) c.threads = 1;
+        if (const char* n = std::getenv("GOWA_PPU_JOBS_NATIVE")) {
+            c.native = n[0] && n[0] != '0';
+            c.spu_host = n[0] == 's';
+            c.ab = n[0] == 'a';
+        }
+        if (const char* p = std::getenv("GOWA_PPU_JOBS_PRIO")) {
+            c.worker_prio = std::atoi(p);
+            c.worker_prio_set = true;
+        }
         return c;
     }();
     return c;
@@ -169,6 +185,8 @@ bool parse(Job& j) {
 
 struct Stats {
     std::atomic<uint64_t> jobs{0}, helped{0}, cycles{0}, cpu{0}, insns{0}, waits{0}, wait_cycles{0}, captured{0}, fallback{0}, verified{0}, mismatches{0};
+    std::atomic<uint64_t> native_done{0}, native_resumed{0}, native_cycles{0}, state_diff{0}, rmw_puts{0}, slow_dma{0};
+    std::atomic<uint64_t> n_jobs{0}, n_tsc{0}, n_cpu{0}, e_jobs{0}, e_tsc{0}, e_cpu{0};
 };
 Stats g_stats;
 
@@ -380,6 +398,207 @@ struct Replayer : spu::Host {
         return false;
     }
     void halt(uint32_t pc, uint32_t word) override { next(4, pc, word, true); }
+};
+
+struct DmaStats {
+    std::atomic<uint64_t> wr{0}, rd{0}, get{0}, put{0}, bget{0}, bput{0};
+};
+DmaStats g_dstats;
+
+struct FastHost final : renjob::ChanHost {
+    spu::SpuThread& t;
+    uint32_t table = 0;
+    uint32_t get_lo[8] = {}, get_hi[8] = {};
+    uint32_t ngets = 0;
+    uint32_t rmw = 0, slow = 0;
+    uint32_t n_wr = 0, n_rd = 0, n_get = 0, n_put = 0, b_get = 0, b_put = 0, n_atom = 0;
+    explicit FastHost(spu::SpuThread& th) : t(th) {
+        table = vm::is_mapped(0x9B2298) ? vm::read32(0x9B2298) : 0;
+    }
+    bool in_table(uint32_t ea, uint32_t size) const { return table && ea < table + 0xA280 && ea + size > table; }
+    void note_get(uint32_t ea, uint32_t size) {
+        get_lo[ngets & 7] = ea;
+        get_hi[ngets & 7] = ea + size;
+        ngets++;
+    }
+    void note_put(uint32_t ea, uint32_t size) {
+        uint32_t n = ngets < 8 ? ngets : 8;
+        for (uint32_t i = 0; i < n; i++) {
+            if (ea < get_hi[i] && ea + size > get_lo[i]) {
+                rmw++;
+                return;
+            }
+        }
+    }
+    uint32_t rd(uint32_t ch) override {
+        n_rd++;
+        switch (ch) {
+        case 13: return t.ctx.interrupts_enabled ? 1 : 0;
+        case 24:
+            if (t.tag_stat_count) {
+                t.tag_stat_count = false;
+                return t.tag_stat;
+            }
+            break;
+        case 27:
+            if (t.atomic_stat_count) {
+                t.atomic_stat_count = false;
+                return t.atomic_stat;
+            }
+            break;
+        default: break;
+        }
+        return t.read_channel(ch);
+    }
+    uint32_t cnt(uint32_t ch) override {
+        switch (ch) {
+        case 21: return 16;
+        case 23: return 1;
+        case 24: return t.tag_stat_count;
+        case 27: return t.atomic_stat_count;
+        default: return t.channel_count(ch);
+        }
+    }
+    void wr(uint32_t ch, uint32_t v) override {
+        n_wr++;
+        switch (ch) {
+        case 16: t.mfc_lsa = v; return;
+        case 17: return;
+        case 18: t.mfc_eal = v; return;
+        case 19: t.mfc_size = v > 0xFFFF ? 0xFFFF : v; return;
+        case 20: t.mfc_tag = v & 0x1F; return;
+        case 21: mfc(v & 0xFF); return;
+        case 22: t.tag_mask = v; return;
+        case 23:
+            t.tag_stat = t.tag_mask;
+            if (v == 1 && t.tag_mask == 0) return;
+            t.tag_stat_count = true;
+            return;
+        default: t.write_channel(ch, v); return;
+        }
+    }
+    bool plain(uint32_t ea, uint32_t size, uint32_t lsa) const {
+        return size && size <= 0x4000 && ea >= 0x10000 && ea < 0xF0000000u && (lsa & 0x3FFFF) + size <= spu::LS_SIZE && vm::is_mapped(ea) && vm::is_mapped(ea + size - 1);
+    }
+    void get(uint32_t lsa, uint32_t ea, uint32_t size) {
+        n_get++;
+        b_get += size;
+        lsa &= 0x3FFFF;
+        if (vm::is_immutable(ea, size)) {
+            std::memcpy(t.ls + lsa, vm::ptr(ea), size);
+        } else {
+            uint32_t lo = 0xFFFFFFFFu, hi = 0;
+            rsv::copy_range_if_changed(ea, t.ls + lsa, size, lo, hi);
+        }
+        if (lsa < 0x17580) t.mark_ls(lsa, size);
+        note_get(ea, size);
+    }
+    void put(uint32_t lsa, uint32_t ea, uint32_t size) {
+        n_put++;
+        b_put += size;
+        lsa &= 0x3FFFF;
+        note_put(ea, size);
+        rsv::store_range(ea, t.ls + lsa, size);
+    }
+    void slow_path(uint32_t cmd) {
+        slow++;
+        t.write_channel(21, cmd);
+    }
+    void mfc(uint32_t cmd) {
+        uint32_t lsa = t.mfc_lsa, ea = t.mfc_eal, size = t.mfc_size;
+        switch (cmd) {
+        case 0x40: case 0x41: case 0x42:
+            if (!plain(ea, size, lsa)) return slow_path(cmd);
+            get(lsa, ea, size);
+            return;
+        case 0x20: case 0x21: case 0x22:
+            if (!plain(ea, size, lsa) || in_table(ea, size)) return slow_path(cmd);
+            put(lsa, ea, size);
+            return;
+        case 0x44: case 0x45: case 0x46:
+        case 0x24: case 0x25: case 0x26: {
+            bool is_put = cmd < 0x40;
+            uint32_t list = ea & 0x3FFF8;
+            uint32_t cur = lsa & 0x3FFF0;
+            for (uint32_t n = size, l = list, c = cur; n >= 8; n -= 8) {
+                const uint8_t* e = t.ls + l;
+                uint32_t ts = ((uint32_t(e[2]) << 8) | e[3]) & 0x7FFF;
+                uint32_t a;
+                std::memcpy(&a, e + 4, 4);
+                a = __builtin_bswap32(a);
+                if ((e[0] & 0x80) || (ts && (!plain(a, ts, c | (a & 15)) || (is_put && in_table(a, ts))))) return slow_path(cmd);
+                c = (c + ((ts + 15) & ~15u)) & 0x3FFF0;
+                l = (l + 8) & 0x3FFF8;
+                if (l + 8 > spu::LS_SIZE && n > 8) return slow_path(cmd);
+            }
+            for (uint32_t n = size; n >= 8; n -= 8) {
+                const uint8_t* e = t.ls + list;
+                uint32_t ts = ((uint32_t(e[2]) << 8) | e[3]) & 0x7FFF;
+                uint32_t a;
+                std::memcpy(&a, e + 4, 4);
+                a = __builtin_bswap32(a);
+                if (ts) {
+                    if (is_put) put(cur | (a & 15), a, ts);
+                    else get(cur | (a & 15), a, ts);
+                }
+                cur = (cur + ((ts + 15) & ~15u)) & 0x3FFF0;
+                list = (list + 8) & 0x3FFF8;
+            }
+            return;
+        }
+        case 0xD0: {
+            uint32_t line = ea & ~127u;
+            if (ea < 0x10000 || !vm::is_mapped(line)) return slow_path(cmd);
+            uint64_t ver = rsv::snapshot(line, t.rdata);
+            t.raddr = line;
+            t.rtime = ver;
+            std::memcpy(t.ls + (lsa & 0x3FF80), t.rdata, 128);
+            t.atomic_stat = 4;
+            t.atomic_stat_count = true;
+            return;
+        }
+        case 0xB4: {
+            uint32_t line = ea & ~127u;
+            if (ea < 0x10000 || !vm::is_mapped(line)) return slow_path(cmd);
+            bool ok = t.raddr == line && rsv::commit_if(line, t.rtime, t.rdata, t.ls + (lsa & 0x3FF80), 0, 128);
+            t.raddr = 0;
+            t.atomic_stat = ok ? 0 : 1;
+            t.atomic_stat_count = true;
+            return;
+        }
+        case 0xB0: case 0xB8: {
+            uint32_t line = ea & ~127u;
+            if (ea < 0x10000 || !vm::is_mapped(line)) return slow_path(cmd);
+            rsv::store_unconditional(line, t.ls + (lsa & 0x3FF80));
+            if (cmd == 0xB0) {
+                t.atomic_stat = 2;
+                t.atomic_stat_count = true;
+            }
+            return;
+        }
+        case 0xC0: case 0xC8: case 0xCC: case 0x80: case 0x81:
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            return;
+        default:
+            return slow_path(cmd);
+        }
+    }
+};
+
+struct SpuHostChan final : renjob::ChanHost {
+    spu::Host& h;
+    spu::SpuThread& t;
+    SpuHostChan(spu::Host& host, spu::SpuThread& th) : h(host), t(th) {}
+    uint32_t rd(uint32_t ch) override {
+        uint32_t v = h.read_channel(ch);
+        abort = t.ctx.halted;
+        return v;
+    }
+    void wr(uint32_t ch, uint32_t v) override {
+        h.write_channel(ch, v);
+        abort = t.ctx.halted;
+    }
+    uint32_t cnt(uint32_t ch) override { return h.channel_count(ch); }
 };
 
 struct Exec {
@@ -605,7 +824,7 @@ void finish(Exec& x) {
     x.insn_mark = t.exec_insns;
     g_stats.jobs.fetch_add(1, std::memory_order_relaxed);
     if (x.helper) g_stats.helped.fetch_add(1, std::memory_order_relaxed);
-    if (x.verify_this) {
+    if (x.verify_this && !cfg().native) {
         t.exec_host = nullptr;
         verify_job(x);
         x.verify_this = false;
@@ -638,7 +857,7 @@ bool fetch(Exec& x, bool block) {
         x.rec->ev.clear();
         x.start_ls.assign(t.ls, t.ls + spu::LS_SIZE);
         x.ref_ctx_start = t.ctx;
-        t.exec_host = x.rec.get();
+        if (!cfg().native) t.exec_host = x.rec.get();
     }
     return true;
 }
@@ -647,6 +866,173 @@ bool next_cb(spu::SpuThread& t) {
     Exec& x = *static_cast<Exec*>(t.job_user);
     finish(x);
     return fetch(x, !x.helper);
+}
+
+bool single_next(spu::SpuThread&) { return false; }
+
+void emulate_rest(spu::SpuThread& t, spu::Host* host) {
+    for (uint32_t k = 0; k < 64; k++) t.clear_snap(k);
+    t.mark_all_ls();
+    t.exec_host = host;
+    t.stop_flag.store(false);
+    t.exec();
+    t.exec_host = nullptr;
+}
+
+bool whole_ok(const spu::SpuThread& t, const Job& j) {
+    return renjob::image_loaded(t.ls) && kCodeLs + vm::read32(j.code_ea + 0x10) == renjob::kWholeEntry;
+}
+
+struct FailLog {
+    std::mutex m;
+    std::vector<std::pair<uint32_t, uint32_t>> seen;
+    void note(uint32_t pc, uint32_t miss) {
+        std::lock_guard lk(m);
+        for (auto& [p, n] : seen) {
+            if (p == pc) {
+                n++;
+                return;
+            }
+        }
+        seen.push_back({pc, 1});
+        LOG_WARN("ppujobs", "native RenJob resumed in the emulator at 0x%05x (icall target 0x%05x)", pc, miss);
+    }
+};
+FailLog g_faillog;
+
+std::string diff_state(const spu::SpuThread& a, const spu::SpuThread& b) {
+    std::string out;
+    for (int r = 0; r < 128 && out.size() < 300; r++) {
+        if (std::memcmp(&a.ctx.gpr[r], &b.ctx.gpr[r], 16) == 0) continue;
+        char t[96];
+        std::snprintf(t, sizeof t, " r%d %08x%08x%08x%08x/%08x%08x%08x%08x", r, a.ctx.gpr[r].u32[3], a.ctx.gpr[r].u32[2], a.ctx.gpr[r].u32[1], a.ctx.gpr[r].u32[0], b.ctx.gpr[r].u32[3],
+                      b.ctx.gpr[r].u32[2], b.ctx.gpr[r].u32[1], b.ctx.gpr[r].u32[0]);
+        out += t;
+    }
+    uint32_t lines = 0, first = 0;
+    for (uint32_t q = 0; q < spu::LS_SIZE; q += 128) {
+        if (std::memcmp(a.ls + q, b.ls + q, 128) == 0) continue;
+        if (!lines) first = q;
+        lines++;
+    }
+    if (lines) {
+        char t[80];
+        std::snprintf(t, sizeof t, " ls lines %u first 0x%05x", lines, first);
+        out += t;
+    }
+    if (a.ctx.pc != b.ctx.pc) out += " pc " + std::to_string(a.ctx.pc) + "/" + std::to_string(b.ctx.pc);
+    return out;
+}
+
+void verify_native(Exec& x) {
+    if (!x.shadow) {
+        x.shadow = std::make_unique<spu::SpuThread>();
+        x.shadow->id = 0x7f000000u | x.index;
+        x.shadow->slot = 40 + x.index;
+        x.shadow->name = "ppujob verify";
+        x.shadow->job_mode = true;
+        x.shadow->job_stop = kJobRet;
+        x.shadow->job_next = shadow_next;
+        x.shadow->job_trap = trap;
+    }
+    spu::SpuThread& s = *x.shadow;
+    std::memcpy(s.ls, x.start_ls.data(), spu::LS_SIZE);
+    s.mark_all_ls();
+    std::memcpy(s.ctx.gpr, x.ref_ctx_start.gpr, sizeof s.ctx.gpr);
+    setup_job(s, x.cur, x.index);
+    Replayer rp(s, x.rec->ev, *x.t);
+    SpuHostChan ch(rp, s);
+    s.stop_flag.store(false);
+    renjob::WholeResult r;
+    bool can = whole_ok(s, x.cur);
+    if (can) r = renjob::run_whole(s.ls, s.ctx, ch);
+    if (r.done) s.ctx.pc = kJobRet;
+    bool resumed = false;
+    if (!r.done && !s.ctx.halted && rp.error.empty()) {
+        if (can) s.ctx.pc = r.fail_pc;
+        emulate_rest(s, &rp);
+        resumed = true;
+    }
+    s.stop_flag.store(false);
+    if (rp.error.empty() && rp.pos != x.rec->ev.size()) rp.error = "native consumed " + std::to_string(rp.pos) + " of " + std::to_string(x.rec->ev.size()) + " channel ops";
+    g_vstats.runs[0].fetch_add(1);
+    g_stats.verified.fetch_add(1);
+    std::string sd = diff_state(s, *x.t);
+    if (!sd.empty()) g_stats.state_diff.fetch_add(1);
+    static std::atomic<int> logged{0};
+    if (!rp.error.empty()) {
+        g_vstats.bad[0].fetch_add(1);
+        g_stats.mismatches.fetch_add(1);
+        if (logged.fetch_add(1) < 30) LOG_ERROR("ppujobs", "native verify MISMATCH job cmd 0x%08x (resumed %d at 0x%05x): %s;%s", x.cur.cmd_ea, resumed ? 1 : 0, r.fail_pc, rp.error.c_str(), sd.c_str());
+    } else if (logged.load() < 40) {
+        logged.fetch_add(1);
+        LOG_INFO("ppujobs", "native verify ok job cmd 0x%08x: %zu channel ops, %u outputs, %u bytes, resumed %d, state%s", x.cur.cmd_ea, x.rec->ev.size(), rp.puts, rp.put_bytes, resumed ? 1 : 0, sd.empty() ? " identical" : sd.c_str());
+    }
+}
+
+uint64_t thread_cycles() {
+    ULONG64 c = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &c);
+    return c;
+}
+
+void run_native_body(Exec& x, bool emu_only);
+
+void run_native_job(Exec& x) {
+    spu::SpuThread& t = *x.t;
+    if (x.verify_this) {
+        emulate_rest(t, x.rec.get());
+        verify_native(x);
+        x.verify_this = false;
+        return;
+    }
+    static std::atomic<uint64_t> seq{0};
+    bool emu = cfg().ab && (seq.fetch_add(1, std::memory_order_relaxed) & 1);
+    uint64_t t0 = __rdtsc(), c0 = thread_cycles();
+    run_native_body(x, emu);
+    uint64_t t1 = __rdtsc(), c1 = thread_cycles();
+    if (emu) {
+        g_stats.e_jobs.fetch_add(1, std::memory_order_relaxed);
+        g_stats.e_tsc.fetch_add(t1 - t0, std::memory_order_relaxed);
+        g_stats.e_cpu.fetch_add(c1 - c0, std::memory_order_relaxed);
+    } else {
+        g_stats.n_jobs.fetch_add(1, std::memory_order_relaxed);
+        g_stats.n_tsc.fetch_add(t1 - t0, std::memory_order_relaxed);
+        g_stats.n_cpu.fetch_add(c1 - c0, std::memory_order_relaxed);
+    }
+}
+
+void run_native_body(Exec& x, bool emu_only) {
+    spu::SpuThread& t = *x.t;
+    if (!emu_only && whole_ok(t, x.cur)) {
+        uint64_t c0 = __rdtsc();
+        renjob::WholeResult r;
+        if (cfg().spu_host) {
+            SpuHostChan h(t, t);
+            r = renjob::run_whole(t.ls, t.ctx, h);
+        } else {
+            FastHost h(t);
+            r = renjob::run_whole(t.ls, t.ctx, h);
+            if (h.rmw) g_stats.rmw_puts.fetch_add(h.rmw, std::memory_order_relaxed);
+            if (h.slow) g_stats.slow_dma.fetch_add(h.slow, std::memory_order_relaxed);
+            g_dstats.wr.fetch_add(h.n_wr, std::memory_order_relaxed);
+            g_dstats.rd.fetch_add(h.n_rd, std::memory_order_relaxed);
+            g_dstats.get.fetch_add(h.n_get, std::memory_order_relaxed);
+            g_dstats.put.fetch_add(h.n_put, std::memory_order_relaxed);
+            g_dstats.bget.fetch_add(h.b_get, std::memory_order_relaxed);
+            g_dstats.bput.fetch_add(h.b_put, std::memory_order_relaxed);
+        }
+        g_stats.native_cycles.fetch_add(__rdtsc() - c0, std::memory_order_relaxed);
+        if (r.done) {
+            g_stats.native_done.fetch_add(1, std::memory_order_relaxed);
+            t.ctx.pc = kJobRet;
+            return;
+        }
+        g_stats.native_resumed.fetch_add(1, std::memory_order_relaxed);
+        g_faillog.note(r.fail_pc, r.icall_miss);
+        t.ctx.pc = r.fail_pc;
+    }
+    emulate_rest(t, nullptr);
 }
 
 std::unique_ptr<Exec> make_exec(uint32_t index, bool helper) {
@@ -660,7 +1046,7 @@ std::unique_ptr<Exec> make_exec(uint32_t index, bool helper) {
     t.name = helper ? "ppujob helper" : "ppujob worker";
     t.job_mode = true;
     t.job_stop = kJobRet;
-    t.job_next = next_cb;
+    t.job_next = cfg().native ? single_next : next_cb;
     t.job_trap = trap;
     t.job_user = x.get();
     t.ctx.pc = kJobRet;
@@ -679,7 +1065,15 @@ void worker_main(int k) {
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
         crash::profile_thread(h, "ppujob 0");
     }
+    if (cfg().worker_prio_set) SetThreadPriority(GetCurrentThread(), cfg().worker_prio);
     auto x = make_exec(static_cast<uint32_t>(k), false);
+    if (cfg().native) {
+        while (fetch(*x, true)) {
+            run_native_job(*x);
+            finish(*x);
+        }
+        return;
+    }
     x->t->ctx.pc = kJobRet;
     x->t->exec();
 }
@@ -713,6 +1107,30 @@ void stats_thread() {
         lwc = wc;
         lcap = cap;
         lfb = fb;
+        if (cfg().native) {
+            static uint64_t lnd = 0, lnr = 0, lnc = 0, lsd = 0, lrmw = 0, lslow = 0;
+            uint64_t nd = g_stats.native_done.load(), nr = g_stats.native_resumed.load(), nc = g_stats.native_cycles.load(), sd = g_stats.state_diff.load(), rmw = g_stats.rmw_puts.load(), sl = g_stats.slow_dma.load();
+            LOG_INFO("ppujobs", "5s native: %llu whole, %llu resumed, %.1f us/job native, state diffs %llu, rmw puts %llu, slow dma %llu", static_cast<unsigned long long>(nd - lnd), static_cast<unsigned long long>(nr - lnr),
+                     nd - lnd ? double(nc - lnc) / hz * 1e6 / double(nd - lnd) : 0.0, static_cast<unsigned long long>(sd - lsd), static_cast<unsigned long long>(rmw - lrmw), static_cast<unsigned long long>(sl - lslow));
+            static uint64_t l[6] = {};
+            uint64_t v[6] = {g_stats.n_jobs.load(), g_stats.n_tsc.load(), g_stats.n_cpu.load(), g_stats.e_jobs.load(), g_stats.e_tsc.load(), g_stats.e_cpu.load()};
+            uint64_t dn = v[0] - l[0], de = v[3] - l[3];
+            LOG_INFO("ppujobs", "5s cost: native %llu jobs %.1f us wall %.1f us cpu; emulated %llu jobs %.1f us wall %.1f us cpu", static_cast<unsigned long long>(dn), dn ? double(v[1] - l[1]) / hz * 1e6 / double(dn) : 0.0,
+                     dn ? double(v[2] - l[2]) / hz * 1e6 / double(dn) : 0.0, static_cast<unsigned long long>(de), de ? double(v[4] - l[4]) / hz * 1e6 / double(de) : 0.0, de ? double(v[5] - l[5]) / hz * 1e6 / double(de) : 0.0);
+            for (int k = 0; k < 6; k++) l[k] = v[k];
+            static uint64_t ld[6] = {};
+            uint64_t dv[6] = {g_dstats.wr.load(), g_dstats.rd.load(), g_dstats.get.load(), g_dstats.put.load(), g_dstats.bget.load(), g_dstats.bput.load()};
+            double jn = double(nd - lnd ? nd - lnd : 1);
+            LOG_INFO("ppujobs", "5s dma per native job: wrch %.0f rdch %.0f, %.0f GETs %.0f bytes, %.0f PUTs %.0f bytes", double(dv[0] - ld[0]) / jn, double(dv[1] - ld[1]) / jn, double(dv[2] - ld[2]) / jn, double(dv[4] - ld[4]) / jn, double(dv[3] - ld[3]) / jn,
+                     double(dv[5] - ld[5]) / jn);
+            for (int k = 0; k < 6; k++) ld[k] = dv[k];
+            lnd = nd;
+            lnr = nr;
+            lnc = nc;
+            lsd = sd;
+            lrmw = rmw;
+            lslow = sl;
+        }
         if (cfg().verify) {
             std::string v;
             for (int k = 0; k < 16; k++) {
@@ -729,7 +1147,7 @@ void stats_thread() {
 void start_once() {
     static std::once_flag once;
     std::call_once(once, [] {
-        LOG_INFO("ppujobs", "PPU-level job execution on: %d workers, waiter helps %d, verify every %u, modules %zu", cfg().threads, cfg().help ? 1 : 0, cfg().verify, cfg().mods.size());
+        LOG_INFO("ppujobs", "PPU-level job execution on: %d workers, waiter helps %d, verify every %u, modules %zu, native %d%s", cfg().threads, cfg().help ? 1 : 0, cfg().verify, cfg().mods.size(), cfg().native ? 1 : 0, cfg().spu_host ? " (spu host)" : "");
         for (int k = 0; k < cfg().threads; k++) std::thread(worker_main, k).detach();
         std::thread(stats_thread).detach();
     });
@@ -823,9 +1241,16 @@ bool on_wait(ppu::Context& ctx) {
         }
         unsigned csr = _mm_getcsr();
         _mm_setcsr((csr & ~0x6000u) | 0x6000u | 0x8040u);
-        while (ls->pending.load(std::memory_order_acquire) > 0 && g_queued.load(std::memory_order_relaxed)) {
-            helper->t->ctx.pc = kJobRet;
-            helper->t->exec();
+        if (cfg().native) {
+            while (ls->pending.load(std::memory_order_acquire) > 0 && fetch(*helper, false)) {
+                run_native_job(*helper);
+                finish(*helper);
+            }
+        } else {
+            while (ls->pending.load(std::memory_order_acquire) > 0 && g_queued.load(std::memory_order_relaxed)) {
+                helper->t->ctx.pc = kJobRet;
+                helper->t->exec();
+            }
         }
         _mm_setcsr(csr);
     }

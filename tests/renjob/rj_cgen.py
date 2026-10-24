@@ -21,6 +21,10 @@ OPS_NS = "renjob::opz"
 ROOTS_MACRO = "RJ_ROOTS"
 ICALLS = {}
 RECURSION_LIMIT = 0
+WHOLE = False
+WHOLE_ROOTS = (0x14cf8, 0x052c8, 0x13310, 0x14ae0, 0x14800, 0x05830)
+WHOLE_MULTI = {0x14cf8: (0x14cf8, 0x14da4)}
+PM_CALLS = {0x017b8: "pm_gettag(R, ls, ctl);", 0x017c0: "pm_releasetag(R, ls, ctl);", 0x017e0: ""}
 LOOP_BUDGET = False
 REC_EDGES = set()
 PC_COUNTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pc_counts.txt")
@@ -111,6 +115,14 @@ class Func:
         self.has_fail = False
 
 
+def ie_idiom(pc):
+    d = decode(pc)
+    if d["op"] not in ("bi", "biz", "binz", "bihz", "bihnz") or d["ra"] == 0:
+        return False
+    a, b = decode(pc - 8), decode(pc - 4)
+    return a["op"] == "brsl" and a["rt"] == d["ra"] and ((pc - 8 + a["imm"] * 4) & 0x3FFFC) == pc - 4 and b["op"] == "ai" and b["rt"] == d["ra"] and b["ra"] == d["ra"] and b["imm"] == 8
+
+
 def discover(entry, known_entries, stops=frozenset(), entries=None):
     f = Func(entry)
     f.exits = set()
@@ -129,6 +141,9 @@ def discover(entry, known_entries, stops=frozenset(), entries=None):
             f.insns[pc] = d
             op = d["op"]
             nxt = pc + 4
+            if WHOLE and ie_idiom(pc):
+                pc = nxt
+                continue
             if op == "br":
                 t = (pc + d["imm"] * 4) & 0x3FFFC
                 if t in known_entries and t != entry:
@@ -484,7 +499,26 @@ def emit_func(f, out):
         s = None
         if op in SKIP:
             continue
-        if op in FAILOPS:
+        if WHOLE and ie_idiom(pc):
+            fl = (d["rb"] >> 4) & 3
+            act = "*ctl.ie = true;" if fl == 1 else "*ctl.ie = false;" if fl == 2 else ""
+            if op == "bi":
+                s = act
+            else:
+                cond = {"biz": "pref(R[%d]) == 0", "binz": "pref(R[%d]) != 0", "bihz": "hw6(R[%d]) == 0", "bihnz": "hw6(R[%d]) != 0"}[op] % rt
+                s = "if (%s) { %s }" % (cond, act) if act else ""
+            if s:
+                out.append("    %s" % re.sub(r"R\[(\d+)\]", lambda m: "r" + m.group(1), s))
+            continue
+        if WHOLE and op == "rdch":
+            s = "R[%d] = pref_only(ctl.host->rd(%d)); if (__builtin_expect(ctl.host->abort, 0)) FAIL(@PC@);" % (rt, ra)
+        elif WHOLE and op == "rchcnt":
+            s = "R[%d] = pref_only(ctl.host->cnt(%d));" % (rt, ra)
+        elif WHOLE and op == "wrch":
+            s = "ctl.host->wr(%d, pref(R[%d])); if (__builtin_expect(ctl.host->abort, 0)) FAIL(@PC@);" % (ra, rt)
+        elif WHOLE and op == "bisl" and d["rb"] & 0x30 == 0 and rt != ra:
+            s = "{ uint32_t it_ = pref(R[%d]); R[%d] = pref_only(0x%x); icall(R, ls, ctl, it_, 0x%05x); if (ctl.out) return; }" % (ra, rt, pc + 4, pc)
+        elif op in FAILOPS:
             s = "FAIL(@PC@);"
         elif op in HALTS:
             s = "if (" + HALTS[op] % d + ") FAIL(@PC@);"
@@ -556,6 +590,8 @@ def emit_func(f, out):
             s = "FAIL(@PC@);"
         elif op == "bi" and pc in getattr(f, "switches", {}):
             s = "switch (pref(R[%d]) & 0x3fffc) { %s default: FAIL(@PC@); }" % (ra, " ".join("case 0x%05x: goto L_%05x;" % (t, t) for t in sorted(set(f.switches[pc]))))
+        elif WHOLE and op == "bi" and ra == 0 and (d["rb"] >> 4) & 3 in (1, 2):
+            s = "*ctl.ie = %s; @RET@" % ("true" if (d["rb"] >> 4) & 3 == 1 else "false")
         elif op == "bi":
             s = "@RET@" if ra == 0 and d["rb"] & 0x30 == 0 else "FAIL(@PC@);"
         elif op in ("biz", "binz", "bihz", "bihnz"):
@@ -669,7 +705,61 @@ def ops_mode(outp, hdr):
     print(len(funcs), "ops")
 
 
+def whole_main(outp, hdr):
+    global WHOLE, EXITS
+    WHOLE = True
+    EXITS = False
+    ns = "renjob::wh"
+    funcs = {}
+    known = set(WHOLE_ROOTS)
+    changed = True
+    while changed:
+        changed = False
+        for e in sorted(known):
+            if e in funcs:
+                continue
+            funcs[e] = discover(e, known, frozenset(), WHOLE_MULTI.get(e))
+            for c in funcs[e].calls | funcs[e].tails:
+                if c not in known:
+                    known.add(c)
+                    changed = True
+    base = os.path.basename(hdr)
+    out = ['#include "%s"' % base, "", "namespace %s {" % ns, "", "#define FAIL(pc) do { ctl.fail = true; ctl.out = true; ctl.fail_pc = pc; return; } while (0)", ""]
+    inline_max = int(os.environ.get("RJ_INLINE_MAX", "120"))
+    for e in sorted(funcs):
+        if e not in WHOLE_ROOTS and len(funcs[e].insns) <= inline_max and not (funcs[e].calls & set(funcs)) - set(INLINE_EXCEPT):
+            SPEC[e] = "static inline __attribute__((always_inline)) "
+    out.append("void icall(V* R, uint8_t* ls, Ctl& ctl, uint32_t t, uint32_t pc);")
+    for e in sorted(funcs):
+        out.append("%svoid f_%05x(V* R, uint8_t* ls, Ctl& ctl%s);" % (SPEC.get(e, ""), e, ", uint32_t entry" if e in WHOLE_MULTI else ""))
+    out.append("")
+    closure(funcs)
+    for e in sorted(funcs):
+        emit_func(funcs[e], out)
+    cases = " ".join("case 0x%05x: f_%05x(R, ls, ctl%s); return;" % (e, e, ", 0x%05x" % e if e in WHOLE_MULTI else "") for e in sorted(funcs) if e not in SPEC)
+    cases += " " + " ".join("case 0x%05x: %s return;" % (t, c) for t, c in sorted(PM_CALLS.items()))
+    out.append("void icall(V* R, uint8_t* ls, Ctl& ctl, uint32_t t, uint32_t pc) { switch (t & 0x3fffc) { %s default: ctl.icall_miss = t; FAIL(pc); } }" % cases)
+    out = [re.sub(r"(?<![A-Za-z0-9_])st\(ls,", "stp(ls,", l) for l in out]
+    out = [re.sub(r"(?<![A-Za-z0-9_])st32\(ls,", "st32p(ls,", l) for l in out]
+    out = [abi(l) for l in out]
+    out += ["#undef FAIL", "", "}"]
+    open(outp, "w", newline="\n").write("\n".join(out) + "\n")
+    h = ["#pragma once", "", '#include "%s"' % OPS_INCLUDE, "", "namespace %s {" % ns, "", "using namespace %s;" % BASE_NS, ""]
+    h.append("void pm_gettag(V* R, uint8_t* ls, Ctl& ctl);")
+    h.append("void pm_releasetag(V* R, uint8_t* ls, Ctl& ctl);")
+    for e in WHOLE_ROOTS:
+        h.append("void f_%05x(V* R, uint8_t* ls, Ctl& ctl%s);" % (e, ", uint32_t entry" if e in WHOLE_MULTI else ""))
+    h.append("inline constexpr uint32_t kWholeFuncs = %d;" % len(funcs))
+    h += ["", "}"]
+    h = [abi(l) for l in h]
+    open(hdr, "w", newline="\n").write("\n".join(h) + "\n")
+    print("whole: %d functions, %d insns, %d with fail" % (len(funcs), sum(len(f.insns) for f in funcs.values()), sum(1 for f in funcs.values() if f.has_fail)))
+
+
 def main():
+    if sys.argv[1] == "whole":
+        whole_main(sys.argv[2], sys.argv[3])
+        return
     if sys.argv[1] == "ops":
         ops_mode(sys.argv[2], sys.argv[3])
         return

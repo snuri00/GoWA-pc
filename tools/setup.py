@@ -19,6 +19,7 @@ GENERATORS = (
     ("edge_softbody", "edge", ["tests/edge/sb_cgen.py", "{gen}/edge/edge_softbody_gen.inc"]),
     ("edge_ovl", "edge", ["tests/edge/ovl_cgen.py", "{gen}/edge/edge_ovl_gen.cpp", "{gen}/edge/edge_ovl_gen.h"]),
     ("renjob", "renjob", ["tests/renjob/rj_cgen.py", "@tests/renjob/roots.txt", "{gen}/renjob/renjob_gen.cpp", "{gen}/renjob/renjob_gen.h"]),
+    ("renjob_whole", "renjob", ["tests/renjob/rj_cgen.py", "whole", "{gen}/renjob/renjob_whole_gen.cpp", "{gen}/renjob/renjob_whole_gen.h"]),
     ("scream", "scream", ["tests/scream/sc_cgen.py", "all"]),
     ("scream_job", "scream", ["tests/scream/sc_job_cgen.py"]),
     ("cloth", "cloth", ["tests/cloth_shadows/cs_cgen.py", "cloth", "gen", "@tests/cloth_shadows/roots_cloth.txt", "{gen}/cloth/cloth_gen.cpp", "{gen}/cloth/cloth_gen.h"]),
