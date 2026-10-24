@@ -6,6 +6,7 @@
 #include "runtime/ppujobs.h"
 #include "runtime/reservation.h"
 #include "runtime/trace.h"
+#include "jobsys/edge_consumer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -587,6 +588,19 @@ void install_ppujobs() {
     }
 }
 
+void install_jobsys_edge() {
+    if (!jsedge::enabled()) return;
+    jsedge::init();
+    Hook*& h = g_hooks[0x41cbdc];
+    if (!h) {
+        h = new Hook;
+        h->addr = 0x41cbdc;
+        h->quiet = true;
+    }
+    h->guard = jsedge::on_wait_previous;
+    ppu::hook_flags[0x41cbdc >> 2] = 1;
+}
+
 void hog_thread(int lp, int on_ms, int off_ms, double from) {
     SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << lp);
     SetThreadDescription(GetCurrentThread(), L"test hog");
@@ -629,6 +643,7 @@ void init() {
     if (!*spec) {
         install_patches();
         install_ppujobs();
+        install_jobsys_edge();
         install_critpath();
         if (!g_hooks.empty()) ppu::hook_impl = impl;
         return;
@@ -690,6 +705,7 @@ void init() {
     }
     install_patches();
     install_ppujobs();
+    install_jobsys_edge();
     install_critpath();
     if (g_hooks.empty()) return;
     ppu::hook_impl = impl;
