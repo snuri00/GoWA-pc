@@ -44,6 +44,7 @@ G.configure(
     ENTRIES=(0x0AD98,),
     TRAMPOLINE=None,
     EXIT_TARGETS=NATIVES,
+    FALLBACK_ENTRIES=NATIVES if os.environ.get("EJ_NO_FALLBACK") is None else frozenset(),
     BLOCK_BUDGET=True,
     IRQ_SLICE=65536,
     NS="pm::gen::ej",

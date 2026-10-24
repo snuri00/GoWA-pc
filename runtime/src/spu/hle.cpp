@@ -40,9 +40,14 @@ void register_function(const Function& f) {
     LOG_INFO("spuhle", "registered native SPU function %s at LS 0x%05x", f.name, f.lsa);
 }
 
-const Function* lookup(const uint8_t* ls, uint32_t pc) {
+const Function* lookup_next(const uint8_t* ls, uint32_t pc, const Function* after) {
+    bool past = after == nullptr;
     for (uint32_t i = g_first[(pc & PC_MASK) >> 2]; i; i = g_next[i - 1]) {
         const Function& f = g_functions[i - 1];
+        if (!past) {
+            past = &f == after;
+            continue;
+        }
         if (f.lsa != pc || pc + f.sig_words * 4 > LS_SIZE) continue;
         bool match = true;
         if (!f.signature) match = code_hash(ls + pc, f.sig_words) == f.sig_hash;
@@ -51,5 +56,7 @@ const Function* lookup(const uint8_t* ls, uint32_t pc) {
     }
     return nullptr;
 }
+
+const Function* lookup(const uint8_t* ls, uint32_t pc) { return lookup_next(ls, pc, nullptr); }
 
 }

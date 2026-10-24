@@ -2,6 +2,7 @@
 #include "spu/context.h"
 #include "hle.h"
 #include "edge/edge_gpu.h"
+#include "edge/edge_adapters.h"
 #ifdef SPU_BENCH_LIVE
 #include "runtime/memory.h"
 #include "thread.h"
@@ -857,9 +858,10 @@ Result run(State& s, const Capture& cap, bool regions) {
             g_cur_job->disp++;
             jp_top = __rdtsc();
         }
-        if (g_hle && spu::hle::any_at(s.c.pc)) {
-            const spu::hle::Function* f = hle_find(s.c.pc);
-            if (f && f->host_handler) {
+        if (g_hle && (spu::hle::any_at(s.c.pc) || spu::hle::dyn_at(s.c.pc))) {
+            const spu::hle::Function* f = spu::hle::any_at(s.c.pc) ? hle_find(s.c.pc) : nullptr;
+            if (!f && spu::hle::dyn_at(s.c.pc)) f = spu::hle::lookup_dyn(s.ls, s.c.pc);
+            auto try_host = [&](const spu::hle::Function* f) -> bool {
                 if (cap.insns - n > g_host_budget + 200000) {
                     uint32_t pc0 = s.c.pc;
                     uint64_t hb = g_host_budget;
@@ -900,10 +902,14 @@ Result run(State& s, const Capture& cap, bool regions) {
                         g_hle_insns += k;
                         s.c.irq_check = false;
                         if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value == n) host.next(5, 0, uint32_t(n), true);
-                        continue;
+                        return true;
                     }
                     s.c.pc = pc0;
                 }
+                return false;
+            };
+            if (f && f->host_handler) {
+                if (try_host(f)) continue;
                 f = nullptr;
             }
             if (f) {
@@ -930,6 +936,12 @@ Result run(State& s, const Capture& cap, bool regions) {
                 }
                 if (!g_have_counts) QueryThreadCycleTime(GetCurrentThread(), &x1);
                 excluded += x1 - x0;
+                const spu::hle::Function* fb = nullptr;
+                if (!iso_ok) {
+                    fb = spu::hle::lookup_next(s.ls, s.c.pc, f);
+                    if (fb && !fb->host_handler) fb = nullptr;
+                }
+                if (fb && try_host(fb)) continue;
                 if (iso_ok && n + k < cap.insns) {
                     if (g_js_on) g_phase = js_base | PH_NATIVE;
                     uint64_t h0 = __rdtsc();
@@ -981,6 +993,8 @@ Result run(State& s, const Capture& cap, bool regions) {
             slot.b = b;
             slot.valid = b ? e : 0;
         }
+        static const uint32_t noaot_lo = std::getenv("GOWA_BENCH_NOAOT_EDGE") ? 0x10c80u : 0u, noaot_hi = noaot_lo ? 0x29000u : 0u;
+        if (b && s.c.pc >= noaot_lo && s.c.pc < noaot_hi && edge::image_loaded(s.ls)) b = nullptr;
         r.dispatches++;
         if (!b) {
             uint64_t i0 = g_jobprof_rec ? __rdtsc() : 0;
@@ -1091,6 +1105,7 @@ int main(int argc, char** argv) {
     bool regions = true;
     bool live = false;
     int live_mode = 3;
+    std::string live_what = "direct";
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -1104,6 +1119,7 @@ int main(int argc, char** argv) {
         else if (a == "--hle-profile") g_hle = g_hle_profile = true;
         else if (a == "--jobprof") g_jobprof = true;
         else if (a == "--live") live = true;
+        else if (a == "--live-what" && i + 1 < argc) live_what = argv[++i];
         else if (a == "--live-mode" && i + 1 < argc) live_mode = std::atoi(argv[++i]);
         else if (a == "--jobsample") g_jobsample = true;
         else if (a == "--pmtrace" && i + 1 < argc) g_pmtrace = std::fopen(argv[++i], "w");
@@ -1166,7 +1182,8 @@ int main(int argc, char** argv) {
                 uint8_t* own = t->ls;
                 t->ls = s.ls;
                 g_live_thread = t.get();
-                spu::g_edge_direct = mode ? live_mode : 0;
+                spu::g_edge_direct = live_what == "direct" && mode ? live_mode : 0;
+                if (live_what == "ovl") spu::hle::g_dyn_on = mode != 0;
                 uint64_t hits0 = spu::g_edge_merge_hits.load();
                 g_live_mismatch = 0;
                 g_live_first.clear();
@@ -1196,7 +1213,8 @@ int main(int argc, char** argv) {
                 uint8_t* own = t->ls;
                 t->ls = s.ls;
                 g_live_thread = t.get();
-                spu::g_edge_direct = mode ? live_mode : 0;
+                spu::g_edge_direct = live_what == "direct" && mode ? live_mode : 0;
+                if (live_what == "ovl") spu::hle::g_dyn_on = mode != 0;
                 g_count_pos = 0;
                 Result r = run(s, cap, regions);
                 if (std::getenv("SPU_LIVE_VERBOSE")) std::printf("  rep %d mode %d cycles %llu\n", k, mode, static_cast<unsigned long long>(r.cycles));
