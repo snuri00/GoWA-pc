@@ -17,6 +17,8 @@ JOBS = (
     ("meshhier", "mh", 0x78B380, 0x8130, None, ()),
     ("shadows", "sh", 0x79C400, 0x9850, None, ()),
     ("anim", "an", 0x84BE40, 0xAA70, None, ()),
+    ("scream_mp3", "sm", 0x7E1C00, 0x1C0A0, "scream", ()),
+    ("scream_aux", "sa", 0x7BFC80, 0x20BC0, "scream", ()),
 )
 
 PM_API = (0x16F0, 0x2FD8, 0x1760, 0x17B8, 0x17C0, 0x17E0, 0x1AF0, 0x1B10, 0x1A90)
@@ -72,18 +74,37 @@ def extra_icalls(short, lo, hi):
     return out
 
 
+def data_targets(data, ea, size, hi):
+    out = set()
+    for off in range(0x30, size, 4):
+        v = u32(data, ea + off)
+        for t in (v, v + 0x4000):
+            if 0x4030 <= t < hi and not t & 3 and D.dis(u32(data, ea + t - 0x4000), t).split()[0] not in ("invalid", "stop", "lnop", "nop"):
+                out.add(t)
+    return out
+
+
 def generate(job, outdir):
     name, short, ea, size, ic, extra = job
     data = G.data
+    scream = ic == "scream"
+    if scream:
+        ic = None
+        sys.path.insert(0, os.path.join(ROOT, "tests", "scream"))
+        import sc_indirect
+        G.RR3.update({"dfa", "dfs", "dfm"})
+        G.RR2.update({"fesd", "frds"})
+        sc_indirect.install()
     entry, tail, ctors = crt(data, ea)
     lo, hi = 0x4030, 0x4000 + size
-    found = (set(ctors) | icalls(ic, lo, hi) | extra_icalls(short, lo, hi) | set(extra)) - {entry}
+    found = (set(ctors) | icalls(ic, lo, hi) | extra_icalls(short, lo, hi) | set(extra) | data_targets(data, ea, size, hi)) - {entry}
     roots = [entry] + sorted(r for r in found if lo <= r < hi) + list(PM_API)
     pc_counts = os.path.join(ROOT, "tests", "meshprep", "pc_counts_%s.txt" % ic) if ic else None
-    G.configure(IMG_EA=ea, IMG_SIZE=size, CODE_END=hi, ENTRY_ROOTS=(entry,), INLINE_EXCEPT=(), OPS_INCLUDE="renjob_ops.h", BASE_NS="renjob::xo",
+    G.configure(IMG_EA=ea, IMG_SIZE=size, CODE_END=hi, ENTRY_ROOTS=(entry,), INLINE_EXCEPT=(), OPS_INCLUDE="../scream/scream_ops.h" if scream else "renjob_ops.h", BASE_NS="renjob::xo",
                 PC_COUNTS_PATH=pc_counts, KERNELS={}, ICALLS={}, RECURSION_LIMIT=0, LOOP_BUDGET=False,
                 WHOLE_ROOTS=tuple(roots), WHOLE_MULTI={entry: (entry, tail)}, WHOLE_NS="renjob::wj_%s" % short, WHOLE_PM=True, WHOLE_RETCHECK=True,
                 WHOLE_HDR_EXTRA=('#include "jobs_flags.h"',), WHOLE_PM_DECLS=False,
+                WHOLE_ICALL_DEFAULT="{ ctl.icall_miss = t; uint32_t r_ = ::wj::ext_call(R, ls, t & 0x3fffc, pc + 4); if (r_ == pc + 4) return; ctl.fail = true; ctl.out = true; ctl.fail_pc = r_; return; }",
                 PM_CALLS={0x017E0: "if (::wj::t_lnj) { f_017e0(R, ls, ctl); if (ctl.out) return; }"})
     G.PC_COUNTS = None
     G.NOCALL.clear()
@@ -109,10 +130,16 @@ def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["GOWA_GEN_DIR"], "jwhole")
     want = set(sys.argv[2:])
     os.makedirs(outdir, exist_ok=True)
+    if len(want) == 1 and os.environ.get("WJ_ONE") == "1":
+        for job in JOBS:
+            if job[0] in want or job[1] in want:
+                generate(job, outdir)
+        return
+    import subprocess
     for job in JOBS:
         if want and job[0] not in want and job[1] not in want:
             continue
-        generate(job, outdir)
+        subprocess.run([sys.executable, os.path.abspath(__file__), outdir, job[1]], env=dict(os.environ, WJ_ONE="1"), check=True)
         print(job[0], file=sys.stderr)
 
 

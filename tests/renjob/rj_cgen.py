@@ -31,6 +31,7 @@ WHOLE_PM = False
 WHOLE_RETCHECK = False
 WHOLE_HDR_EXTRA = ()
 WHOLE_PM_DECLS = True
+WHOLE_ICALL_DEFAULT = "ctl.icall_miss = t; FAIL(pc);"
 PM_EA = 0x7A7B00
 PM_LS = 0xA00
 PM_SIZE = 0x2FF0
@@ -662,7 +663,8 @@ def emit_func(f, out):
                 continue
         s = s.replace("@RET@", "{ " + spill + " return; }")
         s = re.sub(r"@CALL([0-9a-f]+)@", lambda m: rec_call(f, pc, rt, m.group(1)) if (f.entry, int(m.group(1), 16)) in REC_EDGES and rt == 0 else "{ " + call_spill(int(m.group(1), 16), False) + " f_" + m.group(1) + "(R, ls, ctl); if (ctl.out) return; " + call_fill(int(m.group(1), 16)) + (" " + retcheck("@RT@", pc + 4) if WHOLE_RETCHECK and op in ("brsl", "bisl") else "") + " }", s)
-        s = s.replace("@RT@", "r%d" % rt)
+        if "@RT@" in s:
+            s = s.replace("@RT@", "r%d" % rt)
         s = re.sub(r"@TAIL([0-9a-f]+)@", lambda m: "{ " + call_spill(int(m.group(1), 16), True) + " f_" + m.group(1) + "(R, ls, ctl); return; }", s)
         out.append("    %s" % s)
     for x in sorted(f.exits):
@@ -781,7 +783,7 @@ def whole_main(outp, hdr):
         emit_func(funcs[e], out)
     cases = " ".join("case 0x%05x: f_%05x(R, ls, ctl%s); return;" % (e, e, ", 0x%05x" % e if e in WHOLE_MULTI else "") for e in sorted(funcs) if e not in SPEC and e not in PM_CALLS)
     cases += " " + " ".join("case 0x%05x: %s return;" % (t, c) for t, c in sorted(PM_CALLS.items()))
-    out.append("void icall(V* R, uint8_t* ls, Ctl& ctl, uint32_t t, uint32_t pc) { switch (t & 0x3fffc) { %s default: ctl.icall_miss = t; FAIL(pc); } }" % cases)
+    out.append("void icall(V* R, uint8_t* ls, Ctl& ctl, uint32_t t, uint32_t pc) { switch (t & 0x3fffc) { %s default: %s } }" % (cases, WHOLE_ICALL_DEFAULT))
     out = [re.sub(r"(?<![A-Za-z0-9_])st\(ls,", "stp(ls,", l) for l in out]
     out = [re.sub(r"(?<![A-Za-z0-9_])st32\(ls,", "st32p(ls,", l) for l in out]
     out = [abi(l) for l in out]

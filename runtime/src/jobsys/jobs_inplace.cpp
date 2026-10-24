@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -198,7 +199,11 @@ void verify_run(int job, spu::Context& c, spu::Host& h) {
     Replay rp(rec.ev, ls1.get());
     Result r = run(job, ls1.get(), c1, rp, true);
     std::string err = rp.error;
-    if (err.empty() && !r.done) err = "native did not finish, fail pc 0x" + std::to_string(r.fail_pc);
+    if (err.empty() && !r.done) {
+        char b[64];
+        std::snprintf(b, sizeof b, "native did not finish, fail pc 0x%05x", r.fail_pc);
+        err = b;
+    }
     if (err.empty() && rp.pos != rec.ev.size()) err = "native consumed " + std::to_string(rp.pos) + " of " + std::to_string(rec.ev.size()) + " channel ops";
     if (!err.empty()) {
         st.vbad++;
@@ -226,6 +231,21 @@ void verify_run(int job, spu::Context& c, spu::Host& h) {
     }
 }
 
+std::mutex g_fail_m;
+uint32_t g_fail_seen[kJobCount][16][2];
+uint32_t g_fail_n[kJobCount];
+
+void note_fail(int job, uint32_t pc, uint32_t miss) {
+    std::lock_guard lk(g_fail_m);
+    for (uint32_t i = 0; i < g_fail_n[job]; i++)
+        if (g_fail_seen[job][i][0] == pc && g_fail_seen[job][i][1] == miss) return;
+    if (g_fail_n[job] >= 16) return;
+    g_fail_seen[job][g_fail_n[job]][0] = pc;
+    g_fail_seen[job][g_fail_n[job]][1] = miss;
+    g_fail_n[job]++;
+    LOG_INFO("wj", "%s: new resume point 0x%05x (icall target 0x%05x)", info(job).name, pc, miss);
+}
+
 template <int J>
 bool handler(spu::Context& c, spu::Host& h) {
     if (!g_on[J] || job_in_ls(c.ls) != J) return false;
@@ -237,7 +257,7 @@ bool handler(spu::Context& c, spu::Host& h) {
     }
     uint64_t t0 = __rdtsc();
     SpuChan ch(h, c);
-    Result r = run(J, c.ls, c, ch, true);
+    Result r = run(J, c.ls, c, ch, true, &h);
     st.cycles += __rdtsc() - t0;
     c.executed = 4096;
     if (r.done) {
@@ -247,14 +267,15 @@ bool handler(spu::Context& c, spu::Host& h) {
         st.resumed++;
         st.last_fail.store(r.fail_pc, std::memory_order_relaxed);
         if (r.icall_miss) st.last_miss.store(r.icall_miss, std::memory_order_relaxed);
+        note_fail(J, r.fail_pc, r.icall_miss);
         c.pc = r.fail_pc & spu::PC_MASK;
     }
     return true;
 }
 
 using HostFn = bool (*)(spu::Context&, spu::Host&);
-const HostFn kHandlers[kJobCount] = {handler<0>, handler<1>, handler<2>, handler<3>, handler<4>, handler<5>, handler<6>};
-const char* const kShort[kJobCount] = {"pb", "gv", "sp", "mp", "mh", "sh", "an"};
+const HostFn kHandlers[kJobCount] = {handler<0>, handler<1>, handler<2>, handler<3>, handler<4>, handler<5>, handler<6>, handler<7>, handler<8>};
+const char* const kShort[kJobCount] = {"pb", "gv", "sp", "mp", "mh", "sh", "an", "sm", "sa"};
 
 void stats_thread() {
     for (;;) {
@@ -272,7 +293,8 @@ void stats_thread() {
                           (unsigned long long)vs);
             line += b;
         }
-        if (!line.empty()) LOG_INFO("wj", "10s:%s", line.c_str());
+        uint64_t steps = 0, calls = ext_stats(steps);
+        if (!line.empty()) LOG_INFO("wj", "10s:%s ext %llu calls %llu steps", line.c_str(), (unsigned long long)calls, (unsigned long long)steps);
     }
 }
 
