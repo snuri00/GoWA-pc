@@ -1,4 +1,5 @@
 #include "runtime/placement.h"
+#include "runtime/ppujobs.h"
 #include "spu/aot.h"
 #include "hle.h"
 #include "edge/edge_gpu.h"
@@ -1544,6 +1545,7 @@ void SpuThread::exec() {
     const bool edge_stats = edge::ovl::stats_on();
     bool interp_edge = false;
     uint64_t interp_edge_n = 0;
+    const bool donor = !job_mode && ppujobs::enabled() && ppujobs::donor_slot() >= 0 && uint32_t(ppujobs::donor_slot()) == slot;
     for (;;) {
         if (interp_edge_n >= 4096) {
             edge::ovl::count(edge::ovl::kInterpInsns, interp_edge_n);
@@ -1558,6 +1560,7 @@ void SpuThread::exec() {
                 ctx.pc = __builtin_bswap32(exit_pc) & PC_MASK;
             }
             if (cp_on) critpath::spu_block(cp, slot, ls, cp_src, ctx.pc);
+            if (donor && ppujobs::g_queued.load(std::memory_order_relaxed)) ppujobs::donate();
             if (job_mode && ctx.pc < 0x4000) {
                 if (ctx.pc == job_stop) {
                     exec_insns += n;

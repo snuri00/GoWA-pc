@@ -38,6 +38,8 @@ void profile_thread(void* native, const char* name);
 
 namespace ppujobs {
 
+std::atomic<uint32_t> g_queued{0};
+
 namespace {
 
 constexpr uint32_t kJobRet = 0x3368;
@@ -63,6 +65,8 @@ struct Config {
     bool spu_host = false;
     bool ab = false;
     int worker_prio = 0;
+    uint32_t duty_us = 0;
+    int donor = -1;
     bool worker_prio_set = false;
 };
 
@@ -102,6 +106,8 @@ const Config& cfg() {
             c.worker_prio = std::atoi(p);
             c.worker_prio_set = true;
         }
+        if (const char* d = std::getenv("GOWA_PPU_JOBS_DONOR")) c.donor = std::atoi(d);
+        if (const char* d = std::getenv("GOWA_PPU_JOBS_DUTY_US")) c.duty_us = static_cast<uint32_t>(std::strtoul(d, nullptr, 0));
         return c;
     }();
     return c;
@@ -189,6 +195,7 @@ bool parse(Job& j) {
 struct Stats {
     std::atomic<uint64_t> jobs{0}, helped{0}, cycles{0}, cpu{0}, insns{0}, waits{0}, wait_cycles{0}, captured{0}, fallback{0}, verified{0}, mismatches{0};
     std::atomic<uint64_t> native_done{0}, native_resumed{0}, native_cycles{0}, state_diff{0}, rmw_puts{0}, slow_dma{0};
+    std::atomic<uint64_t> yields{0}, donated{0};
     std::atomic<uint64_t> n_jobs{0}, n_tsc{0}, n_cpu{0}, e_jobs{0}, e_tsc{0}, e_cpu{0};
 };
 Stats g_stats;
@@ -196,7 +203,6 @@ Stats g_stats;
 std::mutex g_qm;
 std::condition_variable g_qcv;
 std::deque<Job> g_queue;
-std::atomic<uint32_t> g_queued{0};
 
 void update_line(uint32_t ea, bool (*fn)(uint8_t* line, uint32_t off, void* user), void* user) {
     uint32_t line = ea & ~127u;
@@ -1300,11 +1306,28 @@ void worker_main(int k) {
     if (cfg().worker_prio_set) SetThreadPriority(GetCurrentThread(), cfg().worker_prio);
     auto x = make_exec(static_cast<uint32_t>(k), false);
     if (cfg().native) {
-        while (fetch(*x, true)) {
+        uint64_t cap = 0;
+        if (cfg().duty_us) {
+            auto c0 = std::chrono::steady_clock::now();
+            uint64_t t0 = __rdtsc();
+            Sleep(20);
+            double hz = double(__rdtsc() - t0) / std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+            cap = static_cast<uint64_t>(hz * 1e-6 * cfg().duty_us);
+        }
+        uint64_t streak = 0;
+        for (;;) {
+            if (!g_queued.load(std::memory_order_relaxed)) streak = 0;
+            if (!fetch(*x, true)) return;
+            uint64_t now = __rdtsc();
+            if (!streak) streak = now;
             run_native_job(*x);
             finish(*x);
+            if (cap && __rdtsc() - streak > cap) {
+                g_stats.yields.fetch_add(1, std::memory_order_relaxed);
+                Sleep(1);
+                streak = 0;
+            }
         }
-        return;
     }
     x->t->ctx.pc = kJobRet;
     x->t->exec();
@@ -1342,6 +1365,14 @@ void stats_thread() {
         if (cfg().native) {
             static uint64_t lnd = 0, lnr = 0, lnc = 0, lsd = 0, lrmw = 0, lslow = 0;
             uint64_t nd = g_stats.native_done.load(), nr = g_stats.native_resumed.load(), nc = g_stats.native_cycles.load(), sd = g_stats.state_diff.load(), rmw = g_stats.rmw_puts.load(), sl = g_stats.slow_dma.load();
+            static uint64_t lyield = 0;
+            uint64_t yv = g_stats.yields.load();
+            if (cfg().duty_us) LOG_INFO("ppujobs", "5s duty yields %llu", static_cast<unsigned long long>(yv - lyield));
+            static uint64_t ldon = 0;
+            uint64_t dv0 = g_stats.donated.load();
+            if (cfg().donor >= 0) LOG_INFO("ppujobs", "5s donated jobs (run by SPU %d) %llu", cfg().donor, static_cast<unsigned long long>(dv0 - ldon));
+            ldon = dv0;
+            lyield = yv;
             LOG_INFO("ppujobs", "5s native: %llu whole, %llu resumed, %.1f us/job native, state diffs %llu, rmw puts %llu, slow dma %llu", static_cast<unsigned long long>(nd - lnd), static_cast<unsigned long long>(nr - lnr),
                      nd - lnd ? double(nc - lnc) / hz * 1e6 / double(nd - lnd) : 0.0, static_cast<unsigned long long>(sd - lsd), static_cast<unsigned long long>(rmw - lrmw), static_cast<unsigned long long>(sl - lslow));
             static uint64_t l[6] = {};
@@ -1401,6 +1432,18 @@ thread_local Capture t_cap;
 }
 
 bool enabled() { return cfg().on; }
+
+int donor_slot() { return cfg().on && cfg().native ? cfg().donor : -1; }
+
+void donate() {
+    static thread_local std::unique_ptr<Exec> d;
+    if (!d) d = make_exec(30, false);
+    while (fetch(*d, false)) {
+        run_native_job(*d);
+        finish(*d);
+        g_stats.donated.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 bool on_submit(ppu::Context& ctx) {
     if (!cfg().on) return false;
