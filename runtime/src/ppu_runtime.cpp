@@ -67,6 +67,24 @@ Fn find(const char* module, const char* name) {
     return it == registry().end() ? nullptr : it->second;
 }
 
+namespace {
+
+std::map<std::string, Tap>& taps() {
+    static std::map<std::string, Tap> r;
+    return r;
+}
+
+}
+
+TapReg::TapReg(const char* module, const char* name, Tap tap) {
+    taps()[std::string(module) + "::" + name] = tap;
+}
+
+Tap find_tap(const char* module, const char* name) {
+    auto it = taps().find(std::string(module) + "::" + name);
+    return it == taps().end() ? nullptr : it->second;
+}
+
 }
 
 namespace ppu {
@@ -113,6 +131,7 @@ struct ImportSlot {
     hle::Fn hle = nullptr;
     std::atomic<bool> warned{false};
     bool log_args = false;
+    hle::Tap tap = nullptr;
 };
 
 std::vector<ImportSlot>& import_slots() {
@@ -126,6 +145,7 @@ int32_t resolve(uint32_t index, ImportSlot& slot) {
         std::string l = std::string(",") + list + ",";
         if (imp.name && *imp.name && l.find(std::string(",") + imp.name + ",") != std::string::npos) slot.log_args = true;
     }
+    if (imp.name && *imp.name) slot.tap = hle::find_tap(imp.module, imp.name);
     for (uint32_t i = 0; i < image::export_count; i++) {
         const image::ExportEntry& e = image::exports[i];
         if (e.nid == imp.nid && std::strcmp(e.module, imp.module) == 0 && loader::image_loaded(static_cast<int>(e.image))) {
@@ -179,7 +199,17 @@ void call_import(Context& ctx, uint8_t* base, uint32_t index) {
     call_import_body(ctx, base, index, slot, st, imp);
 }
 
+void call_import_inner(Context& ctx, uint8_t* base, uint32_t index, ImportSlot& slot, int32_t st, const image::ImportEntry& imp);
+
 void call_import_body(Context& ctx, uint8_t* base, uint32_t index, ImportSlot& slot, int32_t st, const image::ImportEntry& imp) {
+    if (!slot.tap) return call_import_inner(ctx, base, index, slot, st, imp);
+    uint64_t a[8];
+    for (int i = 0; i < 8; i++) a[i] = ctx.gpr[3 + i];
+    call_import_inner(ctx, base, index, slot, st, imp);
+    slot.tap(a, ctx.gpr[3]);
+}
+
+void call_import_inner(Context& ctx, uint8_t* base, uint32_t index, ImportSlot& slot, int32_t st, const image::ImportEntry& imp) {
     if (slot.log_args) {
         LOG_INFO("import", "%s::%s(0x%llx, 0x%llx, 0x%llx, 0x%llx) lr 0x%llx", imp.module, imp.name, static_cast<unsigned long long>(ctx.gpr[3]),
                  static_cast<unsigned long long>(ctx.gpr[4]), static_cast<unsigned long long>(ctx.gpr[5]), static_cast<unsigned long long>(ctx.gpr[6]),
@@ -200,6 +230,7 @@ void call_import_body(Context& ctx, uint8_t* base, uint32_t index, ImportSlot& s
     if (st == kHle) {
         LOG_TRACE("import", "%s::%s -> HLE", imp.module, imp.name);
         slot.hle(ctx, base);
+        if (slot.log_args) LOG_INFO("import", "%s::%s returned 0x%llx", imp.module, imp.name, static_cast<unsigned long long>(ctx.gpr[3]));
         return;
     }
     if (!slot.warned.exchange(true)) {

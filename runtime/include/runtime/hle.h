@@ -2,6 +2,8 @@
 
 #include "ppu/context.h"
 
+#include <string>
+
 namespace hle {
 
 using Fn = void (*)(ppu::Context& ctx, uint8_t* base);
@@ -11,6 +13,20 @@ struct Reg {
 };
 
 Fn find(const char* module, const char* name);
+
+using Tap = void (*)(const uint64_t* args, uint64_t result);
+
+struct TapReg {
+    TapReg(const char* module, const char* name, Tap tap);
+};
+
+Tap find_tap(const char* module, const char* name);
+
+struct ModuleOverride {
+    ModuleOverride(const char* file, bool (*active)());
+};
+
+bool module_overridden(const std::string& file);
 
 }
 
