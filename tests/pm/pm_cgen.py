@@ -17,6 +17,7 @@ ENTRIES = (0xA00, 0xA2C, 0x3368)
 LOOP_BUDGET = True
 TRAMPOLINE = 0x3FEC0
 EXIT_TARGETS = frozenset()
+FALLBACK_ENTRIES = frozenset()
 BLOCK_BUDGET = False
 IRQ_SLICE = 256
 NS = "pm::gen"
@@ -25,6 +26,7 @@ HEADER_BYTES = 0x40
 EXTRA_ROOTS = ()
 IE_INLINE = False
 DISPATCH_TABLE = False
+DISPATCH_GATE = "spuf::avx2_on()"
 
 RJ.configure(IMG_EA=PM_EA, IMG_LS=PM_LS, IMG_SIZE=PM_SIZE, CODE_END=0x39D8)
 
@@ -72,7 +74,7 @@ def address_taken_static():
             if v & 3 == 0 and in_code(v):
                 out.add(v)
     out |= set(EXTRA_ROOTS)
-    return set(x for x in out if x not in EXIT_TARGETS and in_code(x))
+    return set(x for x in out if x not in EXIT_TARGETS and in_code(x)) | set(x for x in FALLBACK_ENTRIES if in_code(x))
 
 
 def discover():
@@ -83,8 +85,9 @@ def discover():
     work = sorted(roots)
     while work:
         pc = work.pop()
+        start = pc
         while pc not in insns:
-            if not in_code(pc) or pc in EXIT_TARGETS:
+            if not in_code(pc) or (pc in EXIT_TARGETS and not (pc == start and pc in FALLBACK_ENTRIES)):
                 break
             d = D(pc)
             insns[pc] = d
@@ -224,7 +227,7 @@ def emit(out_cpp, out_h):
         for k, l in enumerate(hs):
             if lo <= l < hi:
                 index[(l - lo) // 4] = k + 1
-        o.append("    if (spuf::avx2_on()) {")
+        o.append("    if (%s) {" % DISPATCH_GATE)
         o.append("        static const void* const kEntryLabel[] = {&&ENTRY_DEFAULT, %s};" % ", ".join("&&L_%05x" % l for l in hs))
         o.append("        static const uint16_t kEntryIndex[%d] = {%s};" % (n, ",".join(str(v) for v in index)))
         o.append("        uint32_t ei = (c.pc - 0x%xu) >> 2;" % lo)
@@ -313,19 +316,19 @@ def emit(out_cpp, out_h):
             s = "c.pc = 0x%05x; h.write_channel(%d, pref(r%d)); if (c.halted || c.pc != 0x%05x) XC(%d);" % (nxt, ra, rt, nxt, after)
         elif op in ("br", "bra"):
             t = rel(pc, d) if op == "br" else absolute(d)
-            s = ("goto L_%05x;" % t) if t in insns else ("X(0x%05x, 0);" % t)
+            s = ("goto L_%05x;" % t) if t in insns and t not in EXIT_TARGETS else ("X(0x%05x, 0);" % t)
             fall_ok = False
         elif op == "brasl" and absolute(d) == TRAMPOLINE:
             s = "r%d = pref_only(0x%x); { uint32_t tp = run_trampoline(c, ls, R, cnt, %d); if (!tp) { tgt = pref(r%d) & 0x3fffc; goto DISPATCH; } X(tp, 0); }" % (rt, nxt, rt, rt)
             fall_ok = False
         elif op in ("brsl", "brasl"):
             t = rel(pc, d) if op == "brsl" else absolute(d)
-            s = "r%d = pref_only(0x%x); " % (rt, nxt) + (("goto L_%05x;" % t) if t in insns else ("X(0x%05x, 0);" % t))
+            s = "r%d = pref_only(0x%x); " % (rt, nxt) + (("goto L_%05x;" % t) if t in insns and t not in EXIT_TARGETS else ("X(0x%05x, 0);" % t))
             fall_ok = False
         elif op in BRANCH_COND:
             t = rel(pc, d)
             cond = BRANCH_COND[op] % rt
-            s = "if (%s) %s" % (cond, ("goto L_%05x;" % t) if t in insns else ("X(0x%05x, 0);" % t))
+            s = "if (%s) %s" % (cond, ("goto L_%05x;" % t) if t in insns and t not in EXIT_TARGETS else ("X(0x%05x, 0);" % t))
         elif op in ("bi", "bisl"):
             bits, exits = interrupt_bits(d, "tgt")
             s = "tgt = pref(r%d) & 0x3fffc; " % ra
@@ -347,20 +350,20 @@ def emit(out_cpp, out_h):
         if s:
             o.append("    " + s)
         if fall_ok and i == n - 1:
-            if nxt in insns:
+            if nxt in insns and nxt not in EXIT_TARGETS:
                 o.append("    goto L_%05x;" % nxt)
             else:
                 o.append("    X(0x%05x, 0);" % nxt)
     o.append("DISPATCH:")
     o.append("    if (__builtin_expect(cnt >= lim, 0)) X(tgt, 0);")
-    targets = sorted(set(insns) & lead)
+    targets = sorted((set(insns) & lead) - set(EXIT_TARGETS))
     if DISPATCH_TABLE and targets:
         lo, hi = CODE[0][0], CODE[-1][1]
         n = (hi - lo) // 4
         index = [0] * n
         for k, l in enumerate(targets):
             index[(l - lo) // 4] = k + 1
-        o.append("    if (spuf::avx2_on()) {")
+        o.append("    if (%s) {" % DISPATCH_GATE)
         o.append("        uint32_t di = (tgt - 0x%xu) >> 2;" % lo)
         o.append("        if (di < %du) goto *kDispLabel[kDispIndex[di]];" % n)
         o.append("    }")
@@ -368,7 +371,7 @@ def emit(out_cpp, out_h):
                        "    static const uint16_t kDispIndex[%d] = {%s};" % (n, ",".join(str(v) for v in index))]
         at = o.index("    // DISPATCH_TABLES")
         o[at:at + 1] = disp_tables
-        jump = "{ if (__builtin_expect(cnt >= lim, 0)) X(tgt, 0); if (spuf::avx2_on()) { uint32_t dj = (tgt - 0x%xu) >> 2; if (dj < %du) goto *kDispLabel[kDispIndex[dj]]; } goto DISPATCH; }" % (lo, n)
+        jump = "{ if (__builtin_expect(cnt >= lim, 0)) X(tgt, 0); if (%s) { uint32_t dj = (tgt - 0x%xu) >> 2; if (dj < %du) goto *kDispLabel[kDispIndex[dj]]; } goto DISPATCH; }" % (DISPATCH_GATE, lo, n)
         o = [l.replace("goto DISPATCH;", jump) if "goto DISPATCH;" in l and not l.lstrip().startswith("{ if (__builtin_expect") else l for l in o]
     o.append("    switch (tgt) {")
     for l in targets:

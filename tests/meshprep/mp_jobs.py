@@ -1,7 +1,7 @@
 import os
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-ELF = os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf")
+ELF = (os.environ.get("GOWA_ELF") or os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf"))
 
 JOBS = {
     "meshprep": dict(ea=0x74b100, size=0x4440, short="mp", entry=0x4030, code_end=0x7960),

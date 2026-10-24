@@ -1,6 +1,8 @@
 #include "spu/aot.h"
 #include "spu/context.h"
 #include "hle.h"
+#include "edge/edge_gpu.h"
+#include "edge/edge_adapters.h"
 #ifdef SPU_BENCH_LIVE
 #include "runtime/memory.h"
 #include "thread.h"
@@ -469,7 +471,13 @@ public:
                 uint32_t cmd = value & 0xFF, lsa = g_mfc[0] & 0x3FFFF, ea = g_mfc[2], size = g_mfc[3];
                 bool put = (cmd & 0xF0) == 0x20 || (cmd & 0xF0) == 0x30;
                 std::fprintf(g_dma_log, "%s cmd %02x pc %05x lsa %05x ea %08x size %x", put ? "PUT" : "GET", cmd, s.c.pc, lsa, ea, size);
-                if (put && size && lsa + size <= spu::LS_SIZE && size <= 0x4000) {
+                if ((cmd & 0x04) && cmd < 0x50 && std::getenv("SPU_BENCH_DMA_LIST")) {
+                    uint32_t la = ea & 0x3FFF8;
+                    for (uint32_t i = 0; i + 8 <= size && la + i + 8 <= spu::LS_SIZE; i += 8) {
+                        const uint8_t* e = s.ls + la + i;
+                        std::fprintf(g_dma_log, " elem %08x %x", (uint32_t(e[4]) << 24) | (uint32_t(e[5]) << 16) | (uint32_t(e[6]) << 8) | e[7], ((uint32_t(e[2]) << 8) | e[3]) & 0x7FFF);
+                    }
+                } else if (put && size && lsa + size <= spu::LS_SIZE && size <= 0x4000 && !std::getenv("SPU_BENCH_DMA_LIST")) {
                     std::fprintf(g_dma_log, " data");
                     for (uint32_t i = 0; i < size; i++) std::fprintf(g_dma_log, "%s%02x", (i & 63) ? "" : " ", s.ls[lsa + i]);
                 }
@@ -493,7 +501,7 @@ public:
         if (g_dma_log && ch == 21) {
             uint32_t cmd = value & 0xFF, lsa = g_mfc[0] & 0x3FFFF, size = g_mfc[3];
             bool get = (cmd & 0xF0) == 0x40;
-            if (get && size && size <= 0x4000 && lsa + size <= spu::LS_SIZE) {
+            if (get && size && size <= 0x4000 && lsa + size <= spu::LS_SIZE && !std::getenv("SPU_BENCH_DMA_LIST")) {
                 std::fprintf(g_dma_log, "GETDATA lsa %05x size %x data", lsa, size);
                 for (uint32_t i = 0; i < size; i++) std::fprintf(g_dma_log, "%s%02x", (i & 63) ? "" : " ", s.ls[lsa + i]);
                 std::fprintf(g_dma_log, "\n");
@@ -791,6 +799,26 @@ Result run(State& s, const Capture& cap, bool regions) {
     std::unique_ptr<Replay> host_ptr = make_host(s, cap);
     Replay& host = *host_ptr;
     std::vector<Slot> cache(spu::LS_SIZE / 4);
+    struct HleSlot {
+        const spu::hle::Function* f;
+        uint32_t valid;
+    };
+    static const bool hle_cache_on = [] {
+        const char* e = std::getenv("GOWA_SPU_HLE_CACHE");
+        return !e || e[0] != '0';
+    }();
+    std::vector<HleSlot> hcache(hle_cache_on ? spu::LS_SIZE / 4 : 0, HleSlot{});
+    auto hle_find = [&](uint32_t pc) -> const spu::hle::Function* {
+        if (!hle_cache_on) return spu::hle::lookup(s.ls, pc);
+        HleSlot& hs = hcache[pc >> 2];
+        uint32_t w = spu::hle::max_sig_words(pc);
+        if (hs.valid && s.fresh(pc, w, hs.valid)) return hs.f;
+        uint32_t e = s.epoch.load();
+        const spu::hle::Function* f = spu::hle::lookup(s.ls, pc);
+        hs.f = f;
+        hs.valid = w < 255 ? e : 0;
+        return f;
+    };
     uint64_t n = 0;
     ULONG64 t0 = 0;
     QueryThreadCycleTime(GetCurrentThread(), &t0);
@@ -830,9 +858,10 @@ Result run(State& s, const Capture& cap, bool regions) {
             g_cur_job->disp++;
             jp_top = __rdtsc();
         }
-        if (g_hle && spu::hle::any_at(s.c.pc)) {
-            const spu::hle::Function* f = spu::hle::lookup(s.ls, s.c.pc);
-            if (f && f->host_handler) {
+        if (g_hle && (spu::hle::any_at(s.c.pc) || spu::hle::dyn_at(s.c.pc))) {
+            const spu::hle::Function* f = spu::hle::any_at(s.c.pc) ? hle_find(s.c.pc) : nullptr;
+            if (!f && spu::hle::dyn_at(s.c.pc)) f = spu::hle::lookup_dyn(s.ls, s.c.pc);
+            auto try_host = [&](const spu::hle::Function* f) -> bool {
                 if (cap.insns - n > g_host_budget + 200000) {
                     uint32_t pc0 = s.c.pc;
                     uint64_t hb = g_host_budget;
@@ -873,10 +902,14 @@ Result run(State& s, const Capture& cap, bool regions) {
                         g_hle_insns += k;
                         s.c.irq_check = false;
                         if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value == n) host.next(5, 0, uint32_t(n), true);
-                        continue;
+                        return true;
                     }
                     s.c.pc = pc0;
                 }
+                return false;
+            };
+            if (f && f->host_handler) {
+                if (try_host(f)) continue;
                 f = nullptr;
             }
             if (f) {
@@ -894,13 +927,21 @@ Result run(State& s, const Capture& cap, bool regions) {
                     spu::Context probe = s.c;
                     probe.ls = probe_ls.data();
                     probe.line_epoch = nullptr;
+                    void* gs = edge::gpu::mode() ? edge::gpu::state_save() : nullptr;
                     iso_ok = f->handler(probe);
+                    if (gs) edge::gpu::state_restore(gs);
                     exit_pc = probe.gpr[0].u32[3] & spu::PC_MASK;
                     if (iso_ok) iso_ok = iso_count(s, k, exit_pc, probe.gpr[1].u32[3]);
                     g_counts.push_back(iso_ok && n + k < cap.insns ? k : UINT64_MAX);
                 }
                 if (!g_have_counts) QueryThreadCycleTime(GetCurrentThread(), &x1);
                 excluded += x1 - x0;
+                const spu::hle::Function* fb = nullptr;
+                if (!iso_ok) {
+                    fb = spu::hle::lookup_next(s.ls, s.c.pc, f);
+                    if (fb && !fb->host_handler) fb = nullptr;
+                }
+                if (fb && try_host(fb)) continue;
                 if (iso_ok && n + k < cap.insns) {
                     if (g_js_on) g_phase = js_base | PH_NATIVE;
                     uint64_t h0 = __rdtsc();
@@ -952,6 +993,8 @@ Result run(State& s, const Capture& cap, bool regions) {
             slot.b = b;
             slot.valid = b ? e : 0;
         }
+        static const uint32_t noaot_lo = std::getenv("GOWA_BENCH_NOAOT_EDGE") ? 0x10c80u : 0u, noaot_hi = noaot_lo ? 0x29000u : 0u;
+        if (b && s.c.pc >= noaot_lo && s.c.pc < noaot_hi && edge::image_loaded(s.ls)) b = nullptr;
         r.dispatches++;
         if (!b) {
             uint64_t i0 = g_jobprof_rec ? __rdtsc() : 0;
@@ -1062,6 +1105,7 @@ int main(int argc, char** argv) {
     bool regions = true;
     bool live = false;
     int live_mode = 3;
+    std::string live_what = "direct";
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -1075,6 +1119,7 @@ int main(int argc, char** argv) {
         else if (a == "--hle-profile") g_hle = g_hle_profile = true;
         else if (a == "--jobprof") g_jobprof = true;
         else if (a == "--live") live = true;
+        else if (a == "--live-what" && i + 1 < argc) live_what = argv[++i];
         else if (a == "--live-mode" && i + 1 < argc) live_mode = std::atoi(argv[++i]);
         else if (a == "--jobsample") g_jobsample = true;
         else if (a == "--pmtrace" && i + 1 < argc) g_pmtrace = std::fopen(argv[++i], "w");
@@ -1137,7 +1182,8 @@ int main(int argc, char** argv) {
                 uint8_t* own = t->ls;
                 t->ls = s.ls;
                 g_live_thread = t.get();
-                spu::g_edge_direct = mode ? live_mode : 0;
+                spu::g_edge_direct = live_what == "direct" && mode ? live_mode : 0;
+                if (live_what == "ovl") spu::hle::g_dyn_on = mode != 0;
                 uint64_t hits0 = spu::g_edge_merge_hits.load();
                 g_live_mismatch = 0;
                 g_live_first.clear();
@@ -1167,7 +1213,8 @@ int main(int argc, char** argv) {
                 uint8_t* own = t->ls;
                 t->ls = s.ls;
                 g_live_thread = t.get();
-                spu::g_edge_direct = mode ? live_mode : 0;
+                spu::g_edge_direct = live_what == "direct" && mode ? live_mode : 0;
+                if (live_what == "ovl") spu::hle::g_dyn_on = mode != 0;
                 g_count_pos = 0;
                 Result r = run(s, cap, regions);
                 if (std::getenv("SPU_LIVE_VERBOSE")) std::printf("  rep %d mode %d cycles %llu\n", k, mode, static_cast<unsigned long long>(r.cycles));
@@ -1329,6 +1376,12 @@ int main(int argc, char** argv) {
         for (auto& [pc, c] : by_exit) v.push_back({c, pc});
         std::sort(v.rbegin(), v.rend());
         for (size_t i = 0; i < v.size() && i < 40; i++) std::printf("  exit %05x %llu\n", v[i].second, (unsigned long long)v[i].first);
+    }
+    if (edge::gpu::mode()) {
+        edge::gpu::Stats st = edge::gpu::stats();
+        std::printf("edge gpu: deferred %llu confirmed %llu published %llu dropped %llu materialized", (unsigned long long)st.deferred, (unsigned long long)st.confirmed, (unsigned long long)st.published, (unsigned long long)st.dropped);
+        for (int i = 0; i < 8; i++) std::printf(" %llu", (unsigned long long)st.materialized[i]);
+        std::printf("\n");
     }
     std::printf("total %.3f cycles/insn over %llu insns, %d mismatching\n", total_insns ? double(total_cycles) / total_insns : 0.0, static_cast<unsigned long long>(total_insns), failures);
     return failures ? 1 : 0;

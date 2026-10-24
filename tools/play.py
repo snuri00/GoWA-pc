@@ -72,6 +72,8 @@ def main():
     ap.add_argument("--fps-unlock", action="store_true")
     ap.add_argument("--fresh-save", action="store_true")
     ap.add_argument("--env", action="append")
+    ap.add_argument("--lowfps-capture", default="22:6:90:4", help="fps:secs:cooldown:max, 0 disables")
+    ap.add_argument("--critpath", action="store_true", help="record PPU waits and SPU jobs (critpath.bin + critpath.txt report)")
     args = ap.parse_args()
     if running():
         print("gowa.exe is already running; close it first")
@@ -79,14 +81,23 @@ def main():
     if os.path.isdir(PLAY_SAVE) and not args.fresh_save:
         copy_saves(PLAY_SAVE, SAVE_DIR)
         print("restored your save from", PLAY_SAVE)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = os.path.join(SESSIONS, stamp)
+    os.makedirs(out, exist_ok=True)
     env = dict(os.environ)
     env["GOWA_ROOT"] = ROOT
     for k in ("GOWA_AUTOPAD", "GOWA_SNAP_EVERY", "GOWA_SNAP_FROM", "GOWA_SNAP_DIR"):
         env.pop(k, None)
+    if args.lowfps_capture != "0":
+        env["GOWA_SPU_CAPTURE_LOWFPS"] = args.lowfps_capture
+        env["GOWA_SPU_CAPTURE_DIR"] = os.path.join(out, "spucap")
     if args.scale:
         env["GOWA_RES_SCALE"] = str(args.scale)
     if args.fps_unlock:
         env["GOWA_FPS_UNLOCK"] = "1"
+    if args.critpath:
+        env["GOWA_CRITPATH"] = "1"
+        env["GOWA_CRITPATH_FILE"] = os.path.join(out, "critpath.bin")
     for kv in args.env or []:
         k, _, v = kv.partition("=")
         env[k] = v
@@ -94,9 +105,6 @@ def main():
         if os.path.exists(os.path.join(RUN_DIR, f)):
             os.remove(os.path.join(RUN_DIR, f))
     shutil.rmtree(os.path.join(RUN_DIR, "blackbox"), ignore_errors=True)
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = os.path.join(SESSIONS, stamp)
-    os.makedirs(out, exist_ok=True)
     print("starting the game; close its window to end the session")
     t0 = time.time()
     proc = subprocess.Popen([EXE], cwd=RUN_DIR, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -136,6 +144,8 @@ def main():
     box = os.path.join(RUN_DIR, "blackbox")
     if os.path.isdir(box):
         shutil.copytree(box, os.path.join(out, "blackbox"), dirs_exist_ok=True)
+    if args.critpath and os.path.exists(os.path.join(out, "critpath.bin")):
+        subprocess.run([sys.executable, os.path.join(ROOT, "tools", "critpath_report.py"), out, "--from", "60", "--out", os.path.join(out, "critpath.txt")], stdout=subprocess.DEVNULL)
     print("session ended (exit code %d, %.0f s); log and captures in %s" % (code, time.time() - t0, out))
     return 0
 

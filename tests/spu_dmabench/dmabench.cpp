@@ -58,10 +58,10 @@ void tagwait(spu::Host& h, uint32_t mask) {
     g_sink += h.read_channel(24);
 }
 
-int stress(uint32_t base, int iters) {
-    const uint32_t counter = base + 0xC00000;
-    const uint32_t shared = base + 0xC10000;
-    const uint32_t ppu_word = base + 0xC20000;
+int stress(uint32_t base, int iters, bool tight, bool wrap) {
+    const uint32_t shared = wrap ? rsv::group_wrap_addr(base) - 0x400 : base + 0xC10000;
+    const uint32_t counter = tight ? shared - 0x80 : base + 0xC00000;
+    const uint32_t ppu_word = tight ? shared + 0x800 : base + 0xC20000;
     vm::write32(counter, 0);
     vm::write32(ppu_word, 0);
     for (uint32_t i = 0; i < 0x800; i++) vm::ptr(shared)[i] = 0;
@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
         std::_Exit(r);
     }
     if (argc > 1 && std::string(argv[1]) == "stress") {
-        int r = stress(base, argc > 2 ? std::atoi(argv[2]) : 200000);
+        int r = stress(base, argc > 2 ? std::atoi(argv[2]) : 200000, argc > 3 && std::string(argv[3]) != "far", argc > 3 && std::string(argv[3]) == "wrap");
         std::fflush(stdout);
         std::_Exit(r);
     }
@@ -241,6 +241,12 @@ int main(int argc, char** argv) {
         measure("baseline: virtual channel_count(21)", 200000, [](int) {}, [&](int) { g_sink += h.channel_count(21); });
         measure("baseline: rsv::copy_if_changed 0x80 same", 200000, [](int) {}, [&](int) { g_sink += rsv::copy_if_changed(base, th.ls + 0x30000, 0x80); });
         measure("baseline: rsv::store_locked 0x80", 200000, [](int) {}, [&](int i) { rsv::store_locked(base + 0xB00000 + (i & 63) * 0x80, th.ls, 0x80); });
+        measure("baseline: memcpy 0x4000 to guest", 20000, [](int) {}, [&](int i) { std::memcpy(vm::ptr(base + 0xB80000 + (i & 7) * 0x4000), th.ls, 0x4000); });
+        measure("baseline: memcpy 0x4000 to guest + mfence", 20000, [](int) {}, [&](int i) { std::memcpy(vm::ptr(base + 0xB80000 + (i & 7) * 0x4000), th.ls, 0x4000); _mm_mfence(); });
+        measure("baseline: rsv::store_range 0x4000 same dst", 20000, [](int) {}, [&](int i) { rsv::store_range(base + 0xB80000, th.ls, 0x4000); });
+        measure("baseline: rsv::store_range 0x4000", 20000, [](int) {}, [&](int i) { rsv::store_range(base + 0xB80000 + (i & 7) * 0x4000, th.ls, 0x4000); });
+        measure("baseline: rsv::copy_range_if_changed 0x4000 same", 20000, [](int) {}, [&](int) { uint32_t lo = ~0u, hi = 0; g_sink += rsv::copy_range_if_changed(base, th.ls + 0x30000, 0x4000, lo, hi); });
+        measure("baseline: rsv::copy_range_prefetch 0x4000 same", 20000, [](int) {}, [&](int) { uint32_t lo = ~0u, hi = 0; g_sink += rsv::copy_range_prefetch(base, th.ls + 0x30000, 0x4000, lo, hi); });
         measure("baseline: mark_ls 0x80", 200000, [](int) {}, [&](int) { th.mark_ls(0x30000, 0x80); });
     }
     measure("wrch MFC param (ch16..20) x5", 200000, [](int) {}, [&](int i) {

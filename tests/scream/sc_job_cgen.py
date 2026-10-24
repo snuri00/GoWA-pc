@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(ROOT, "tests", "pm"))
 import pm_cgen as G
 import rj_cgen as RJ
 
-OUT = os.path.join(ROOT, "runtime", "src", "spu", "scream")
+OUT = os.path.join((os.environ.get("GOWA_GEN_DIR") or os.path.join(ROOT, "out", "gen", "spu")), "scream")
 
 IMAGES = (
     ("mp3", 0x7E1C00, 0x1C0A0, 0x1B6D0),
@@ -28,7 +28,7 @@ def codegen_extra_starts():
 
 def recorded_starts(img_ls, img):
     out = set()
-    for path in glob.glob(os.path.join(ROOT, "recomp", "spu", "blocks", "run*.bin")):
+    for path in glob.glob(os.path.join(os.environ.get("GOWA_SPU_BLOCKS") or os.path.join(ROOT, "recomp", "spu", "blocks"), "run*.bin")):
         data = open(path, "rb").read()
         words = struct.unpack("<%dI" % (len(data) // 4), data[: len(data) // 4 * 4])
         i = 0
@@ -76,7 +76,7 @@ def kernel_hooks(name):
 
 
 def generate(name, ea, size, code_end):
-    elf = open(os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf"), "rb").read()
+    elf = open((os.environ.get("GOWA_ELF") or os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf")), "rb").read()
     img = elf[ea - 0x10000: ea - 0x10000 + size]
     entry = 0x4000 + struct.unpack_from(">I", img, 0x10)[0]
     exits = kernel_hooks(name)
@@ -96,6 +96,8 @@ def generate(name, ea, size, code_end):
         OPS_H="scream_job_ops.h",
         HEADER_BYTES=0x30,
         IE_INLINE=True,
+        DISPATCH_TABLE=True,
+        DISPATCH_GATE="spuf::glue_disp_on()",
         EXTRA_ROOTS=tuple(sorted(((recorded_starts(0x4000, img) | set(a for a in codegen_extra_starts() if 0x4030 <= a < code_end)) - exits))),
     )
     print(name, file=sys.stderr)

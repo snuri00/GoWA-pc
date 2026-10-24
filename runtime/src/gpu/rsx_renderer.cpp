@@ -10,6 +10,8 @@
 #include "runtime/memory.h"
 #include "fp_decompiler.h"
 #include "ring.h"
+#include "edge_compute.h"
+#include "../spu/edge/edge_gpu.h"
 #include "shader_compiler.h"
 #include "texture_decode.h"
 #include "vk_context.h"
@@ -2338,7 +2340,7 @@ bool skip(int line) {
 
 bool g_mv_done = false;
 std::string g_mv_hudless;
-void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h);
+void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h, uint64_t fp_hash, uint64_t vp_hash, uint32_t verts);
 
 bool draw() {
     VkCommandBuffer cmd = frame_cmd();
@@ -2509,6 +2511,8 @@ bool draw() {
     };
     PendingDecode pending[16];
     uint32_t npending = 0;
+    const float* gpu_check[16] = {};
+    uint32_t check_ea[16] = {};
     for (uint32_t i = 0; i < 16; i++) {
         uint32_t f = R(VERTEX_ARRAY_FORMAT + i * 4);
         uint32_t type = f & 7, size = (f >> 4) & 0xF, stride = (f >> 8) & 0xFF, freq = f >> 16;
@@ -2533,6 +2537,21 @@ bool draw() {
             vstrides[i] = 0;
             vdata[i] = reinterpret_cast<const float*>(a.ptr);
             continue;
+        }
+        if (!constant && !inline_draw && type == 2 && size == 3 && stride == 12 && freq <= 1 && edge_compute::enabled()) {
+            std::shared_ptr<const edge::gpu::Record> rec = edge::gpu::find(base);
+            RingAlloc ga;
+            if (rec && vmax < rec->nv && edge_compute::expand(*rec, ga)) {
+                if (!edge_compute::verify()) {
+                    vbufs[i] = ga.buffer;
+                    voffs[i] = ga.offset + VkDeviceSize(vmin) * 16;
+                    vstrides[i] = 16;
+                    vdata[i] = nullptr;
+                    continue;
+                }
+                gpu_check[i] = reinterpret_cast<const float*>(ga.ptr) + size_t(vmin) * 4;
+                check_ea[i] = base;
+            }
         }
         if (!ring_alloc(uint64_t(vcount) * 16, 16, a)) return skip(__LINE__);
         float* out = reinterpret_cast<float*>(a.ptr);
@@ -2572,6 +2591,8 @@ bool draw() {
             decode_vertices(d.type, d.size, d.src + size_t(v0) * d.stride, d.stride, nv, d.out + size_t(v0) * 4);
         }
     }
+    for (uint32_t i = 0; i < 16; i++)
+        if (gpu_check[i] && vdata[i]) edge_compute::add_check(gpu_check[i], vdata[i], vcount, check_ea[i]);
     g_stats.phase[3] += ticks() - ph;
     ph = ticks();
     RingAlloc ib;
@@ -2695,7 +2716,7 @@ bool draw() {
             g_qreset_needed = false;
         }
     }
-    if (mv::enabled()) mv_draw(colors, w, h);
+    if (mv::enabled()) mv_draw(colors, w, h, fp->hash, vp->hash, vcount);
     begin_pass(colors, depth, w, h);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
@@ -3316,6 +3337,7 @@ void frame_complete() {
         LOG_INFO("rsx", "vertex recheck: %u of %zu arrays changed after their draw", changed, g_vb_checks.size());
         g_vb_checks.clear();
     }
+    edge_compute::frame_complete();
     resolve_zpass();
     complete_writebacks();
     complete_dumps();
@@ -3449,8 +3471,18 @@ bool display_target(uint32_t offset) {
     return false;
 }
 
-void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h) {
+void mv_draw(const std::vector<Surface*>& colors, uint32_t w, uint32_t h, uint64_t fp_hash, uint64_t vp_hash, uint32_t verts) {
     if (colors.empty() || !display_target(colors[0]->offset)) return;
+    static int hud_log = std::getenv("GOWA_HUD_LOG") ? std::atoi(std::getenv("GOWA_HUD_LOG")) : 0;
+    static uint32_t hud_draw = 0;
+    if (!g_mv_done) hud_draw = 0;
+    static const double hud_from = std::getenv("GOWA_HUD_LOG_FROM") ? std::atof(std::getenv("GOWA_HUD_LOG_FROM")) : 0.0;
+    if (hud_log > 0 && mv::elapsed() >= hud_from) {
+        LOG_INFO("hud", "display draw %u fp %016llx vp %016llx verts %u blend %u/0x%x/0x%x depth %u/%u", hud_draw, static_cast<unsigned long long>(fp_hash), static_cast<unsigned long long>(vp_hash), verts, R(BLEND_ENABLE),
+                 R(BLEND_SFACTOR), R(BLEND_DFACTOR), R(DEPTH_TEST_ENABLE), R(DEPTH_MASK));
+        if (hud_draw == 0) hud_log--;
+    }
+    hud_draw++;
     if (!g_mv_done) {
         g_mv_done = true;
         mv_frame();
@@ -3594,7 +3626,12 @@ bool present(uint32_t buffer_id) {
                 uint32_t cw, ch;
                 transition(sp, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 if (dlssnr::compose(frame_cmd(), sp->view, sp->layout, rw, rh, ci, cl, cw, ch)) {
-                    if (snap) schedule_image_snapshot(ci, cw, ch, snap_dir + name);
+                    if (snap) {
+                        schedule_image_snapshot(ci, cw, ch, snap_dir + name);
+                        char hname[64];
+                        std::snprintf(hname, sizeof hname, "/nrhud_%07.1f.ppm", elapsed);
+                        schedule_image_snapshot(ci, cw, ch, snap_dir + hname);
+                    }
                     uint64_t pt = ticks();
                     present_image(ci, *cl, cw, ch);
                     g_stats.present_ticks += ticks() - pt;

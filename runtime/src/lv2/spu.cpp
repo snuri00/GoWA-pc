@@ -1,5 +1,6 @@
 #include "event.h"
 #include "../spu/thread.h"
+#include "../spu/natsched.h"
 #include "runtime/vfs.h"
 #include "ppu/ops.h"
 
@@ -252,6 +253,7 @@ LV2_SYSCALL(173, sys_spu_thread_group_start) {
         if (auto q = get<EventQueue>(run_queue)) push_event(q, {SPU_GROUP_RUN_KEY, g->id, 0, 0});
     }
     for (auto& t : g->threads) t->start();
+    spu::natsched::on_group_start(g);
     return CELL_OK;
 }
 
@@ -437,6 +439,7 @@ LV2_SYSCALL(251, sys_spu_thread_group_connect_event_all_threads) {
         for (auto& t : g->threads) {
             if (t) t->spup[p] = eq;
         }
+        for (auto& t : g->aux) t->spup[p] = eq;
         vm::ptr(out)[0] = static_cast<uint8_t>(p);
         return CELL_OK;
     }
@@ -452,6 +455,7 @@ LV2_SYSCALL(252, sys_spu_thread_group_disconnect_event_all_threads) {
     for (auto& t : g->threads) {
         if (t) t->spup[p] = 0;
     }
+    for (auto& t : g->aux) t->spup[p] = 0;
     return CELL_OK;
 }
 

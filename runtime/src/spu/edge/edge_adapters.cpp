@@ -2,6 +2,7 @@
 
 #include "edge_cull.h"
 #include "edge_cull_gen.h"
+#include "edge_gpu.h"
 #include "edge_skin.h"
 #include "edge_softbody.h"
 #include "edge_vcomp.h"
@@ -101,6 +102,7 @@ bool d618(uint8_t* ls, spu::Context& c, Outputs& outs) {
     be_quad(in.r81, c.gpr[81]);
     be_quad(in.r82, c.gpr[82]);
     be_quad(in.r126, c.gpr[126]);
+    if (gpu::mode()) gpu::touch_all(ls, 5);
     int32_t n = force_gen ? -1 : cull_triangles(ls, in);
     if (n < 0) return run_gen<xo::f_0d618>(ls, c, outs);
     c.gpr[3].vi = _mm_set1_epi32(n);
@@ -109,6 +111,7 @@ bool d618(uint8_t* ls, spu::Context& c, Outputs& outs) {
 
 bool x73e0(uint8_t* ls, spu::Context& c, Outputs& outs) {
     static const bool use_gen = std::getenv("EDGE_SB_GEN") != nullptr;
+    if (gpu::mode()) gpu::touch_all(ls, 6);
     if (use_gen) return run_gen<xo::f_073e0>(ls, c, outs);
     uint32_t sp = c.gpr[1].u32[3];
     if ((sp & 15) || sp < 0x2000 || sp > 0x3ffc0 || c.gpr[8].u32[3] != 0 || c.gpr[11].u32[3] > 0x2000) return false;
@@ -131,6 +134,7 @@ bool e550(uint8_t* ls, spu::Context& c, Outputs&) {
     uint32_t ctx = c.gpr[3].u32[3] & 0x3fff0;
     uint32_t sp = c.gpr[1].u32[3];
     if ((sp & 15) || sp < 0x1000 || sp > 0x3ffc0 || ctx < 0x10000 || ctx + 0x200 > 0x40000) return false;
+    if (gpu::mode()) gpu::touch_all(ls, 4);
     uint32_t q96[4];
     for (int i = 0; i < 4; i++) q96[i] = rbe32(ls + ctx + 96 + 4 * i);
     if (!skin_vertexes(ls, ctx, c.gpr[4].u32[3], c.gpr[5].u32[3], c.gpr[6].u32[3], sp - 0x1000)) return false;
@@ -187,7 +191,9 @@ bool d158(uint8_t* ls, spu::Context& c, Outputs& outs) {
     bool called = false;
     uint32_t sp = c.gpr[1].u32[3] & 0x3fff0;
     if (sp < 0x2000) return false;
+    if (gpu::mode()) gpu::before_compress(ls, ctx, id);
     if (!compress_vertexes(ls, ctx, id, r3, &outs, &called, sp - 0x1000)) return false;
+    if (gpu::mode()) gpu::after_compress(ls, ctx);
     uint32_t regs[128][4];
     for (int r = 0; r < 128; r++)
         for (int i = 0; i < 4; i++) regs[r][i] = c.gpr[r].u32[3 - i];
@@ -221,7 +227,18 @@ bool dbc8(uint8_t* ls, spu::Context& c, Outputs& outs) {
     put(regs.r1, 1);
     for (int i = 0; i < 9; i++) put(regs.saved[i], 80 + i);
     put(regs.saved[9], 126);
-    if (!vdecomp_run(ls, ov, ctx, c.gpr[4].u32[3], nv, c.gpr[5].u32[3], c.gpr[6].u32[3] & 255, regs, &outs)) return false;
+    if (gpu::mode()) {
+        gpu::job_start();
+        if (ov == 10 && gpu::defer_decompress(ls, ctx, c.gpr[4].u32[3] & 0x3ffff, nv, c.gpr[5].u32[3] & 0x3ffff)) {
+            c.gpr[3] = spu::v128{};
+            return true;
+        }
+    }
+    if (!vdecomp_run(ls, ov, ctx, c.gpr[4].u32[3], nv, c.gpr[5].u32[3], c.gpr[6].u32[3] & 255, regs, &outs)) {
+        if (gpu::mode()) gpu::job_start();
+        return false;
+    }
+    if (gpu::mode()) gpu::poison_table(ls);
     c.gpr[3] = spu::v128{};
     return true;
 }
@@ -240,6 +257,10 @@ bool f538(uint8_t* ls, spu::Context& c, Outputs&) {
     uint32_t q[4];
     uint32_t n = c.gpr[3].u32[3];
     if (!n) return true;
+    if (gpu::mode() && gpu::defer_transform(ls, n, c.gpr[4].u32[3] & 0x3ffff, c.gpr[5].u32[3] & 0x3ffff, c.gpr[6].u32[3] & 0x3fff0, q)) {
+        set_r3(c, q);
+        return true;
+    }
     transform_vertexes(ls, n, c.gpr[4].u32[3], c.gpr[5].u32[3], c.gpr[6].u32[3], q);
     set_r3(c, q);
     return true;
@@ -272,6 +293,7 @@ bool a880(uint8_t* ls, spu::Context& c, Outputs&) {
 
 bool bbc8(uint8_t* ls, spu::Context& c, Outputs&) {
     if (c.gpr[4].u32[3] > 0x10000) return false;
+    if (gpu::mode()) gpu::touch(ls, c.gpr[3].u32[3] & 0x3fff0, (c.gpr[3].u32[3] & 0x3fff0) + 16 * ((c.gpr[4].u32[3] + 7) & ~7u), 7);
     uint32_t q[4], n[4];
     for (int i = 0; i < 4; i++) n[i] = c.gpr[4].u32[3 - i];
     if (!normalize_vertexes(ls, c.gpr[3].u32[3], n, q)) return false;

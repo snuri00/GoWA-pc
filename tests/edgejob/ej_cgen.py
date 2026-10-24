@@ -13,7 +13,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 def recorded_starts(img_ls, img):
     out = set()
-    for path in glob.glob(os.path.join(ROOT, "recomp", "spu", "blocks", "run*.bin")):
+    for path in glob.glob(os.path.join(os.environ.get("GOWA_SPU_BLOCKS") or os.path.join(ROOT, "recomp", "spu", "blocks"), "run*.bin")):
         data = open(path, "rb").read()
         words = struct.unpack("<%dI" % (len(data) // 4), data[: len(data) // 4 * 4])
         i = 0
@@ -31,7 +31,7 @@ def recorded_starts(img_ls, img):
     return out
 
 
-elf = open(os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf"), "rb").read()
+elf = open((os.environ.get("GOWA_ELF") or os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf")), "rb").read()
 IMAGE = elf[0x737580 - 0x10000: 0x737580 - 0x10000 + 0xC430]
 
 G.configure(
@@ -44,6 +44,7 @@ G.configure(
     ENTRIES=(0x0AD98,),
     TRAMPOLINE=None,
     EXIT_TARGETS=NATIVES,
+    FALLBACK_ENTRIES=NATIVES if os.environ.get("EJ_NO_FALLBACK") is None else frozenset(),
     BLOCK_BUDGET=True,
     IRQ_SLICE=65536,
     NS="pm::gen::ej",

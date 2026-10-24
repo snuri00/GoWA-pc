@@ -3,6 +3,7 @@
 #include "ej_adapters.h"
 #include "mh_adapters.h"
 #include "an_adapters.h"
+#include "mpj_adapters.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +37,10 @@ const Target kPm = {"pm", pm::hooks, pm::signature, pm::image_loaded, pm::run_ho
 const Target kEdge = {"edgejob", edgejob::hooks, edgejob::signature, edgejob::image_loaded, edgejob::run_hook, edgejob::kDefaultBudget, 0x4030, 0x10430, 0x11000, 0x29000, 0x4000, 0x10430, 0x4000, 0x4000};
 const Target kMh = {"meshhier", meshhier::hooks, meshhier::signature, meshhier::image_loaded, meshhier::run_hook, meshhier::kDefaultBudget, 0x4030, 0xc130, 0xc200, 0x3f000, 0x4000, 0xc130, 0x4000, 0x4000, 0x78b380, 0x8130};
 const Target kAn = {"anim", anim::hooks, anim::signature, anim::image_loaded, anim::run_hook, anim::kDefaultBudget, 0x4030, 0xea70, 0xeb00, 0x3f000, 0x4000, 0xea70, 0x4000, 0x4000, 0x84be40, 0xaa70};
+const Target kMpj = {"meshprepjob", mpjob::hooks_of<mpjob::kMeshPrep>, mpjob::signature_of<mpjob::kMeshPrep>, mpjob::loaded<mpjob::kMeshPrep>, mpjob::run_hook<mpjob::kMeshPrep>, mpjob::kDefaultBudget, 0x4030, 0x8440, 0x8500, 0x3f000, 0x4000, 0x8440, 0x4000, 0x4000, 0x74b100, 0x4440};
+const Target kPbj = {"primbuilderjob", mpjob::hooks_of<mpjob::kPrimBuilder>, mpjob::signature_of<mpjob::kPrimBuilder>, mpjob::loaded<mpjob::kPrimBuilder>, mpjob::run_hook<mpjob::kPrimBuilder>, mpjob::kDefaultBudget, 0x4030, 0x10e30, 0x10f00, 0x3f000, 0x4000, 0x10e30, 0x4000, 0x4000, 0x6f8800, 0xce30};
+const Target kGvj = {"groupvisjob", mpjob::hooks_of<mpjob::kGroupVis>, mpjob::signature_of<mpjob::kGroupVis>, mpjob::loaded<mpjob::kGroupVis>, mpjob::run_hook<mpjob::kGroupVis>, mpjob::kDefaultBudget, 0x4030, 0xb080, 0xb100, 0x3f000, 0x4000, 0xb080, 0x4000, 0x4000, 0x793500, 0x7080};
+const Target kSpj = {"sortprimjob", mpjob::hooks_of<mpjob::kSortPrim>, mpjob::signature_of<mpjob::kSortPrim>, mpjob::loaded<mpjob::kSortPrim>, mpjob::run_hook<mpjob::kSortPrim>, mpjob::kDefaultBudget, 0x4030, 0x6790, 0x6800, 0x3f000, 0x4000, 0x6790, 0x4000, 0x4000, 0x6f4a00, 0x2790};
 const Target* T = &kPm;
 
 uint32_t rbe32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
@@ -341,8 +346,8 @@ int main(int argc, char** argv) {
     }
     std::string cmd = argv[1];
     std::vector<std::string> rest(argv + 2, argv + argc);
-    if ((cmd == "--edge" || cmd == "--mh" || cmd == "--an") && argc > 2) {
-        T = cmd == "--edge" ? &kEdge : cmd == "--mh" ? &kMh : &kAn;
+    if ((cmd == "--edge" || cmd == "--mh" || cmd == "--an" || cmd == "--mpj" || cmd == "--pbj" || cmd == "--gvj" || cmd == "--spj") && argc > 2) {
+        T = cmd == "--edge" ? &kEdge : cmd == "--mh" ? &kMh : cmd == "--an" ? &kAn : cmd == "--mpj" ? &kMpj : cmd == "--pbj" ? &kPbj : cmd == "--gvj" ? &kGvj : cmd == "--spj" ? &kSpj : &kAn;
         cmd = argv[2];
         rest.assign(argv + 3, argv + argc);
     }

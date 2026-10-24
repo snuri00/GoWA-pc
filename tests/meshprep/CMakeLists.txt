@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 get_filename_component(GOWA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(GOWA_GEN "${GOWA_ROOT}/out/gen/spu" CACHE PATH "Generated native SPU sources (tools/setup.py)")
 set(EDGE_DIR ${GOWA_ROOT}/tests/edge)
 set(RJ_DIR ${GOWA_ROOT}/tests/renjob)
 set(MP_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-frounding-math /EHsc /O2)
@@ -20,9 +21,9 @@ target_include_directories(mp_spu PUBLIC ${GOWA_ROOT}/runtime/include ${GOWA_ROO
 target_compile_options(mp_spu PRIVATE ${MP_FLAGS})
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-file(GLOB MP_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/meshprep/*.cpp)
+file(GLOB MP_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/meshprep/*.cpp ${GOWA_GEN}/meshprep/*.cpp)
 add_library(mp_native STATIC ${MP_NATIVE_SRC})
-target_include_directories(mp_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/meshprep ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
+target_include_directories(mp_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/meshprep ${GOWA_GEN}/meshprep ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(mp_native PRIVATE ${MP_FLAGS})
 
 set(MP_GEN_DEPS ${CMAKE_CURRENT_SOURCE_DIR}/mp_cgen.py ${CMAKE_CURRENT_SOURCE_DIR}/mp_jobs.py ${CMAKE_CURRENT_SOURCE_DIR}/mp_kernels.py ${RJ_DIR}/rj_cgen.py)

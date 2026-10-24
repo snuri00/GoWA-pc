@@ -7,7 +7,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import spu_dis as D
 
-ELF = os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf")
+ELF = (os.environ.get("GOWA_ELF") or os.path.join(ROOT, "bin", "01.12", "GOWA.patched.elf"))
 IMG_OFF = 0x727580
 IMG_LS = 0x4000
 IMG_SIZE = 0xC430
@@ -239,7 +239,7 @@ def main():
     for e in sorted(funcs):
         emit_func(funcs[e], out)
     out.append("}")
-    open(outp, "w").write("\n".join(out) + "\n")
+    open(outp, "w", newline="\n").write("\n".join(out) + "\n")
     for e in sorted(funcs):
         print("%05x insns %d calls %s tails %s" % (e, len(funcs[e].insns), sorted("%05x" % c for c in funcs[e].calls), sorted("%05x" % c for c in funcs[e].tails)))
 

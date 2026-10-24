@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 get_filename_component(GOWA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(GOWA_GEN "${GOWA_ROOT}/out/gen/spu" CACHE PATH "Generated native SPU sources (tools/setup.py)")
 set(EDGE_DIR ${GOWA_ROOT}/tests/edge)
 set(CS_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-frounding-math /EHsc /O2)
 
@@ -18,9 +19,9 @@ add_library(cs_spu STATIC
 target_include_directories(cs_spu PUBLIC ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(cs_spu PRIVATE ${CS_FLAGS})
 
-file(GLOB CS_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/cloth/*.cpp ${GOWA_ROOT}/runtime/src/spu/shadows/*.cpp)
+file(GLOB CS_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/cloth/*.cpp ${GOWA_ROOT}/runtime/src/spu/shadows/*.cpp ${GOWA_GEN}/cloth/*.cpp ${GOWA_GEN}/shadows/*.cpp)
 add_library(cs_native STATIC ${CS_NATIVE_SRC})
-target_include_directories(cs_native PUBLIC ${GOWA_ROOT}/runtime/src/spu ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
+target_include_directories(cs_native PUBLIC ${GOWA_ROOT}/runtime/src/spu ${GOWA_ROOT}/runtime/src/spu/cloth ${GOWA_ROOT}/runtime/src/spu/shadows ${GOWA_GEN}/cloth ${GOWA_GEN}/shadows ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(cs_native PRIVATE ${CS_FLAGS})
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
