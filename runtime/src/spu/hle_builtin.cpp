@@ -3,6 +3,7 @@
 #include "edge/edge_adapters.h"
 #include "edge/edge_ovl.h"
 #include "renjob/renjob_adapters.h"
+#include "../jobsys/jobs_inplace.h"
 #include "scream/scream_adapters.h"
 #include "scream/scj_adapters.h"
 #include "cloth/cloth_adapters.h"
@@ -378,6 +379,7 @@ void install_builtin() {
         install_wws_job("GOWA_ANIM_HLE", "GOWA_ANIM_HLE_SKIP", "Anim", anim::hooks, anim::signature, anim::run_hook);
         install_tasks();
         install_mpjob();
+        wj::install_inplace();
     });
 }
 
