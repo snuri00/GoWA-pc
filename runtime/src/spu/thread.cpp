@@ -5,6 +5,7 @@
 #include "edge/edge_adapters.h"
 #include "edge/edge_ovl.h"
 #include "thread.h"
+#include "natsched.h"
 #include "../lv2/event.h"
 #include "../lv2/sync.h"
 #include "ppu/ops.h"
@@ -289,6 +290,12 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
                     lk.unlock();
                     waiting.store(1, std::memory_order_relaxed);
                     rsv::wait_parked(line, rt, snap, park_slot, w0, limit, stop_flag);
+                    waiting.store(0, std::memory_order_relaxed);
+                    lk.lock();
+                } else if (aux) {
+                    lk.unlock();
+                    waiting.store(1, std::memory_order_relaxed);
+                    natsched::aux_wait(*this, line, rt, snap, 2000);
                     waiting.store(0, std::memory_order_relaxed);
                     lk.lock();
                 } else {
@@ -1541,6 +1548,11 @@ void SpuThread::run() {
         if (block_start) {
             block_start = false;
             block_len = 0;
+            if (aux && ctx.pc == 0xa00 && !natsched::pm_entry_allowed(*this)) {
+                uint32_t exit_pc;
+                std::memcpy(&exit_pc, ls + 0x1e0, 4);
+                ctx.pc = __builtin_bswap32(exit_pc) & PC_MASK;
+            }
             if (cp_on) critpath::spu_block(cp, slot, ls, cp_src, ctx.pc);
             if (job_log) {
                 uint32_t src = line_src[ctx.pc >> 7];
@@ -1770,7 +1782,7 @@ void SpuThread::run() {
         running = false;
         in_mbox.clear();
     }
-    if (group) group->thread_stopped(*this);
+    if (group && !aux) group->thread_stopped(*this);
 }
 
 namespace {
@@ -2019,6 +2031,11 @@ void Group::thread_stopped(SpuThread& t) {
 }
 
 void Group::stop_all() {
+    for (auto& t : aux) {
+        t->stop_flag = true;
+        t->cv.notify_all();
+        rsv::park_kick(t->park_slot);
+    }
     for (auto& t : threads) {
         if (!t) continue;
         t->stop_flag = true;

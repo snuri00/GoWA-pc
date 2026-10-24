@@ -22,6 +22,15 @@
 
 namespace rsv {
 
+std::atomic<uint32_t> g_watch_line{0xFFFFFFFFu};
+std::atomic<uint32_t> g_watch_word{0};
+std::atomic<uint32_t> g_watch_sleepers{0};
+
+void watch_kick() {
+    g_watch_word.fetch_add(1, std::memory_order_seq_cst);
+    WakeByAddressAll(&g_watch_word);
+}
+
 namespace {
 
 constexpr uint32_t PER_GROUP = 7;
@@ -171,6 +180,7 @@ bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uin
     }
     unlock_line(e, v0, true);
     if (sleepers()) e.ver.notify_all();
+    watch_note(line);
     return true;
 }
 
@@ -181,6 +191,7 @@ void store_unconditional(uint32_t line, const uint8_t* data) {
     std::memcpy(vm::ptr(line), data, 128);
     unlock_line(e, v0, true);
     if (sleepers()) e.ver.notify_all();
+    watch_note(line);
 }
 
 void store_locked(uint32_t addr, const void* data, uint32_t size) {
@@ -190,6 +201,7 @@ void store_locked(uint32_t addr, const void* data, uint32_t size) {
     std::memcpy(vm::ptr(addr), data, size);
     unlock_line(e, v0, true);
     if (sleepers()) e.ver.notify_all();
+    watch_note(addr);
 }
 
 void store_range(uint32_t addr, const uint8_t* data, uint32_t size) {
