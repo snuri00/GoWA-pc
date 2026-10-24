@@ -2,6 +2,7 @@
 #include "spu/context.h"
 #include "hle.h"
 #include "edge/edge_gpu.h"
+#include "edge/edge_adapters.h"
 #ifdef SPU_BENCH_LIVE
 #include "runtime/memory.h"
 #include "thread.h"
@@ -992,6 +993,8 @@ Result run(State& s, const Capture& cap, bool regions) {
             slot.b = b;
             slot.valid = b ? e : 0;
         }
+        static const uint32_t noaot_lo = std::getenv("GOWA_BENCH_NOAOT_EDGE") ? 0x10c80u : 0u, noaot_hi = noaot_lo ? 0x29000u : 0u;
+        if (b && s.c.pc >= noaot_lo && s.c.pc < noaot_hi && edge::image_loaded(s.ls)) b = nullptr;
         r.dispatches++;
         if (!b) {
             uint64_t i0 = g_jobprof_rec ? __rdtsc() : 0;
