@@ -144,6 +144,36 @@ void start(const std::shared_ptr<Thread>& t) {
     t->host.detach();
 }
 
+std::shared_ptr<Thread> spawn_host(const std::string& name, int32_t prio, uint32_t stack_size, uint32_t tls, std::function<void(Thread&)> fn) {
+    auto t = create(name, 0, 0, 0, prio, stack_size, tls, true);
+    if (!t) return nullptr;
+    std::lock_guard lk(t->lock);
+    t->started = true;
+    t->host = std::thread([t, fn = std::move(fn)]() {
+        t_current = t.get();
+        t->native = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
+        set_host_name("PPU " + t->name);
+        placement::apply("ppu:" + t->name);
+        LOG_INFO("ppu", "host thread 0x%x '%s' start", t->id, t->name.c_str());
+        fn(*t);
+        LOG_INFO("ppu", "host thread 0x%x '%s' exit", t->id, t->name.c_str());
+        {
+            std::lock_guard lk2(t->lock);
+            t->exited = true;
+        }
+        t->cv.notify_all();
+        t_current = nullptr;
+    });
+    return t;
+}
+
+void join_host(const std::shared_ptr<Thread>& t) {
+    if (!t) return;
+    if (t->host.joinable()) t->host.join();
+    remove(t->id);
+    vm::dealloc(t->stack_addr);
+}
+
 void remove(uint32_t id) {
     std::lock_guard lk(g_lock);
     g_threads.erase(id);

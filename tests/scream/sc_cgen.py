@@ -30,7 +30,7 @@ def setup(name):
 def gen_all():
     import subprocess
     for name in IMAGES:
-        out = os.path.join(ROOT, "runtime", "src", "spu", "scream", "%s_gen" % name)
+        out = os.path.join((os.environ.get("GOWA_GEN_DIR") or os.path.join(ROOT, "out", "gen", "spu")), "scream", "%s_gen" % name)
         subprocess.run([sys.executable, os.path.abspath(__file__), name, "@" + os.path.join(HERE, "roots_%s.txt" % name), out + ".cpp", out + ".h"], check=True, stdout=subprocess.DEVNULL)
 
 

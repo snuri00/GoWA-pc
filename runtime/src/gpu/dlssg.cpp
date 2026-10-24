@@ -34,7 +34,8 @@ struct Image {
 };
 
 struct Slot {
-    Image mv, depth, hudless;
+    Image mv, depth, hudless, ui;
+    bool ui_ready = false;
 };
 
 struct State {
@@ -50,6 +51,8 @@ struct State {
     uint32_t frame = 0;
     bool inputs = false;
     bool hudless = false;
+    bool ui = false;
+    uint64_t presented_total = 0;
     bool prev_valid = false;
     bool fg_on = false;
     bool options_set = false;
@@ -439,8 +442,35 @@ void capture_hudless(VkCommandBuffer cmd, VkImage src, VkImageLayout layout, uin
     g.hudless = true;
 }
 
+uint64_t presented_total() { return g.presented_total; }
+
+bool generating() { return g.ok && g.fg_on; }
+
+VkImage ui_begin(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
+    if (!g.ok || !g.device || !g.token) return VK_NULL_HANDLE;
+    Slot& s = g.slots[g.slot];
+    bool fresh = !s.ui.image || s.ui.w != w || s.ui.h != h;
+    if (!ensure(s.ui, VK_FORMAT_B8G8R8A8_UNORM, w, h, VK_IMAGE_ASPECT_COLOR_BIT)) return VK_NULL_HANDLE;
+    if (fresh) s.ui_ready = false;
+    if (!s.ui_ready) {
+        barrier(cmd, s.ui.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkClearColorValue zero{};
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, s.ui.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+        s.ui_ready = true;
+    } else {
+        barrier(cmd, s.ui.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    }
+    g.ui = true;
+    return s.ui.image;
+}
+
 void pre_submit(VkCommandBuffer cmd, uint32_t back_w, uint32_t back_h) {
     if (!g.ok || !g.token) return;
+    Slot& us = g.slots[g.slot];
+    bool ui = g.ui && us.ui.w == back_w && us.ui.h == back_h;
+    if (g.ui) barrier(cmd, us.ui.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    g.ui = false;
     set_backbuffer(back_w, back_h);
     static const bool tags_off = std::getenv("GOWA_DLSSG_NOTAGS") != nullptr;
     bool valid = g.inputs && !tags_off;
@@ -457,13 +487,15 @@ void pre_submit(VkCommandBuffer cmd, uint32_t back_w, uint32_t back_h) {
     sl::Resource mvec = valid ? resource(s.mv) : sl::Resource{};
     sl::Resource hud = (valid && g.hudless) ? resource(s.hudless) : sl::Resource{};
     sl::Extent ext{0, 0, s.mv.w, s.mv.h};
+    sl::Resource uir = (valid && ui) ? resource(us.ui) : sl::Resource{};
     sl::Extent hext{0, 0, g.back_w, g.back_h};
-    sl::ResourceTag tags[3] = {
+    sl::ResourceTag tags[4] = {
         sl::ResourceTag(valid ? &depth : nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, valid ? &ext : nullptr),
         sl::ResourceTag(valid ? &mvec : nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, valid ? &ext : nullptr),
         sl::ResourceTag((valid && g.hudless) ? &hud : nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, (valid && g.hudless) ? &hext : nullptr),
+        sl::ResourceTag((valid && ui) ? &uir : nullptr, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent, (valid && ui) ? &hext : nullptr),
     };
-    if (SL_FAILED(res, slSetTagForFrame(*g.token, sl::ViewportHandle(0), tags, 3, reinterpret_cast<sl::CommandBuffer*>(cmd)))) {
+    if (SL_FAILED(res, slSetTagForFrame(*g.token, sl::ViewportHandle(0), tags, 4,reinterpret_cast<sl::CommandBuffer*>(cmd)))) {
         static int n = 0;
         if (n++ < 5) LOG_WARN("dlssg", "slSetTagForFrame failed %d", int(res));
     }
@@ -489,7 +521,9 @@ void present_end() {
     if (g.token) slPCLSetMarker(sl::PCLMarker::ePresentEnd, *g.token);
     sl::DLSSGState st{};
     if (SL_SUCCEEDED(res, slDLSSGGetState(sl::ViewportHandle(0), st, nullptr))) {
-        g.presented += st.numFramesActuallyPresented ? st.numFramesActuallyPresented : 1;
+        uint64_t np = st.numFramesActuallyPresented ? st.numFramesActuallyPresented : 1;
+        g.presented += np;
+        g.presented_total += np;
         static sl::DLSSGStatus last = sl::DLSSGStatus::eOk;
         if (st.status != last) {
             LOG_WARN("dlssg", "DLSS-G status %u", uint32_t(st.status));
@@ -526,8 +560,11 @@ void shutdown() {
 namespace gpu::dlssg {
 
 bool requested() {
-    const char* v = std::getenv("GOWA_DLSSG");
-    return v && std::atoi(v) != 0;
+    static const bool r = [] {
+        const char* v = std::getenv("GOWA_DLSSG");
+        return v && std::atoi(v) != 0;
+    }();
+    return r;
 }
 bool load_vulkan() {
     if (requested()) LOG_WARN("dlssg", "GOWA_DLSSG set but this build has no Streamline SDK");
@@ -540,6 +577,9 @@ void set_backbuffer(uint32_t, uint32_t) {}
 void capture_inputs(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t, uint32_t, const float*) {}
 bool hudless_pending() { return false; }
 void capture_hudless(VkCommandBuffer, VkImage, VkImageLayout, uint32_t, uint32_t) {}
+uint64_t presented_total() { return 0; }
+bool generating() { return false; }
+VkImage ui_begin(VkCommandBuffer, uint32_t, uint32_t) { return VK_NULL_HANDLE; }
 void pre_submit(VkCommandBuffer, uint32_t, uint32_t) {}
 void post_submit() {}
 void present_begin() {}

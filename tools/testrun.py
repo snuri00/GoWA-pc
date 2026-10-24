@@ -214,7 +214,7 @@ def cmd_run(args):
         pass
     json.dump(meta, open(os.path.join(out, "meta.json"), "w"), indent=1)
     print("run", name, "for", duration, "s")
-    golden = os.path.join(RUN_DIR, "savedata_golden")
+    golden = args.save or os.path.join(RUN_DIR, "savedata_golden")
     if os.path.isdir(golden) and not args.keep_save:
         dst = os.path.join(RUN_DIR, "vfs", "dev_hdd0", "home", "00000001", "savedata")
         for d in os.listdir(golden):
@@ -230,6 +230,8 @@ def cmd_run(args):
     time.sleep(1)
     if os.path.exists(os.path.join(RUN_DIR, "gowa.log")):
         shutil.copy(os.path.join(RUN_DIR, "gowa.log"), os.path.join(out, "gowa.log"))
+    if env.get("GOWA_CRITPATH", "0") not in ("", "0") and os.path.exists(os.path.join(RUN_DIR, "critpath.bin")):
+        shutil.move(os.path.join(RUN_DIR, "critpath.bin"), os.path.join(out, "critpath.bin"))
     keep_blackbox(out)
     shots = convert_snaps(out)
     summary = summarize(out, duration, rc, wall)
@@ -343,6 +345,7 @@ def main():
     p.add_argument("--trace")
     p.add_argument("--env", action="append")
     p.add_argument("--keep-save", action="store_true")
+    p.add_argument("--save", help="savedata dir to restore instead of run/savedata_golden (e.g. out/play_save)")
     p = sub.add_parser("show")
     p.add_argument("run", nargs="?", default="last")
     sub.add_parser("list")

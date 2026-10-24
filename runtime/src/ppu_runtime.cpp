@@ -1,4 +1,5 @@
 #include "ppu/ops.h"
+#include "runtime/critpath.h"
 #include "runtime/hle.h"
 #include "runtime/image.h"
 #include "runtime/kernel.h"
@@ -66,6 +67,24 @@ Fn find(const char* module, const char* name) {
     return it == registry().end() ? nullptr : it->second;
 }
 
+namespace {
+
+std::map<std::string, Tap>& taps() {
+    static std::map<std::string, Tap> r;
+    return r;
+}
+
+}
+
+TapReg::TapReg(const char* module, const char* name, Tap tap) {
+    taps()[std::string(module) + "::" + name] = tap;
+}
+
+Tap find_tap(const char* module, const char* name) {
+    auto it = taps().find(std::string(module) + "::" + name);
+    return it == taps().end() ? nullptr : it->second;
+}
+
 }
 
 namespace ppu {
@@ -112,6 +131,7 @@ struct ImportSlot {
     hle::Fn hle = nullptr;
     std::atomic<bool> warned{false};
     bool log_args = false;
+    hle::Tap tap = nullptr;
 };
 
 std::vector<ImportSlot>& import_slots() {
@@ -125,6 +145,7 @@ int32_t resolve(uint32_t index, ImportSlot& slot) {
         std::string l = std::string(",") + list + ",";
         if (imp.name && *imp.name && l.find(std::string(",") + imp.name + ",") != std::string::npos) slot.log_args = true;
     }
+    if (imp.name && *imp.name) slot.tap = hle::find_tap(imp.module, imp.name);
     for (uint32_t i = 0; i < image::export_count; i++) {
         const image::ExportEntry& e = image::exports[i];
         if (e.nid == imp.nid && std::strcmp(e.module, imp.module) == 0 && loader::image_loaded(static_cast<int>(e.image))) {
@@ -178,7 +199,17 @@ void call_import(Context& ctx, uint8_t* base, uint32_t index) {
     call_import_body(ctx, base, index, slot, st, imp);
 }
 
+void call_import_inner(Context& ctx, uint8_t* base, uint32_t index, ImportSlot& slot, int32_t st, const image::ImportEntry& imp);
+
 void call_import_body(Context& ctx, uint8_t* base, uint32_t index, ImportSlot& slot, int32_t st, const image::ImportEntry& imp) {
+    if (!slot.tap) return call_import_inner(ctx, base, index, slot, st, imp);
+    uint64_t a[8];
+    for (int i = 0; i < 8; i++) a[i] = ctx.gpr[3 + i];
+    call_import_inner(ctx, base, index, slot, st, imp);
+    slot.tap(a, ctx.gpr[3]);
+}
+
+void call_import_inner(Context& ctx, uint8_t* base, uint32_t index, ImportSlot& slot, int32_t st, const image::ImportEntry& imp) {
     if (slot.log_args) {
         LOG_INFO("import", "%s::%s(0x%llx, 0x%llx, 0x%llx, 0x%llx) lr 0x%llx", imp.module, imp.name, static_cast<unsigned long long>(ctx.gpr[3]),
                  static_cast<unsigned long long>(ctx.gpr[4]), static_cast<unsigned long long>(ctx.gpr[5]), static_cast<unsigned long long>(ctx.gpr[6]),
@@ -199,6 +230,7 @@ void call_import_body(Context& ctx, uint8_t* base, uint32_t index, ImportSlot& s
     if (st == kHle) {
         LOG_TRACE("import", "%s::%s -> HLE", imp.module, imp.name);
         slot.hle(ctx, base);
+        if (slot.log_args) LOG_INFO("import", "%s::%s returned 0x%llx", imp.module, imp.name, static_cast<unsigned long long>(ctx.gpr[3]));
         return;
     }
     if (!slot.warned.exchange(true)) {
@@ -214,6 +246,8 @@ void syscall(Context& ctx, uint8_t* base) {
     if (slot.fn) {
         LOG_TRACE("lv2", "%s(0x%llx, 0x%llx, 0x%llx, 0x%llx)", slot.name, static_cast<unsigned long long>(ctx.gpr[3]), static_cast<unsigned long long>(ctx.gpr[4]),
                   static_cast<unsigned long long>(ctx.gpr[5]), static_cast<unsigned long long>(ctx.gpr[6]));
+        uint64_t cp0 = critpath::g_on ? __rdtsc() : 0;
+        uint32_t cp_arg = static_cast<uint32_t>(ctx.gpr[3]);
         guest::Thread* t = guest::current();
         if (t) {
             t->in_syscall.store(n + 1, std::memory_order_relaxed);
@@ -231,6 +265,7 @@ void syscall(Context& ctx, uint8_t* base) {
             ctx.gpr[3] = static_cast<uint64_t>(slot.fn(ctx, base));
         }
         if (t) t->in_syscall.store(0, std::memory_order_relaxed);
+        if (cp0) critpath::syscall_done(n, cp0, static_cast<uint32_t>(ctx.lr), cp_arg, static_cast<uint32_t>(ctx.gpr[1]));
         return;
     }
     if (!lv2::g_warned[n].exchange(1)) {

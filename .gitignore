@@ -37,3 +37,7 @@ build_renjob/
 build_cs/
 /dlss/
 /third_party/streamline/
+/runtime/src/spu/*/*_gen.cpp
+/runtime/src/spu/*/*_gen.h
+!/runtime/src/spu/edge/edge_cull_gen.h
+/recomp/spu/blocks/

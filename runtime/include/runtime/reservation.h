@@ -6,6 +6,14 @@
 
 namespace rsv {
 
+extern std::atomic<uint32_t> g_watch_line;
+extern std::atomic<uint32_t> g_watch_word;
+extern std::atomic<uint32_t> g_watch_sleepers;
+void watch_kick();
+inline void watch_note(uint32_t line) {
+    if ((line & ~127u) == g_watch_line.load(std::memory_order_relaxed) && g_watch_sleepers.load(std::memory_order_seq_cst)) watch_kick();
+}
+
 std::atomic<uint64_t>& version(uint32_t addr);
 uint64_t snapshot(uint32_t line, uint8_t* out);
 bool commit_if(uint32_t line, uint64_t rtime, const uint8_t* expected, const uint8_t* data, uint32_t offset, uint32_t size, bool data_only = false);
@@ -25,6 +33,7 @@ uint32_t park_word(int slot);
 void park_kick(int slot);
 int wait_parked(uint32_t line, uint64_t rtime, const uint8_t* rdata, int slot, uint32_t w0, int64_t limit_us, const std::atomic<bool>& stop);
 void wake(uint32_t addr);
+uint32_t group_wrap_addr(uint32_t from);
 bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size);
 bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi);
 bool copy_range_prefetch(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi);

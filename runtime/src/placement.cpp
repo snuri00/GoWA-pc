@@ -117,6 +117,11 @@ std::string default_spec(const Config& c) {
     for (size_t k = pairs; slots.size() < 6; k++) slots.push_back("c" + std::to_string(2 + k % rest));
     std::string spec = "mode=mask;ppu:main_thread=c0;fifo=c1;spu=";
     for (size_t i = 0; i < slots.size(); i++) spec += (i ? "," : "") + slots[i];
+    const char* ns = std::getenv("GOWA_NATIVE_SCHED");
+    if (ns && *ns && *ns != '0') {
+        const char* ap = std::getenv("GOWA_NATIVE_SCHED_PLACE");
+        spec += ap ? std::string(",") + ap : c.cores[0].size() > 1 && c.cores[1].size() > 1 ? std::string(",s0,s1") : std::string(",c0,c1");
+    }
     return spec;
 }
 

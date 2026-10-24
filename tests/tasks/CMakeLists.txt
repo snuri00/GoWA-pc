@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 get_filename_component(GOWA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(GOWA_GEN "${GOWA_ROOT}/out/gen/spu" CACHE PATH "Generated native SPU sources (tools/setup.py)")
 set(EDGE_DIR ${GOWA_ROOT}/tests/edge)
 set(TK_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-frounding-math /EHsc /O2)
 
@@ -18,9 +19,9 @@ add_library(tk_spu STATIC
 target_include_directories(tk_spu PUBLIC ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(tk_spu PRIVATE ${TK_FLAGS})
 
-file(GLOB TK_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/tasks/*.cpp ${GOWA_ROOT}/runtime/src/spu/scream/scj_*.cpp)
+file(GLOB TK_NATIVE_SRC CONFIGURE_DEPENDS ${GOWA_ROOT}/runtime/src/spu/tasks/*.cpp ${GOWA_ROOT}/runtime/src/spu/scream/scj_*.cpp ${GOWA_GEN}/tasks/*.cpp ${GOWA_GEN}/scream/scj_*.cpp)
 add_library(tk_native STATIC ${TK_NATIVE_SRC})
-target_include_directories(tk_native PUBLIC ${GOWA_ROOT}/runtime/src/spu/tasks ${GOWA_ROOT}/runtime/src/spu/scream ${GOWA_ROOT}/runtime/src/spu ${GOWA_ROOT}/runtime/src/spu/pm ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
+target_include_directories(tk_native PUBLIC ${GOWA_GEN}/tasks ${GOWA_GEN}/scream ${GOWA_ROOT}/runtime/src/spu/tasks ${GOWA_ROOT}/runtime/src/spu/scream ${GOWA_ROOT}/runtime/src/spu ${GOWA_ROOT}/runtime/src/spu/pm ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(tk_native PRIVATE ${TK_FLAGS})
 
 add_executable(tk_harness tk_harness.cpp ${EDGE_DIR}/capture.cpp)

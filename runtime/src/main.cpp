@@ -3,6 +3,7 @@
 #include "runtime/loader.h"
 #include "runtime/log.h"
 #include "runtime/trace.h"
+#include "runtime/critpath.h"
 #include "runtime/hooks.h"
 #include "runtime/memory.h"
 #include "gpu/presenter.h"
@@ -15,10 +16,12 @@
 
 namespace spu {
 void status_dump();
+void lowfps_tick(uint64_t flips);
 }
 
 namespace lv2 {
 void rsx_status();
+uint64_t rsx_flip_count();
 }
 
 #include <chrono>
@@ -123,6 +126,7 @@ void thread_census(int period) {
 int main(int argc, char** argv) {
     crash::install();
     trace::init();
+    critpath::init();
     hooks::init();
     timeBeginPeriod(1);
     gpu::init();
@@ -200,6 +204,7 @@ int main(int argc, char** argv) {
     for (int tick = 0;; tick++) {
         if (census > 0 && tick % census == 0) thread_census(census);
         hooks::tick_patches();
+        spu::lowfps_tick(lv2::rsx_flip_count());
         if (!peeks.empty()) {
             std::string line;
             for (uint32_t addr : peeks) {

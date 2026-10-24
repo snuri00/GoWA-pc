@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/critpath.h"
 #include "runtime/reservation.h"
 
 #include "spu/context.h"
@@ -25,6 +26,7 @@ struct SpuThread : Host {
     uint32_t id = 0;
     uint32_t slot = 0;
     uint32_t order = 0;
+    bool aux = false;
     std::string name;
     Group* group = nullptr;
     Context ctx{};
@@ -41,6 +43,7 @@ struct SpuThread : Host {
     void clear_snap(uint32_t k);
     std::unique_ptr<uint32_t[]> line_src{new uint32_t[0x40000 / 128]()};
     uint32_t cur_src = 0;
+    critpath::SpuState cp;
     uint64_t src_insn_mark = 0;
     uint32_t dma_snap_next = 0;
     void remember_get(uint32_t ea, uint32_t size, uint32_t lsa);
@@ -176,6 +179,9 @@ private:
 
 void register_thread(SpuThread* t);
 void status_dump();
+std::string brief();
+void request_capture(const std::string& dir);
+void lowfps_tick(uint64_t flips);
 
 struct Group {
     uint32_t id = 0;
@@ -188,6 +194,7 @@ struct Group {
     uint32_t state = 0;
     uint32_t init = 0;
     std::vector<std::shared_ptr<SpuThread>> threads;
+    std::vector<std::shared_ptr<SpuThread>> aux;
     uint32_t running = 0;
     uint32_t join_state = 0;
     uint32_t exit_status = 0;

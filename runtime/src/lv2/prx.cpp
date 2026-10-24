@@ -1,4 +1,5 @@
 #include "object.h"
+#include "runtime/hle.h"
 #include "runtime/image.h"
 #include "runtime/loader.h"
 
@@ -36,7 +37,7 @@ int64_t load(const std::string& path) {
     p->path = path;
     p->name = path.substr(path.find_last_of('/') + 1);
     int idx = loader::find_image_by_path(path);
-    if (idx >= 0 && image::images[idx].prx) {
+    if (idx >= 0 && image::images[idx].prx && !hle::module_overridden(p->name)) {
         if (!loader::load_image(idx)) return CELL_ENOEXEC;
         p->image = idx;
         p->start_opd = find_special_export(idx, 0xBC9A0086);
