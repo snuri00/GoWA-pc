@@ -1,5 +1,5 @@
 #include "runtime/placement.h"
-#include "runtime/ppujobs.h"
+#include "runtime/jobsys.h"
 #include "spu/aot.h"
 #include "hle.h"
 #include "edge/edge_gpu.h"
@@ -302,6 +302,12 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
                 } else {
                     lk.unlock();
                     waiting.store(1, std::memory_order_relaxed);
+                    if (!job_mode && ctx.pc < 0xa00 && jobsys::spu_idle_donate(slot)) {
+                        waiting.store(0, std::memory_order_relaxed);
+                        lk.lock();
+                        collect_events();
+                        continue;
+                    }
                     rsv::wait_lost(line, rt, snap, 1000);
                     waiting.store(0, std::memory_order_relaxed);
                     lk.lock();
@@ -1545,7 +1551,6 @@ void SpuThread::exec() {
     const bool edge_stats = edge::ovl::stats_on();
     bool interp_edge = false;
     uint64_t interp_edge_n = 0;
-    const bool donor = !job_mode && ppujobs::enabled() && ppujobs::donor_slot() >= 0 && uint32_t(ppujobs::donor_slot()) == slot;
     for (;;) {
         if (interp_edge_n >= 4096) {
             edge::ovl::count(edge::ovl::kInterpInsns, interp_edge_n);
@@ -1560,7 +1565,6 @@ void SpuThread::exec() {
                 ctx.pc = __builtin_bswap32(exit_pc) & PC_MASK;
             }
             if (cp_on) critpath::spu_block(cp, slot, ls, cp_src, ctx.pc);
-            if (donor && ppujobs::g_queued.load(std::memory_order_relaxed)) ppujobs::donate();
             if (job_mode && ctx.pc < 0x4000) {
                 if (ctx.pc == job_stop) {
                     exec_insns += n;
