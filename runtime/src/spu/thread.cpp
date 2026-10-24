@@ -2,6 +2,8 @@
 #include "spu/aot.h"
 #include "hle.h"
 #include "edge/edge_gpu.h"
+#include "edge/edge_adapters.h"
+#include "edge/edge_ovl.h"
 #include "thread.h"
 #include "../lv2/event.h"
 #include "../lv2/sync.h"
@@ -1528,7 +1530,14 @@ void SpuThread::run() {
     const bool cp_on = critpath::g_on;
     if (cp_on) critpath::spu_init_sig();
     const uint32_t* cp_src = line_src.get();
+    const bool edge_stats = edge::ovl::stats_on();
+    bool interp_edge = false;
+    uint64_t interp_edge_n = 0;
     for (;;) {
+        if (interp_edge_n >= 4096) {
+            edge::ovl::count(edge::ovl::kInterpInsns, interp_edge_n);
+            interp_edge_n = 0;
+        }
         if (block_start) {
             block_start = false;
             block_len = 0;
@@ -1545,8 +1554,10 @@ void SpuThread::run() {
                     note_job(id, __builtin_bswap32(wid), src, ctx.pc, job_log, prev, delta);
                 }
             }
-            if (!cap && hle::any_at(ctx.pc)) {
-                if (const hle::Function* f = hle_find(ctx.pc)) {
+            if (!cap && (hle::any_at(ctx.pc) || hle::dyn_at(ctx.pc))) {
+                const hle::Function* f = hle::any_at(ctx.pc) ? hle_find(ctx.pc) : nullptr;
+                if (!f && hle::dyn_at(ctx.pc)) f = hle::lookup_dyn(ls, ctx.pc);
+                if (f) {
                     if (f->host_handler) {
                         ctx.executed = 0;
                         uint32_t pc_before = ctx.pc;
@@ -1710,6 +1721,8 @@ void SpuThread::run() {
                 }
             }
             if (rec) aot::record(ls, ctx.pc);
+            interp_edge = edge_stats && edge::image_loaded(ls);
+            if (interp_edge) edge::ovl::note_interp(ctx.pc);
             if (job_log) {
                 std::lock_guard lk(g_job_lock);
                 g_interp_pcs[ctx.pc]++;
@@ -1720,6 +1733,7 @@ void SpuThread::run() {
         word = __builtin_bswap32(word);
         if (job_log) g_interp_insns.fetch_add(1, std::memory_order_relaxed);
         if (cp_on) cp.emu++;
+        if (interp_edge) ++interp_edge_n;
         if (!step(ctx, *host)) break;
         if (aot::is_terminator(word) || ++block_len >= aot::MAX_BLOCK_WORDS) block_start = true;
         if (!bps.empty()) {

@@ -857,8 +857,9 @@ Result run(State& s, const Capture& cap, bool regions) {
             g_cur_job->disp++;
             jp_top = __rdtsc();
         }
-        if (g_hle && spu::hle::any_at(s.c.pc)) {
-            const spu::hle::Function* f = hle_find(s.c.pc);
+        if (g_hle && (spu::hle::any_at(s.c.pc) || spu::hle::dyn_at(s.c.pc))) {
+            const spu::hle::Function* f = spu::hle::any_at(s.c.pc) ? hle_find(s.c.pc) : nullptr;
+            if (!f && spu::hle::dyn_at(s.c.pc)) f = spu::hle::lookup_dyn(s.ls, s.c.pc);
             if (f && f->host_handler) {
                 if (cap.insns - n > g_host_budget + 200000) {
                     uint32_t pc0 = s.c.pc;
@@ -1091,6 +1092,7 @@ int main(int argc, char** argv) {
     bool regions = true;
     bool live = false;
     int live_mode = 3;
+    std::string live_what = "direct";
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -1104,6 +1106,7 @@ int main(int argc, char** argv) {
         else if (a == "--hle-profile") g_hle = g_hle_profile = true;
         else if (a == "--jobprof") g_jobprof = true;
         else if (a == "--live") live = true;
+        else if (a == "--live-what" && i + 1 < argc) live_what = argv[++i];
         else if (a == "--live-mode" && i + 1 < argc) live_mode = std::atoi(argv[++i]);
         else if (a == "--jobsample") g_jobsample = true;
         else if (a == "--pmtrace" && i + 1 < argc) g_pmtrace = std::fopen(argv[++i], "w");
@@ -1166,7 +1169,8 @@ int main(int argc, char** argv) {
                 uint8_t* own = t->ls;
                 t->ls = s.ls;
                 g_live_thread = t.get();
-                spu::g_edge_direct = mode ? live_mode : 0;
+                spu::g_edge_direct = live_what == "direct" && mode ? live_mode : 0;
+                if (live_what == "ovl") spu::hle::g_dyn_on = mode != 0;
                 uint64_t hits0 = spu::g_edge_merge_hits.load();
                 g_live_mismatch = 0;
                 g_live_first.clear();
@@ -1196,7 +1200,8 @@ int main(int argc, char** argv) {
                 uint8_t* own = t->ls;
                 t->ls = s.ls;
                 g_live_thread = t.get();
-                spu::g_edge_direct = mode ? live_mode : 0;
+                spu::g_edge_direct = live_what == "direct" && mode ? live_mode : 0;
+                if (live_what == "ovl") spu::hle::g_dyn_on = mode != 0;
                 g_count_pos = 0;
                 Result r = run(s, cap, regions);
                 if (std::getenv("SPU_LIVE_VERBOSE")) std::printf("  rep %d mode %d cycles %llu\n", k, mode, static_cast<unsigned long long>(r.cycles));

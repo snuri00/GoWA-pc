@@ -17,6 +17,7 @@ GOWA_SHA256 = {
 GENERATORS = (
     ("edge", "edge", ["tests/edge/spu_cgen.py", "73e0,d618", "{gen}/edge/edge_cull_gen.cpp"]),
     ("edge_softbody", "edge", ["tests/edge/sb_cgen.py", "{gen}/edge/edge_softbody_gen.inc"]),
+    ("edge_ovl", "edge", ["tests/edge/ovl_cgen.py", "{gen}/edge/edge_ovl_gen.cpp", "{gen}/edge/edge_ovl_gen.h"]),
     ("renjob", "renjob", ["tests/renjob/rj_cgen.py", "@tests/renjob/roots.txt", "{gen}/renjob/renjob_gen.cpp", "{gen}/renjob/renjob_gen.h"]),
     ("scream", "scream", ["tests/scream/sc_cgen.py", "all"]),
     ("scream_job", "scream", ["tests/scream/sc_job_cgen.py"]),

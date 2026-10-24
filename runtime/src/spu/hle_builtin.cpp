@@ -1,6 +1,7 @@
 #include "hle.h"
 #include "texcreator_native.h"
 #include "edge/edge_adapters.h"
+#include "edge/edge_ovl.h"
 #include "renjob/renjob_adapters.h"
 #include "scream/scream_adapters.h"
 #include "scream/scj_adapters.h"
@@ -50,7 +51,9 @@ bool edge_handler(Context& c) {
     size_t n = 0;
     const edge::Adapter& a = edge::adapters(n)[I];
     edge::Outputs outs;
-    return a.handler(c.ls, c, outs);
+    if (a.handler(c.ls, c, outs)) return true;
+    edge::ovl::count_decline(int(I));
+    return false;
 }
 
 using EdgeHandler = bool (*)(Context&);
@@ -299,6 +302,36 @@ void install_mpjob() {
     install_mpjob_one<mpjob::kSortPrim>(e, "sp");
 }
 
+template <size_t I>
+bool ovl_handler(Context& c, Host& h) {
+    return edge::ovl::run(c, h, edge::ovl::entry(I));
+}
+
+template <size_t... I>
+constexpr auto make_ovl_handlers(std::index_sequence<I...>) {
+    return std::array<HostHandler, sizeof...(I)>{ovl_handler<I>...};
+}
+
+constexpr auto kOvlHandlers = make_ovl_handlers(std::make_index_sequence<128>{});
+
+std::array<Function, 128> g_ovl_funcs{};
+
+void install_ovl() {
+    const char* e = std::getenv("GOWA_EDGE_OVL");
+    if (e && e[0] == '0') return;
+    if (const char* h = std::getenv("GOWA_SPU_HLE"); h && h[0] == '0') return;
+    size_t n = edge::ovl::entry_count();
+    for (size_t i = 0; i < n && i < g_ovl_funcs.size(); i++) g_ovl_funcs[i] = Function{0, 0, nullptr, nullptr, edge::ovl::entry_name(i), kOvlHandlers[i]};
+    g_dyn_on = n && n <= g_ovl_funcs.size();
+}
+
+}
+
+bool g_dyn_on = false;
+
+const Function* lookup_dyn(const uint8_t* ls, uint32_t pc) {
+    const edge::ovl::Entry* e = edge::ovl::find(ls, pc);
+    return e ? &g_ovl_funcs[size_t(edge::ovl::index_of(e))] : nullptr;
 }
 
 void install_builtin() {
@@ -306,6 +339,7 @@ void install_builtin() {
     std::call_once(once, [] {
         if (const char* e = std::getenv("GOWA_TEXCREATOR_HLE"); !e || e[0] != '0') register_function({0x56E0, 32, nullptr, texcreator_compute, "TexCreator.compute", nullptr, kTexCreatorComputeHash});
         install_edge();
+        install_ovl();
         install_renjob();
         install_scream();
         install_screamjob();
