@@ -1,7 +1,25 @@
 #include "common.h"
 #include "runtime/thread.h"
 
+#include <map>
+
 namespace hle {
+
+namespace {
+
+std::map<std::string, bool (*)()>& overrides() {
+    static std::map<std::string, bool (*)()> m;
+    return m;
+}
+
+}
+
+ModuleOverride::ModuleOverride(const char* file, bool (*active)()) { overrides()[file] = active; }
+
+bool module_overridden(const std::string& file) {
+    auto it = overrides().find(file);
+    return it != overrides().end() && it->second();
+}
 
 void call_guest(ppu::Context& ctx, uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
     ppu::Context saved = ctx;
