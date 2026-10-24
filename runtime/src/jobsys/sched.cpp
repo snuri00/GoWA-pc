@@ -113,6 +113,7 @@ void run_item(Executor& x, Item& it) {
     ModStat& ms = mod_stat(j.module_ea);
     ms.jobs.fetch_add(1, std::memory_order_relaxed);
     ms.cyc.fetch_add(dt, std::memory_order_relaxed);
+    atomic_max(ms.max_cyc, dt);
     complete(it.c);
     if (g_qn.load(std::memory_order_relaxed) && g_parked.load(std::memory_order_relaxed)) {
         g_wake.fetch_add(1, std::memory_order_release);

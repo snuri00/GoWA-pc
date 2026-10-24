@@ -21,6 +21,8 @@ struct Config {
     bool on = false;
     bool all_mods = true;
     std::vector<uint32_t> mods;
+    std::vector<uint32_t> add_mods;
+    std::vector<uint32_t> del_mods;
     Tier tier = Tier::Auto;
     std::vector<std::pair<uint32_t, Tier>> tier_mod;
     uint32_t verify = 0;
@@ -85,7 +87,7 @@ void start_stats();
 
 struct ModStat {
     uint32_t ea = 0;
-    std::atomic<uint64_t> jobs{0}, cyc{0}, fallback{0};
+    std::atomic<uint64_t> jobs{0}, cyc{0}, fallback{0}, max_cyc{0};
 };
 ModStat& mod_stat(uint32_t ea);
 void help_until_list(const Completion& c, uint32_t list);

@@ -88,9 +88,9 @@ void stats_thread() {
             uint64_t n = m.jobs.load(), c = m.cyc.load(), f = m.fallback.load();
             if (n != lm[i] || f != lmf[i]) {
                 const ModuleInfo* mi = find_module(m.ea);
-                char b[96];
-                std::snprintf(b, sizeof b, " %s:%llu/%.0fus/wws%llu", mi ? mi->name : std::to_string(m.ea).c_str(), (unsigned long long)(n - lm[i]), n != lm[i] ? double(c - lmc[i]) / hz * 1e6 / double(n - lm[i]) : 0.0,
-                              (unsigned long long)(f - lmf[i]));
+                char b[128];
+                std::snprintf(b, sizeof b, " %s:%llu/%.0fus/max%.1fms/wws%llu", mi ? mi->name : std::to_string(m.ea).c_str(), (unsigned long long)(n - lm[i]), n != lm[i] ? double(c - lmc[i]) / hz * 1e6 / double(n - lm[i]) : 0.0,
+                              double(m.max_cyc.exchange(0)) / hz * 1e3, (unsigned long long)(f - lmf[i]));
                 mods += b;
             }
             lm[i] = n;

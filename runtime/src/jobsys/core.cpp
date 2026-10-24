@@ -53,8 +53,24 @@ const Config& cfg() {
         Config c;
         bool legacy = env_on("GOWA_PPU_JOBS", false);
         c.on = env_on("GOWA_JOBSYS", kDefaultOn) || legacy;
-        c.mods = parse_hex(std::getenv("GOWA_JOBSYS_MODS"));
-        if (c.mods.empty() && legacy) c.mods = parse_hex(std::getenv("GOWA_PPU_JOBS_MODS"));
+        const char* ms = std::getenv("GOWA_JOBSYS_MODS");
+        if (!ms && legacy) ms = std::getenv("GOWA_PPU_JOBS_MODS");
+        if (ms) {
+            std::string s = ms;
+            size_t pos = 0;
+            while (pos < s.size()) {
+                size_t end = s.find(',', pos);
+                if (end == std::string::npos) end = s.size();
+                std::string t = s.substr(pos, end - pos);
+                pos = end + 1;
+                if (t.empty()) continue;
+                char k = t[0];
+                uint32_t ea = static_cast<uint32_t>(std::strtoul(t.c_str() + (k == '+' || k == '-' ? 1 : 0), nullptr, 16));
+                if (k == '+') c.add_mods.push_back(ea);
+                else if (k == '-') c.del_mods.push_back(ea);
+                else c.mods.push_back(ea);
+            }
+        }
         c.all_mods = c.mods.empty();
         if (const char* t = std::getenv("GOWA_JOBSYS_TIER")) {
             std::string s = t;
@@ -249,6 +265,8 @@ void for_each_module(void (*fn)(const ModuleInfo&, void*), void* user) {
 bool module_enabled(uint32_t ea) {
     const Config& c = cfg();
     if (!c.on) return false;
+    if (std::find(c.del_mods.begin(), c.del_mods.end(), ea) != c.del_mods.end()) return false;
+    if (std::find(c.add_mods.begin(), c.add_mods.end(), ea) != c.add_mods.end()) return true;
     if (!c.all_mods) return std::find(c.mods.begin(), c.mods.end(), ea) != c.mods.end();
     const ModuleInfo* m = find_module(ea);
     return m && !(m->flags & kOptIn);
