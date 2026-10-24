@@ -88,8 +88,13 @@ bool edgejob_on() {
     return !(e && e[0] == '0');
 }
 
+bool fallback_on() {
+    const char* e = std::getenv("GOWA_EDGE_FALLBACK");
+    return !(e && e[0] == '0');
+}
+
 void install_edge() {
-    if (edgejob_on()) {
+    if (edgejob_on() && fallback_on()) {
         size_t hn = 0;
         const uint32_t* h = edgejob::hooks(hn);
         for (size_t i = 0; i < hn; i++) {

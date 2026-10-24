@@ -132,13 +132,36 @@ const Entry* entry(size_t i) { return i < kEntryCount ? &kEntries[i] : nullptr; 
 size_t entry_count() { return kEntryCount; }
 const char* entry_name(size_t i) { return i < kEntryCount ? kEntries[i].name : "?"; }
 
+namespace {
+
+struct Local {
+    uint64_t runs = 0;
+    uint64_t insns = 0;
+    uint32_t per[256] = {};
+    void flush() {
+        count(kRuns, runs);
+        count(kRunInsns, insns);
+        for (size_t i = 0; i < kEntryCount && i < 256; i++)
+            if (per[i]) {
+                stats().per_entry[i].fetch_add(per[i], std::memory_order_relaxed);
+                per[i] = 0;
+            }
+        runs = insns = 0;
+    }
+};
+
+thread_local Local t_local;
+
+}
+
 bool run(spu::Context& c, spu::Host& h, const Entry* e) {
     uint64_t budget = c.executed ? c.executed : (1ull << 40);
     bool ok = e->run(c, h, c.pc, budget);
     if (ok && stats_on()) {
-        count(kRuns, 1);
-        count(kRunInsns, c.executed);
-        count_entry(index_of(e));
+        Local& l = t_local;
+        l.insns += c.executed;
+        l.per[index_of(e) & 255]++;
+        if (++l.runs >= 2048) l.flush();
     }
     return ok;
 }
