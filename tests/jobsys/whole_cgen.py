@@ -13,10 +13,8 @@ MODULES = [
     (0x743a00, "ColorCorrection"),
     (0x766280, "ReadPackets"),
     (0x77a580, "WritePackets"),
-    (0x6f4a00, "SortPrim"),
     (0x728400, "Cloth"),
     (0x7a5c80, "StereoDepth"),
-    (0x74b100, "MeshPrep"),
     (0x71c500, "WaterProc"),
 ]
 
