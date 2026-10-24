@@ -3,6 +3,7 @@
 #include "runtime/hooks.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
+#include "runtime/ppujobs.h"
 #include "runtime/reservation.h"
 #include "runtime/trace.h"
 
@@ -567,6 +568,25 @@ void install_patches() {
     }
 }
 
+void install_ppujobs() {
+    if (!ppujobs::enabled()) return;
+    struct Patch {
+        uint32_t addr;
+        bool (*guard)(ppu::Context&);
+    };
+    static const Patch patches[] = {{0x3e13e0, ppujobs::on_submit}, {0x49e540, ppujobs::on_push}, {0x49ce50, ppujobs::on_kick}, {0x49e368, ppujobs::on_wait}};
+    for (const Patch& p : patches) {
+        Hook*& h = g_hooks[p.addr];
+        if (!h) {
+            h = new Hook;
+            h->addr = p.addr;
+            h->quiet = true;
+        }
+        h->guard = p.guard;
+        ppu::hook_flags[p.addr >> 2] = 1;
+    }
+}
+
 void hog_thread(int lp, int on_ms, int off_ms, double from) {
     SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << lp);
     SetThreadDescription(GetCurrentThread(), L"test hog");
@@ -608,6 +628,7 @@ void init() {
     const char* spec = combined.c_str();
     if (!*spec) {
         install_patches();
+        install_ppujobs();
         install_critpath();
         if (!g_hooks.empty()) ppu::hook_impl = impl;
         return;
@@ -668,6 +689,7 @@ void init() {
         if (!h->ring && !h->panic) LOG_INFO("hook", "hooked %s at 0x%08x", name_of(addr).c_str(), addr);
     }
     install_patches();
+    install_ppujobs();
     install_critpath();
     if (g_hooks.empty()) return;
     ppu::hook_impl = impl;

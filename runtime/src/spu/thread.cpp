@@ -1427,6 +1427,17 @@ void SpuThread::run() {
             crash::profile_thread(h, label.c_str());
         }
     }
+    exec();
+    LOG_INFO("spu", "thread 0x%x '%s' stopped at 0x%05x", id, name.c_str(), ctx.pc);
+    {
+        std::lock_guard lk(m);
+        running = false;
+        in_mbox.clear();
+    }
+    if (group && !aux) group->thread_stopped(*this);
+}
+
+void SpuThread::exec() {
     uint32_t n = 0;
     static const std::vector<uint32_t> bps = [] {
         std::vector<uint32_t> v;
@@ -1483,23 +1494,16 @@ void SpuThread::run() {
         if (!int_ok) halted_in_verify = true;
         return true;
     };
-    struct alignas(32) Slot {
-        const CompiledBlock* b;
-        BlockFn fn;
-        BlockFn region;
-        uint32_t words;
-        uint32_t valid;
-    };
-    std::vector<Slot> block_cache(aot_on ? LS_SIZE / 4 : 0, Slot{});
-    struct HleSlot {
-        const hle::Function* f;
-        uint32_t valid;
-    };
+    using Slot = ExecSlot;
+    using HleSlot = ExecHleSlot;
+    if (aot_on && exec_blocks.size() != LS_SIZE / 4) exec_blocks.assign(LS_SIZE / 4, Slot{});
+    std::vector<Slot>& block_cache = exec_blocks;
     static const bool hle_cache_on = [] {
         const char* e = std::getenv("GOWA_SPU_HLE_CACHE");
         return !e || e[0] != '0';
     }();
-    std::vector<HleSlot> hle_cache(hle_cache_on ? LS_SIZE / 4 : 0, HleSlot{});
+    if (hle_cache_on && exec_hle.size() != LS_SIZE / 4) exec_hle.assign(LS_SIZE / 4, HleSlot{});
+    std::vector<HleSlot>& hle_cache = exec_hle;
     auto hle_find = [&](uint32_t pc) -> const hle::Function* {
         if (!hle_cache_on) return hle::lookup(ls, pc);
         HleSlot& hs = hle_cache[pc >> 2];
@@ -1515,7 +1519,7 @@ void SpuThread::run() {
     const bool use_regions = !verify && !std::getenv("GOWA_SPU_NO_REGIONS");
     uint32_t irq_countdown = 256;
     uint64_t cyc_mark = 0;
-    Host* host = this;
+    Host* host = exec_host ? exec_host : this;
     static const double cap_at = std::getenv("GOWA_SPU_CAPTURE_AT") ? std::atof(std::getenv("GOWA_SPU_CAPTURE_AT")) : 0.0;
     static const uint32_t cap_insns = std::getenv("GOWA_SPU_CAPTURE_INSNS") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_SPU_CAPTURE_INSNS"), nullptr, 0)) : 20000000u;
     std::unique_ptr<CaptureHost> cap;
@@ -1534,7 +1538,7 @@ void SpuThread::run() {
     bool block_start = true;
     uint32_t block_len = 0;
     static const int job_log = std::getenv("GOWA_SPU_JOBS") ? std::atoi(std::getenv("GOWA_SPU_JOBS")) : 0;
-    const bool cp_on = critpath::g_on;
+    const bool cp_on = critpath::g_on && !job_mode;
     if (cp_on) critpath::spu_init_sig();
     const uint32_t* cp_src = line_src.get();
     const bool edge_stats = edge::ovl::stats_on();
@@ -1554,6 +1558,20 @@ void SpuThread::run() {
                 ctx.pc = __builtin_bswap32(exit_pc) & PC_MASK;
             }
             if (cp_on) critpath::spu_block(cp, slot, ls, cp_src, ctx.pc);
+            if (job_mode && ctx.pc < 0x4000) {
+                if (ctx.pc == job_stop) {
+                    exec_insns += n;
+                    n = 0;
+                    if (!job_next(*this)) break;
+                    host = exec_host ? exec_host : this;
+                    block_start = true;
+                    continue;
+                }
+                if (job_trap && job_trap(*this)) {
+                    block_start = true;
+                    continue;
+                }
+            }
             if (job_log) {
                 uint32_t src = line_src[ctx.pc >> 7];
                 if (src != cur_src) {
@@ -1703,7 +1721,7 @@ void SpuThread::run() {
                         pc_samples[pc_sample_pos.fetch_add(1, std::memory_order_relaxed) & 255] = ctx.pc;
                         if (stop_flag.load(std::memory_order_relaxed)) break;
                         bool cap_start_now = false;
-                        if (!cap) {
+                        if (!cap && !job_mode) {
                             uint32_t g = g_cap_gen.load(std::memory_order_relaxed);
                             if (g != cap_gen_seen) {
                                 cap_gen_seen = g;
@@ -1776,13 +1794,7 @@ void SpuThread::run() {
         }
     }
     if (rec) aot::flush();
-    LOG_INFO("spu", "thread 0x%x '%s' stopped at 0x%05x", id, name.c_str(), ctx.pc);
-    {
-        std::lock_guard lk(m);
-        running = false;
-        in_mbox.clear();
-    }
-    if (group && !aux) group->thread_stopped(*this);
+    exec_insns += n;
 }
 
 namespace {
