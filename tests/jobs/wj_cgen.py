@@ -32,20 +32,28 @@ def crt(data, ea):
     entry = 0x4000 + u32(data, ea + 0x10)
     tail = None
     tabs = []
+    base = None
+    r2 = None
     for i in range(160):
         pc = entry + 4 * i
         s = D.dis(u32(data, ea + pc - 0x4000), pc)
+        if s.startswith("ila r2,") and r2 is None:
+            r2 = int(s.split(",")[1], 16)
+        if s.startswith("brsl r126,") and base is None and r2 is not None:
+            base = int(s.split(",")[1], 16) - r2
+        if base is None:
+            continue
         if s.startswith("ila r0,") and tail is None:
-            tail = int(s.split(",")[1], 16) + 0x4000
+            tail = int(s.split(",")[1], 16) + base
         if s.startswith("ila r80,"):
-            tabs.append(int(s.split(",")[1], 16) + 0x4000)
+            tabs.append(int(s.split(",")[1], 16) + base)
     ctors = []
     for t in tabs:
         for j in range(64):
             v = u32(data, ea + t - 0x4000 + 4 * j)
             if v == 0xFFFFFFFF or v == 0:
                 break
-            ctors.append(v + 0x4000)
+            ctors.append(v + base)
     return entry, tail, ctors
 
 

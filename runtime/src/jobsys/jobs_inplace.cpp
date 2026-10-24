@@ -306,7 +306,7 @@ void install_inplace() {
     const char* e = std::getenv("GOWA_WJ");
     if (!e || !*e || e[0] == '0') return;
     std::string sel(e);
-    for (int j = 0; j < kJobCount; j++) g_on[j] = sel == "1" || sel == "all" || sel.find(kShort[j]) != std::string::npos;
+    for (int j = 0; j < kJobCount; j++) g_on[j] = ((sel == "1" || sel == "all") && j != kAnim) || sel.find(kShort[j]) != std::string::npos;
     if (const char* v = std::getenv("GOWA_WJ_VERIFY")) g_verify = static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
     for (int j = 0; j < kJobCount; j++) {
         if (!g_on[j]) continue;
