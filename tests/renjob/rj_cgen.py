@@ -26,6 +26,7 @@ WHOLE_ROOTS = (0x14cf8, 0x052c8, 0x13310, 0x14ae0, 0x14800, 0x05830)
 WHOLE_MULTI = {0x14cf8: (0x14cf8, 0x14da4)}
 PM_CALLS = {0x017b8: "pm_gettag(R, ls, ctl);", 0x017c0: "pm_releasetag(R, ls, ctl);", 0x017e0: ""}
 LOOP_BUDGET = False
+DOPS3 = ()
 REC_EDGES = set()
 PC_COUNTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pc_counts.txt")
 
@@ -185,7 +186,7 @@ def reads_of(d):
     if op in ("selb", "shufb", "fma", "fms", "fnms", "mpya"):
         rs |= {d["ra"], d["rb"], d["rc"]}
         return rs
-    if op in ("addx", "sfx", "cgx", "bgx", "iohl"):
+    if op in ("addx", "sfx", "cgx", "bgx", "iohl") or op in DOPS3:
         rs.add(d["rt"])
     if op in ("il", "ilh", "ilhu", "ila", "fsmbi", "lqr", "lqa", "stqr", "stqa", "br", "brsl", "bra", "brasl", "stop", "stopd", "lnop", "nop", "hbrr", "hbra", "rdch", "rchcnt", "iohl", "invalid"):
         return rs
@@ -530,7 +531,7 @@ def emit_func(f, out):
             s = "R[%d] = %s(R[%d], %d);" % (rt, cn(op), ra, imm)
         elif op in ("selb", "shufb", "fma", "fms", "fnms", "mpya"):
             s = "R[%d] = %s(R[%d], R[%d], R[%d]);" % (rt, op, ra, rb, rc)
-        elif op in ("addx", "sfx", "cgx", "bgx"):
+        elif op in ("addx", "sfx", "cgx", "bgx") or op in DOPS3:
             s = "R[%d] = %s(R[%d], R[%d], R[%d]);" % (rt, op, ra, rb, rt)
         elif op in ("cflts", "cfltu", "cuflt", "csflt"):
             s = "R[%d] = %s(R[%d], %d);" % (rt, op, ra, imm)

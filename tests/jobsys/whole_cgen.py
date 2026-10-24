@@ -53,6 +53,9 @@ def gen_module(ea, name, gen_dir):
     G.WHOLE = True
     G.EXITS = False
     G.KERNELS = {}
+    G.DOPS3 = ("dfma", "dfms", "dfnms", "dfnma")
+    G.RR3.update({"dfa", "dfs", "dfm", "dfceq", "dfcgt", "dfcmeq", "dfcmgt"})
+    G.RR2.update({"fesd", "frds"})
     G.HINTS = False
     G.PC_COUNTS = {}
     known = {entry}
@@ -80,7 +83,7 @@ def gen_module(ea, name, gen_dir):
         f.tails = {c for c in f.tails if c in funcs}
     ns = "renjob::jw%06x" % ea
     base = "w_%06x_gen.h" % ea
-    out = ['#include "%s"' % base, '#include "jwhole_rt.h"', "", "namespace %s {" % ns, "", "using namespace renjob::xo;", "", "#define FAIL(pc) do { ctl.fail = true; ctl.out = true; ctl.fail_pc = pc; return; } while (0)", ""]
+    out = ['#include "%s"' % base, '#include "jwhole_rt.h"', '#include "jw_dops.h"', "", "namespace %s {" % ns, "", "using namespace renjob::xo;", "", "#define FAIL(pc) do { ctl.fail = true; ctl.out = true; ctl.fail_pc = pc; return; } while (0)", ""]
     inline_max = 120
     for e in sorted(funcs):
         if e != entry and len(funcs[e].insns) <= inline_max and not (funcs[e].calls & set(funcs)):
