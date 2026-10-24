@@ -1152,9 +1152,12 @@ void shutdown() {
 namespace gpu::dlssnr {
 
 int mode() {
-    const char* v = std::getenv("GOWA_DLSSNR");
-    int r = v ? std::atoi(v) : 0;
-    return r == 1 || r == 2 ? r : 0;
+    static const int m = [] {
+        const char* v = std::getenv("GOWA_DLSSNR");
+        int r = v ? std::atoi(v) : 0;
+        return r == 1 || r == 2 ? r : 0;
+    }();
+    return m;
 }
 bool requested() { return mode() != 0; }
 bool active() { return false; }
