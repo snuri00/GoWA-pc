@@ -14,6 +14,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -21,7 +22,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
+#include <unordered_map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -249,6 +252,9 @@ struct ChanRec {
     uint32_t value;
     std::vector<std::pair<uint32_t, std::vector<uint8_t>>> lines;
     std::vector<std::pair<uint32_t, std::vector<uint8_t>>> outs;
+    std::vector<uint32_t> line_ea;
+    std::vector<uint32_t> out_ea;
+    bool ok = true;
 };
 
 struct Recorder : spu::Host {
@@ -269,16 +275,20 @@ struct Recorder : spu::Host {
         ChanRec r{1, ch, value, {}, {}};
         if (ch == 21) {
             uint32_t cmd = value & 0xff;
+            uint32_t cur_ea = eal;
             auto grab = [&](uint32_t a, uint32_t n) {
                 a &= 0x3ffff;
                 if (n > 0x40000 - a) n = 0x40000 - a;
                 r.lines.push_back({a, std::vector<uint8_t>(t.ls + a, t.ls + a + n)});
+                r.line_ea.push_back(cur_ea);
             };
             auto out = [&](uint32_t a, uint32_t n) {
                 a &= 0x3ffff;
                 if (n > 0x40000 - a) n = 0x40000 - a;
                 r.outs.push_back({a, std::vector<uint8_t>(t.ls + a, t.ls + a + n)});
+                r.out_ea.push_back(cur_ea);
             };
+            if (cmd == 0xb4) r.ok = t.atomic_stat == 0;
             bool put = (cmd >= 0x20 && cmd <= 0x26) || (cmd >= 0x30 && cmd <= 0x36) || cmd == 0xa0 || cmd == 0xa1 || cmd == 0xa2;
             if (put && ((cmd & 0xf) >= 4 && (cmd & 0xf) <= 6)) {
                 uint32_t cur = lsa & 0x3fff0, list = eal & 0x3fff8;
@@ -288,6 +298,7 @@ struct Recorder : spu::Host {
                     uint32_t ea;
                     std::memcpy(&ea, e + 4, 4);
                     ea = __builtin_bswap32(ea);
+                    cur_ea = ea;
                     out(cur | (ea & 15), ts);
                     cur = (cur + ((ts + 15) & ~15u)) & 0x3fff0;
                     list = (list + 8) & 0x3fff8;
@@ -295,10 +306,14 @@ struct Recorder : spu::Host {
             } else if (put) {
                 out(lsa, cmd >= 0xa0 ? 4 : size);
             } else if (cmd == 0xb4 || cmd == 0xb0 || cmd == 0xb8) {
+                cur_ea = eal & ~127u;
                 out(lsa & ~127u, 128);
             }
             if (cmd == 0x40 || cmd == 0x41 || cmd == 0x42) grab(lsa, size);
-            else if (cmd == 0xd0) grab(lsa & ~127u, 128);
+            else if (cmd == 0xd0) {
+                cur_ea = eal & ~127u;
+                grab(lsa & ~127u, 128);
+            }
             else if (cmd == 0x44 || cmd == 0x45 || cmd == 0x46) {
                 uint32_t cur = lsa & 0x3fff0, list = eal & 0x3fff8;
                 for (uint32_t n = size; n >= 8; n -= 8) {
@@ -307,6 +322,7 @@ struct Recorder : spu::Host {
                     uint32_t ea;
                     std::memcpy(&ea, e + 4, 4);
                     ea = __builtin_bswap32(ea);
+                    cur_ea = ea;
                     grab(cur | (ea & 15), ts);
                     cur = (cur + ((ts + 15) & ~15u)) & 0x3fff0;
                     list = (list + 8) & 0x3fff8;
@@ -978,11 +994,227 @@ uint64_t thread_cycles() {
 
 void run_native_body(Exec& x, bool emu_only);
 
+struct SandboxHost final : renjob::ChanHost {
+    spu::SpuThread& t;
+    const std::unordered_map<uint32_t, std::vector<uint8_t>>& inputs;
+    std::unordered_map<uint32_t, uint32_t> rpos;
+    std::vector<uint8_t> llc_ok;
+    size_t llc_pos = 0;
+    std::map<uint32_t, uint8_t> writes;
+    uint32_t live_bytes = 0;
+    alignas(16) uint8_t rline[128] = {};
+    SandboxHost(spu::SpuThread& th, const std::unordered_map<uint32_t, std::vector<uint8_t>>& in) : t(th), inputs(in) {}
+    uint8_t byte(uint32_t ea) {
+        auto i = inputs.find(ea);
+        if (i != inputs.end()) {
+            uint32_t k = rpos[ea]++;
+            return i->second[k < i->second.size() ? k : i->second.size() - 1];
+        }
+        auto w = writes.find(ea);
+        if (w != writes.end()) return w->second;
+        live_bytes++;
+        return vm::is_mapped(ea) ? vm::ptr(ea)[0] : 0;
+    }
+    void load(uint32_t lsa, uint32_t ea, uint32_t n) {
+        for (uint32_t k = 0; k < n; k++) t.ls[(lsa + k) & 0x3FFFF] = byte(ea + k);
+    }
+    void store(uint32_t lsa, uint32_t ea, uint32_t n) {
+        for (uint32_t k = 0; k < n; k++) writes[ea + k] = t.ls[(lsa + k) & 0x3FFFF];
+    }
+    uint32_t rd(uint32_t ch) override {
+        switch (ch) {
+        case 13: return t.ctx.interrupts_enabled ? 1 : 0;
+        case 24:
+            t.tag_stat_count = false;
+            return t.tag_stat;
+        case 27:
+            t.atomic_stat_count = false;
+            return t.atomic_stat;
+        case 8: return 0;
+        default: abort = true; return 0;
+        }
+    }
+    uint32_t cnt(uint32_t ch) override {
+        switch (ch) {
+        case 21: return 16;
+        case 23: return 1;
+        case 24: return t.tag_stat_count;
+        case 27: return t.atomic_stat_count;
+        default: abort = true; return 0;
+        }
+    }
+    void wr(uint32_t ch, uint32_t v) override {
+        switch (ch) {
+        case 16: t.mfc_lsa = v; return;
+        case 17: return;
+        case 18: t.mfc_eal = v; return;
+        case 19: t.mfc_size = v > 0xFFFF ? 0xFFFF : v; return;
+        case 20: t.mfc_tag = v & 0x1F; return;
+        case 22: t.tag_mask = v; return;
+        case 23:
+            t.tag_stat = t.tag_mask;
+            if (v == 1 && t.tag_mask == 0) return;
+            t.tag_stat_count = true;
+            return;
+        case 21: break;
+        default: abort = true; return;
+        }
+        uint32_t cmd = v & 0xFF, lsa = t.mfc_lsa & 0x3FFFF, ea = t.mfc_eal, size = t.mfc_size;
+        switch (cmd) {
+        case 0x40: case 0x41: case 0x42: load(lsa, ea, size); return;
+        case 0x20: case 0x21: case 0x22: store(lsa, ea, size); return;
+        case 0x44: case 0x45: case 0x46: case 0x24: case 0x25: case 0x26: {
+            uint32_t cur = lsa & 0x3FFF0, list = ea & 0x3FFF8;
+            for (uint32_t n = size; n >= 8; n -= 8) {
+                const uint8_t* e = t.ls + list;
+                uint32_t ts = ((uint32_t(e[2]) << 8) | e[3]) & 0x7FFF;
+                uint32_t a;
+                std::memcpy(&a, e + 4, 4);
+                a = __builtin_bswap32(a);
+                if (cmd < 0x40) store(cur | (a & 15), a, ts);
+                else load(cur | (a & 15), a, ts);
+                cur = (cur + ((ts + 15) & ~15u)) & 0x3FFF0;
+                list = (list + 8) & 0x3FFF8;
+            }
+            return;
+        }
+        case 0xD0:
+            load(lsa & 0x3FF80, ea & ~127u, 128);
+            std::memcpy(rline, t.ls + (lsa & 0x3FF80), 128);
+            t.atomic_stat = 4;
+            t.atomic_stat_count = true;
+            return;
+        case 0xB4: {
+            bool ok = llc_pos < llc_ok.size() ? llc_ok[llc_pos] != 0 : true;
+            llc_pos++;
+            if (ok) store(lsa & 0x3FF80, ea & ~127u, 128);
+            t.atomic_stat = ok ? 0 : 1;
+            t.atomic_stat_count = true;
+            return;
+        }
+        case 0xB0: case 0xB8:
+            store(lsa & 0x3FF80, ea & ~127u, 128);
+            if (cmd == 0xB0) {
+                t.atomic_stat = 2;
+                t.atomic_stat_count = true;
+            }
+            return;
+        case 0xC0: case 0xC8: case 0xCC: case 0x80: case 0x81: return;
+        default: abort = true; return;
+        }
+    }
+};
+
+struct SandboxStats {
+    std::atomic<uint64_t> runs{0}, same{0}, differ{0}, skipped{0}, seq_differs{0};
+};
+SandboxStats g_sbx;
+std::mutex g_sbx_m;
+std::map<uint32_t, std::array<uint64_t, 3>> g_sbx_mask;
+
+void sbx_note(uint32_t mask, int k) {
+    std::lock_guard lk(g_sbx_m);
+    g_sbx_mask[mask][k]++;
+}
+
+void verify_sandbox(Exec& x, uint32_t mask) {
+    if (!x.shadow) return;
+    std::unordered_map<uint32_t, std::vector<uint8_t>> inputs;
+    std::map<uint32_t, uint8_t> ref;
+    for (const ChanRec& e : x.rec->ev) {
+        for (size_t i = 0; i < e.lines.size() && i < e.line_ea.size(); i++) {
+            const auto& d = e.lines[i].second;
+            for (uint32_t k = 0; k < d.size(); k++) inputs[e.line_ea[i] + k].push_back(d[k]);
+        }
+        if (!e.ok) continue;
+        for (size_t i = 0; i < e.outs.size() && i < e.out_ea.size(); i++) {
+            const auto& d = e.outs[i].second;
+            for (uint32_t k = 0; k < d.size(); k++) ref[e.out_ea[i] + k] = d[k];
+        }
+    }
+    spu::SpuThread& s = *x.shadow;
+    std::memcpy(s.ls, x.start_ls.data(), spu::LS_SIZE);
+    std::memcpy(s.ctx.gpr, x.ref_ctx_start.gpr, sizeof s.ctx.gpr);
+    static thread_local std::vector<uint8_t> prev_cache;
+    if (mask & 0x10000) {
+        bool have = prev_cache.size() == 0x38a00 - 0x19300;
+        if (have) std::memcpy(s.ls + 0x19300, prev_cache.data(), prev_cache.size());
+        prev_cache.assign(x.start_ls.begin() + 0x19300, x.start_ls.begin() + 0x38a00);
+        if (!have) return;
+    }
+    poison(s, g_job_seq.load() * 31 + 5, mask & 0xffff);
+    setup_job(s, x.cur, x.index);
+    SandboxHost h(s, inputs);
+    for (const ChanRec& e : x.rec->ev)
+        if (e.kind == 1 && e.ch == 21 && (e.value & 0xff) == 0xb4) h.llc_ok.push_back(e.ok ? 1 : 0);
+    renjob::WholeResult r = renjob::run_whole(s.ls, s.ctx, h);
+    g_sbx.runs.fetch_add(1);
+    static std::atomic<int> logged{0};
+    if (!r.done || h.abort) {
+        g_sbx.skipped.fetch_add(1);
+        sbx_note(mask, 2);
+        if (logged.fetch_add(1) < 10) LOG_WARN("ppujobs", "sandbox verify skipped: done %d abort %d fail pc 0x%05x", r.done ? 1 : 0, h.abort ? 1 : 0, r.fail_pc);
+        return;
+    }
+    uint32_t diff = 0, first = 0;
+    for (auto& [a, v] : ref) {
+        auto it = h.writes.find(a);
+        if (it == h.writes.end() || it->second != v) {
+            if (!diff) first = a;
+            diff++;
+        }
+    }
+    uint32_t extra = 0;
+    for (auto& [a, v] : h.writes) {
+        if (!ref.count(a)) {
+            if (!diff && !extra) first = a;
+            extra++;
+        }
+    }
+    static std::atomic<int> detail_logged{0};
+    static const uint32_t detail_mask = std::getenv("GOWA_PPU_JOBS_SBXDETAIL") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_PPU_JOBS_SBXDETAIL"), nullptr, 16)) : 0x10000u;
+    if ((diff || extra) && mask == detail_mask && detail_logged.fetch_add(1) < 12) {
+        std::string d;
+        uint32_t shown = 0, prev = 0;
+        for (auto& [a, v] : ref) {
+            auto it = h.writes.find(a);
+            bool bad = it == h.writes.end() || it->second != v;
+            if (!bad || shown >= 64) continue;
+            char b[48];
+            std::snprintf(b, sizeof b, "%s%08x:%02x/%s", a == prev + 1 ? "," : " ", a, v, it == h.writes.end() ? "--" : (std::to_string(it->second)).c_str());
+            d += b;
+            prev = a;
+            shown++;
+        }
+        d += " | extra";
+        shown = 0;
+        for (auto& [a, v] : h.writes) {
+            if (ref.count(a) || shown >= 24) continue;
+            char b[32];
+            std::snprintf(b, sizeof b, " %08x:%02x", a, v);
+            d += b;
+            shown++;
+        }
+        LOG_INFO("ppujobs", "sandbox diff detail mask 0x%x job cmd 0x%08x live %u:%s", mask, x.cur.cmd_ea, h.live_bytes, d.c_str());
+    }
+    if (diff || extra) {
+        g_sbx.differ.fetch_add(1);
+        sbx_note(mask, 1);
+        if (logged.fetch_add(1) < 30) LOG_ERROR("ppujobs", "sandbox verify DIFFERS poison 0x%x job cmd 0x%08x: %u ref bytes differ, %u extra bytes, first ea 0x%08x, live input bytes %u", mask, x.cur.cmd_ea, diff, extra, first, h.live_bytes);
+    } else {
+        g_sbx.same.fetch_add(1);
+        sbx_note(mask, 0);
+        if (logged.fetch_add(1) < 20) LOG_INFO("ppujobs", "sandbox verify same poison 0x%x job cmd 0x%08x: %zu written bytes, live input bytes %u", mask, x.cur.cmd_ea, ref.size(), h.live_bytes);
+    }
+}
+
 void run_native_job(Exec& x) {
     spu::SpuThread& t = *x.t;
     if (x.verify_this) {
         emulate_rest(t, x.rec.get());
         verify_native(x);
+        static const std::vector<uint32_t> smasks = parse_hex_list(std::getenv("GOWA_PPU_JOBS_SANDBOX"));
+        for (uint32_t m : smasks) verify_sandbox(x, m);
         x.verify_this = false;
         return;
     }
@@ -1130,6 +1362,12 @@ void stats_thread() {
             lsd = sd;
             lrmw = rmw;
             lslow = sl;
+        }
+        if (cfg().verify && g_sbx.runs.load()) {
+            LOG_INFO("ppujobs", "sandbox verify: %llu runs, %llu same, %llu differ, %llu skipped", static_cast<unsigned long long>(g_sbx.runs.load()), static_cast<unsigned long long>(g_sbx.same.load()),
+                     static_cast<unsigned long long>(g_sbx.differ.load()), static_cast<unsigned long long>(g_sbx.skipped.load()));
+            std::lock_guard lk(g_sbx_m);
+            for (auto& [m, c] : g_sbx_mask) LOG_INFO("ppujobs", "sandbox mask 0x%x: same %llu differ %llu skipped %llu", m, static_cast<unsigned long long>(c[0]), static_cast<unsigned long long>(c[1]), static_cast<unsigned long long>(c[2]));
         }
         if (cfg().verify) {
             std::string v;
