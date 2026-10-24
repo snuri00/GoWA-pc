@@ -259,7 +259,7 @@ void init() {
     }
     g_tsc_hz = calibrate();
     g_sys_min = static_cast<uint32_t>(g_tsc_hz * 20e-6);
-    char magic[8] = {'C', 'P', 'A', 'T', 'H', '2', 0, 0};
+    char magic[8] = {'C', 'P', 'A', 'T', 'H', '3', 0, 0};
     std::fwrite(magic, 1, 8, g_out);
     std::fwrite(&g_tsc_hz, 8, 1, g_out);
     g_on = true;
@@ -487,6 +487,7 @@ void spu_job_begin(SpuState& s, uint32_t slot, const uint8_t* ls, const uint32_t
     s.start = __rdtsc();
     s.lr_wait = s.blk_wait = 0;
     s.lab_n = 0;
+    s.emu = s.declined = 0;
     s.src = line_src[(wws ? 0x4000 : 0x3000) >> 7];
     (void)pc;
     uint32_t wid;
@@ -505,7 +506,8 @@ void spu_job_end(SpuState& s, uint32_t slot) {
     e.t0 = s.start;
     e.t1 = t1;
     e.a = s.src;
-    e.b = (s.wid & 0xFF) | (sat(s.lab_n, 0xFFFFFF) << 8);
+    e.b = (s.wid & 0xFF) | (sat(s.lab_n, 0xFF) << 8) | (sat(s.emu >> 4, 0xFFFF) << 16);
+    e.pad = static_cast<uint8_t>(sat(s.declined, 0xFF));
     e.c = (slot & 0xFF) | (uint32_t(s.wws) << 8) | (sat((s.idle_wait + s.idle_blk) >> 8, 0x7FFFFF) << 9);
     uint64_t q = s.pick && s.pick <= s.start ? s.start - s.pick : 0;
     e.d = sat(q, 0xFFFFFFFFu);

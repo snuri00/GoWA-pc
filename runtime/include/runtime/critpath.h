@@ -86,6 +86,7 @@ struct SpuState {
     uint64_t lr_wait = 0, blk_wait = 0, idle_wait = 0, idle_blk = 0;
     uint64_t lab_first = 0, lab_last = 0;
     uint32_t lab_n = 0;
+    uint32_t emu = 0, declined = 0;
 };
 
 enum SpuWait : uint8_t { SW_LR = 0, SW_BLOCK = 1 };

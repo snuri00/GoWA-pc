@@ -1568,10 +1568,13 @@ void SpuThread::run() {
                             continue;
                         }
                         ctx.pc = pc_before;
+                        if (cp_on) cp.declined++;
                     } else if (f->handler(ctx)) {
                         ctx.pc = ctx.gpr[0].u32[3] & PC_MASK;
                         block_start = true;
                         continue;
+                    } else if (cp_on) {
+                        cp.declined++;
                     }
                 }
             }
@@ -1612,6 +1615,7 @@ void SpuThread::run() {
                         ok = slot.fn(ctx, *host);
                     }
                     n += ran;
+                    if (cp_on) cp.emu += ran;
                     if (job_log) {
                         loc_aot += ran;
                         loc_calls++;
@@ -1715,6 +1719,7 @@ void SpuThread::run() {
         std::memcpy(&word, ls + ctx.pc, 4);
         word = __builtin_bswap32(word);
         if (job_log) g_interp_insns.fetch_add(1, std::memory_order_relaxed);
+        if (cp_on) cp.emu++;
         if (!step(ctx, *host)) break;
         if (aot::is_terminator(word) || ++block_len >= aot::MAX_BLOCK_WORDS) block_start = true;
         if (!bps.empty()) {

@@ -69,7 +69,7 @@ class Data:
         self.ev = collections.defaultdict(list)
         with open(path, "rb") as f:
             blob = f.read()
-        if blob[:5] != b"CPATH" or blob[5:6] not in (b"1", b"2"):
+        if blob[:5] != b"CPATH" or blob[5:6] not in (b"1", b"2", b"3"):
             raise SystemExit("not a critpath file: %s" % path)
         self.version = int(blob[5:6])
         self.hz = struct.unpack_from("<d", blob, 8)[0]
@@ -160,9 +160,15 @@ def job_split(d, j):
     lr = j[11] & 0xFFFFFFFF
     blk = j[11] >> 32
     ring = j[6]
-    labn = j[3] >> 8
+    labn = j[3] >> 8 if d.version == 2 else (j[3] >> 8) & 0xFF
     idle = (j[4] >> 9) << 8
     return wall, lr, blk, ring, labn, idle
+
+
+def job_emu(d, j):
+    if d.version < 3:
+        return 0, 0
+    return (j[3] >> 16) << 4, j[10]
 
 
 def job_for_store(st, by_slot, slot_end, hz):
@@ -235,6 +241,8 @@ def analyze(d, args):
             "blkw": collections.Counter(),
             "ringw": collections.Counter(),
             "spin": collections.Counter(),
+            "emu": collections.Counter(),
+            "decl": collections.Counter(),
             "cnt": collections.Counter(),
             "sys": 0.0,
             "sysk": collections.Counter(),
@@ -301,6 +309,9 @@ def analyze(d, args):
         F["blkw"][nm] += d.ms(blk)
         F["ringw"][nm] += d.ms(ring)
         F["spin"][nm] += 1 if labn > 1 else 0
+        emu, decl = job_emu(d, j)
+        F["emu"][nm] += emu
+        F["decl"][nm] += decl
         F["cnt"][nm] += 1
     return fr, long_batch, ctx
 
@@ -347,19 +358,23 @@ def table(d, fr, title, out):
         out.append("  | %s | %.2f | %.1f | %.2f | %.2f | %.2f |" % (k, v / n, 100 * v / n / ft, dq[k] / n, dr[k] / n, dn[k] / n))
     out.append("  notify by wait site (ms/frame): " + ", ".join("%s %.2f" % (k, v / n) for k, v in dns.most_common()))
     out.append("  main-thread blocking syscalls outside wait sites (ms/frame, site = lr<caller<caller): " + ", ".join("%s %.2f" % (k, v / n) for k, v in sysk.most_common(6)))
-    busy, lrw, blkw, ringw, spin = (collections.Counter() for _ in range(5))
+    busy, lrw, blkw, ringw, spin, emu, decl = (collections.Counter() for _ in range(7))
     for F in fr:
+        emu.update(F["emu"])
+        decl.update(F["decl"])
         busy.update(F["busy"])
         lrw.update(F["lrw"])
         blkw.update(F["blkw"])
         ringw.update(F["ringw"])
         spin.update(F["spin"])
     out.append("  SPU job time (ms/frame): wall = busy + event wait (rdch ch0: LR/SPURS events) + block wait (mailbox/signal/stop) + Edge ring spin (repeated RSX label 0x50300c80.. reads)")
-    out.append("  | job type | wall | busy | event wait | block wait | ring spin | jobs/frame | busy us/job | ring-spin jobs/frame |")
-    out.append("  |---|---|---|---|---|---|---|---|---|")
+    out.append("  emulated kinsn/job = SPU instructions run as recompiled/interpreted SPU code (not native HLE); HLE declines/job = native hooks that fell back to SPU code")
+    out.append("  | job type | wall | busy | event wait | block wait | ring spin | jobs/frame | busy us/job | ring-spin jobs/frame | emulated kinsn/job | HLE declines/job |")
+    out.append("  |---|---|---|---|---|---|---|---|---|---|---|")
     for k, v in run.most_common(16):
         c = cnt[k] or 1
-        out.append("  | %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.1f | %.0f | %.2f |" % (k, v / n, busy[k] / n, lrw[k] / n, blkw[k] / n, ringw[k] / n, cnt[k] / n, 1000 * busy[k] / c, spin[k] / n))
+        out.append("  | %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.1f | %.0f | %.2f | %.1f | %.2f |" % (
+            k, v / n, busy[k] / n, lrw[k] / n, blkw[k] / n, ringw[k] / n, cnt[k] / n, 1000 * busy[k] / c, spin[k] / n, emu[k] / c / 1000, decl[k] / c))
     tb, tl, tk, tr = (sum(x.values()) / n for x in (busy, lrw, blkw, ringw))
     out.append("  all jobs: wall %.1f ms/frame = %.2f SPUs (busy %.2f, event wait %.2f, block wait %.2f, ring spin %.2f SPUs)" % (
         sum(run.values()) / n, sum(run.values()) / n / ft, tb / ft, tl / ft, tk / ft, tr / ft))
