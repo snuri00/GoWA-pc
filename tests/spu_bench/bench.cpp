@@ -860,7 +860,7 @@ Result run(State& s, const Capture& cap, bool regions) {
         if (g_hle && (spu::hle::any_at(s.c.pc) || spu::hle::dyn_at(s.c.pc))) {
             const spu::hle::Function* f = spu::hle::any_at(s.c.pc) ? hle_find(s.c.pc) : nullptr;
             if (!f && spu::hle::dyn_at(s.c.pc)) f = spu::hle::lookup_dyn(s.ls, s.c.pc);
-            if (f && f->host_handler) {
+            auto try_host = [&](const spu::hle::Function* f) -> bool {
                 if (cap.insns - n > g_host_budget + 200000) {
                     uint32_t pc0 = s.c.pc;
                     uint64_t hb = g_host_budget;
@@ -901,10 +901,14 @@ Result run(State& s, const Capture& cap, bool regions) {
                         g_hle_insns += k;
                         s.c.irq_check = false;
                         if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value == n) host.next(5, 0, uint32_t(n), true);
-                        continue;
+                        return true;
                     }
                     s.c.pc = pc0;
                 }
+                return false;
+            };
+            if (f && f->host_handler) {
+                if (try_host(f)) continue;
                 f = nullptr;
             }
             if (f) {
@@ -931,6 +935,12 @@ Result run(State& s, const Capture& cap, bool regions) {
                 }
                 if (!g_have_counts) QueryThreadCycleTime(GetCurrentThread(), &x1);
                 excluded += x1 - x0;
+                const spu::hle::Function* fb = nullptr;
+                if (!iso_ok) {
+                    fb = spu::hle::lookup_next(s.ls, s.c.pc, f);
+                    if (fb && !fb->host_handler) fb = nullptr;
+                }
+                if (fb && try_host(fb)) continue;
                 if (iso_ok && n + k < cap.insns) {
                     if (g_js_on) g_phase = js_base | PH_NATIVE;
                     uint64_t h0 = __rdtsc();

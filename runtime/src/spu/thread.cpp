@@ -1557,8 +1557,18 @@ void SpuThread::run() {
             if (!cap && (hle::any_at(ctx.pc) || hle::dyn_at(ctx.pc))) {
                 const hle::Function* f = hle::any_at(ctx.pc) ? hle_find(ctx.pc) : nullptr;
                 if (!f && hle::dyn_at(ctx.pc)) f = hle::lookup_dyn(ls, ctx.pc);
+                if (f && !f->host_handler) {
+                    if (f->handler(ctx)) {
+                        ctx.pc = ctx.gpr[0].u32[3] & PC_MASK;
+                        block_start = true;
+                        continue;
+                    }
+                    if (cp_on) cp.declined++;
+                    f = hle::lookup_next(ls, ctx.pc, f);
+                    if (f && !f->host_handler) f = nullptr;
+                }
                 if (f) {
-                    if (f->host_handler) {
+                    {
                         ctx.executed = 0;
                         uint32_t pc_before = ctx.pc;
                         if (f->host_handler(ctx, *host)) {
@@ -1580,12 +1590,6 @@ void SpuThread::run() {
                         }
                         ctx.pc = pc_before;
                         if (cp_on) cp.declined++;
-                    } else if (f->handler(ctx)) {
-                        ctx.pc = ctx.gpr[0].u32[3] & PC_MASK;
-                        block_start = true;
-                        continue;
-                    } else if (cp_on) {
-                        cp.declined++;
                     }
                 }
             }

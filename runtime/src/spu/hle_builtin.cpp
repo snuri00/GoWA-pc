@@ -75,7 +75,30 @@ bool skipped(const char* var, uint32_t lsa) {
     return false;
 }
 
+bool is_edge_native(uint32_t lsa) {
+    size_t n = 0;
+    const edge::Adapter* a = edge::adapters(n);
+    for (size_t i = 0; i < n; i++)
+        if (a[i].lsa == lsa) return true;
+    return false;
+}
+
+bool edgejob_on() {
+    const char* e = std::getenv("GOWA_EDGEJOB_HLE");
+    return !(e && e[0] == '0');
+}
+
 void install_edge() {
+    if (edgejob_on()) {
+        size_t hn = 0;
+        const uint32_t* h = edgejob::hooks(hn);
+        for (size_t i = 0; i < hn; i++) {
+            if (!is_edge_native(h[i]) || skipped("GOWA_EDGEJOB_HLE_SKIP", h[i])) continue;
+            uint32_t words = 0;
+            const uint32_t* sig = edgejob::signature(h[i], words);
+            register_function({h[i], words, sig, nullptr, "EdgeJob.fallback", edgejob::run_hook});
+        }
+    }
     if (const char* e = std::getenv("GOWA_EDGE_HLE"); e && e[0] == '0') return;
     size_t n = 0;
     const edge::Adapter* a = edge::adapters(n);
@@ -219,12 +242,11 @@ void install_pm() {
 }
 
 void install_edgejob() {
-    const char* e = std::getenv("GOWA_EDGEJOB_HLE");
-    if (e && e[0] == '0') return;
+    if (!edgejob_on()) return;
     size_t n = 0;
     const uint32_t* h = edgejob::hooks(n);
     for (size_t i = 0; i < n; i++) {
-        if (skipped("GOWA_EDGEJOB_HLE_SKIP", h[i])) continue;
+        if (is_edge_native(h[i]) || skipped("GOWA_EDGEJOB_HLE_SKIP", h[i])) continue;
         uint32_t words = 0;
         const uint32_t* sig = edgejob::signature(h[i], words);
         register_function({h[i], words, sig, nullptr, "EdgeJob", edgejob::run_hook});
