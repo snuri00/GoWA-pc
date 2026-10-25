@@ -597,8 +597,17 @@ void install_jobsys_edge() {
         h->addr = 0x41cbdc;
         h->quiet = true;
     }
+    jsedge::set_prev_guard(h->guard);
     h->guard = jsedge::on_wait_previous;
     ppu::hook_flags[0x41cbdc >> 2] = 1;
+    Hook*& sp = g_hooks[0x49cd6c];
+    if (!sp) {
+        sp = new Hook;
+        sp->addr = 0x49cd6c;
+        sp->quiet = true;
+    }
+    sp->guard = jsedge::on_set_priorities;
+    ppu::hook_flags[0x49cd6c >> 2] = 1;
 }
 
 void hog_thread(int lp, int on_ms, int off_ms, double from) {

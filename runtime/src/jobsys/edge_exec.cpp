@@ -1,5 +1,6 @@
 #include "edge_exec.h"
 
+#include "../spu/hle.h"
 #include "../spu/thread.h"
 
 #include "runtime/log.h"
@@ -42,6 +43,7 @@ struct FastHost final : spu::Host {
     FastHost(spu::SpuThread& th, HostCounters& c) : t(th), hc(c) {}
     uint32_t read_channel(uint32_t ch) override {
         switch (ch) {
+        case 8: return 0u - static_cast<uint32_t>(__rdtsc() >> 5);
         case 13: return t.ctx.interrupts_enabled ? 1 : 0;
         case 24:
             if (t.tag_stat_count) {
@@ -311,6 +313,52 @@ bool trap(spu::SpuThread& t) {
 
 bool no_next(spu::SpuThread&) { return false; }
 
+enum class Fast { Done, Fallback, Failed };
+
+Fast fast_loop(spu::SpuThread& t, spu::Host& h, ApiState& api, std::vector<const spu::hle::Function*>& cache, std::vector<uint8_t>& valid, uint64_t& dispatches) {
+    spu::Context& c = t.ctx;
+    for (uint32_t guard = 0; guard < 4000000; guard++) {
+        uint32_t pc = c.pc & spu::PC_MASK;
+        c.pc = pc;
+        if (pc == kJobRet) return Fast::Done;
+        if (pc < 0x4000) {
+            if (!api_call(c, api)) return Fast::Fallback;
+            continue;
+        }
+        dispatches++;
+        const spu::hle::Function* f = nullptr;
+        if (pc < 0x10430) {
+            uint32_t k = pc >> 2;
+            if (!valid[k]) {
+                cache[k] = spu::hle::any_at(pc) ? spu::hle::lookup(t.ls, pc) : nullptr;
+                valid[k] = 1;
+            }
+            f = cache[k];
+        } else {
+            if (spu::hle::any_at(pc)) f = spu::hle::lookup(t.ls, pc);
+            if (!f && spu::hle::dyn_at(pc)) f = spu::hle::lookup_dyn(t.ls, pc);
+        }
+        if (!f) return Fast::Fallback;
+        if (!f->host_handler) {
+            if (f->handler(c)) {
+                c.pc = c.gpr[0].u32[3] & spu::PC_MASK;
+                continue;
+            }
+            f = spu::hle::lookup_next(t.ls, pc, f);
+            if (f && !f->host_handler) f = nullptr;
+            if (!f) return Fast::Fallback;
+        }
+        c.executed = 0;
+        if (!f->host_handler(c, h)) {
+            c.pc = pc;
+            return Fast::Fallback;
+        }
+        if (c.halted) return Fast::Failed;
+        c.irq_check = false;
+    }
+    return Fast::Fallback;
+}
+
 const uint8_t kApiTemplate[0x100] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x30, 0x01, 0xad, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7b, 0xd7, 0xb9, 0xfb, 0x00, 0x02, 0x01, 0xff,
@@ -559,10 +607,18 @@ bool Executor::run_edge(const JobRef& j, const Cmd& c, bool reference) {
     th.event_mask = 0;
     th.event_count = false;
     FastHost fh(th, hc);
-    th.exec_host = reference ? nullptr : &fh;
+    if (load_code || hvalid.empty()) {
+        hcache.assign(spu::LS_SIZE / 4, nullptr);
+        hvalid.assign(spu::LS_SIZE / 4, 0);
+    }
     th.stop_flag.store(false);
-    th.exec();
-    th.exec_host = nullptr;
+    Fast r = reference ? Fast::Fallback : fast_loop(th, fh, api, hcache, hvalid, dispatches);
+    if (r == Fast::Fallback) {
+        fallbacks++;
+        th.exec_host = reference ? nullptr : &fh;
+        th.exec();
+        th.exec_host = nullptr;
+    }
     fail_pc = th.ctx.pc;
     bool ok = th.ctx.pc == kJobRet && !th.ctx.halted && !api.bad_pc;
     th.ctx.halted = false;

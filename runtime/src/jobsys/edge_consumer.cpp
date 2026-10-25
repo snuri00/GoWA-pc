@@ -27,6 +27,15 @@
 
 #include <immintrin.h>
 
+#if __has_include("runtime/jobsys.h")
+#include "runtime/jobsys.h"
+#define JSEDGE_CORE 1
+#endif
+
+namespace crash {
+void profile_thread(void* native, const char* name);
+}
+
 namespace jsedge {
 
 namespace {
@@ -116,11 +125,19 @@ VSpu g_vspu[kVspus];
 
 struct Stats {
     std::atomic<uint64_t> edge{0}, ab{0}, cr{0}, nops{0}, barriers{0}, blocked{0}, rc_zero{0}, helped{0}, failed{0}, unsupported{0};
-    std::atomic<uint64_t> tsc{0}, cpu{0}, ab_wait{0};
-    std::atomic<uint64_t> gets{0}, get_bytes{0}, puts{0}, put_bytes{0}, slow{0};
-    std::atomic<uint64_t> lv_runs{0}, lv_bad{0}, xv_runs{0}, xv_bad{0}, xv_skip{0}, xv_bytes{0};
+    std::atomic<uint64_t> tsc{0}, cpu{0}, cpu_n{0}, ab_wait{0}, prio_fix{0}, prio_hooked{0};
+    std::atomic<uint64_t> gets{0}, get_bytes{0}, puts{0}, put_bytes{0}, slow{0}, insns{0}, disp{0}, fb{0};
+    std::atomic<uint64_t> lv_runs{0}, lv_bad{0}, xv_runs{0}, xv_bad{0}, xv_skip{0}, xv_bytes{0}, xv_ringb{0};
 };
 Stats g_st;
+
+struct FreshStat {
+    std::atomic<uint64_t> runs{0}, differ{0}, skipped{0};
+};
+FreshStat g_fresh[256];
+std::atomic<uint64_t> g_spu_edge[64];
+std::atomic<uint64_t> g_spu_water[64];
+
 
 std::atomic<bool> g_started{false};
 
@@ -311,13 +328,19 @@ void store_event(uint32_t ea, uint32_t v, uint32_t wid, uint32_t module) {
 }
 
 bool run_claimed(List& L, uint32_t v, Claimed& c) {
-    uint64_t t0 = __rdtsc(), c0 = thread_cycles();
+    static thread_local uint32_t sample = 0;
+    bool timed = (sample++ & 15) == 0;
+    uint64_t t0 = __rdtsc(), c0 = timed ? thread_cycles() : 0;
     bool ok = true;
     switch (c.kind.k) {
     case Kind::EDGE: {
         Executor& x = *g_vspu[v].x;
         HostCounters before = x.hc;
+        uint64_t n0 = x.thread().exec_insns, d0 = x.dispatches, f0 = x.fallbacks;
         ok = x.run_edge(c.ref, c.kind.cmd, cfg().reference);
+        g_st.insns.fetch_add(x.thread().exec_insns - n0, std::memory_order_relaxed);
+        g_st.disp.fetch_add(x.dispatches - d0, std::memory_order_relaxed);
+        g_st.fb.fetch_add(x.fallbacks - f0, std::memory_order_relaxed);
         g_st.edge.fetch_add(1, std::memory_order_relaxed);
         g_st.gets.fetch_add(x.hc.gets - before.gets, std::memory_order_relaxed);
         g_st.get_bytes.fetch_add(x.hc.get_bytes - before.get_bytes, std::memory_order_relaxed);
@@ -348,7 +371,10 @@ bool run_claimed(List& L, uint32_t v, Claimed& c) {
     uint64_t t1 = __rdtsc();
     if (c.kind.k == Kind::EDGE) {
         g_st.tsc.fetch_add(t1 - t0, std::memory_order_relaxed);
-        g_st.cpu.fetch_add(thread_cycles() - c0, std::memory_order_relaxed);
+        if (timed) {
+            g_st.cpu.fetch_add(thread_cycles() - c0, std::memory_order_relaxed);
+            g_st.cpu_n.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     emit_job(t0, v, L.wid, c.kind.cmd.module);
     kick();
@@ -447,6 +473,11 @@ void worker_main(int k) {
     if (cfg().prio_set) SetThreadPriority(GetCurrentThread(), cfg().prio);
     _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
     spu::hle::install_builtin();
+    if (k == 0 && std::getenv("GOWA_JOBSYS_EDGE_PROFILE")) {
+        HANDLE h = nullptr;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        crash::profile_thread(h, "edge worker 0");
+    }
     for (uint32_t idle = 0;;) {
         if (work_once()) {
             idle = 0;
@@ -508,6 +539,18 @@ void manage() {
             } else {
                 L.stable = 0;
             }
+        } else if (s == S_OWNED) {
+            if (vm::read64(L.info + 0x18)) {
+                uint64_t p = vm::read64(L.info + 0x18);
+                for (int i = 0; i < 8; i++) L.prio_saved[i] = static_cast<uint8_t>(p >> (56 - 8 * i));
+                uint8_t zero[8] = {};
+                set_prio(L, zero);
+                L.stable = 0;
+                L.state.store(S_PENDING, std::memory_order_release);
+                g_st.prio_fix.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 8) LOG_WARN("jsedge", "wid %u priority was set to %u,%u,%u,%u behind the consumer, zeroed again, waiting for the SPUs to leave", L.wid, L.prio_saved[0], L.prio_saved[1], L.prio_saved[2], L.prio_saved[3]);
+            }
         } else if (s == S_HANDBACK) {
             if (L.held.load(std::memory_order_acquire) == 0) {
                 set_prio(L, L.prio_saved);
@@ -532,15 +575,43 @@ void stats_line() {
     for (int i = 0; i < 16; i++) d[i] = v[i] - last[i];
     std::memcpy(last, v, sizeof v);
     double jn = d[0] ? double(d[0]) : 1.0;
+    static uint64_t last_cn = 0;
+    uint64_t cn = g_st.cpu_n.load();
+    double cpu_jn = cn - last_cn ? double(cn - last_cn) : 1.0;
+    last_cn = cn;
     LOG_INFO("jsedge", "5s: edge %llu ab %llu cr %llu (helped %llu), %.1f us/job wall %.1f us/job cpu, blocked %llu rc-zero %llu, ab wait %.2f ms, failed %llu total, slow dma %llu",
              static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1]), static_cast<unsigned long long>(d[2]), static_cast<unsigned long long>(d[5]), double(d[3]) / hz * 1e6 / jn,
-             double(d[4]) / hz * 1e6 / jn, static_cast<unsigned long long>(d[6]), static_cast<unsigned long long>(d[7]), double(d[14]) / hz * 1e3, static_cast<unsigned long long>(v[13]),
+             double(d[4]) / hz * 1e6 / cpu_jn, static_cast<unsigned long long>(d[6]), static_cast<unsigned long long>(d[7]), double(d[14]) / hz * 1e3, static_cast<unsigned long long>(v[13]),
              static_cast<unsigned long long>(d[12]));
-    LOG_INFO("jsedge", "5s dma per edge job: %.1f GETs %.0f bytes, %.1f PUTs %.0f bytes; nops %llu", double(d[8]) / jn, double(d[9]) / jn, double(d[10]) / jn, double(d[11]) / jn, static_cast<unsigned long long>(d[15]));
+    static uint64_t last_insns = 0;
+    uint64_t ins = g_st.insns.load();
+    static uint64_t last_disp = 0, last_fb = 0;
+    uint64_t dsp = g_st.disp.load(), fbk = g_st.fb.load();
+    LOG_INFO("jsedge", "5s dma per edge job: %.1f GETs %.0f bytes, %.1f PUTs %.0f bytes; nops %llu; exec %.1f kinsn/job, %.1f dispatches/job, %llu fallbacks", double(d[8]) / jn, double(d[9]) / jn, double(d[10]) / jn,
+             double(d[11]) / jn, static_cast<unsigned long long>(d[15]), double(ins - last_insns) / 1e3 / jn, double(dsp - last_disp) / jn, static_cast<unsigned long long>(fbk - last_fb));
+    last_insns = ins;
+    last_disp = dsp;
+    last_fb = fbk;
+    {
+        std::string a;
+        for (int w = 0; w < 64; w++) {
+            uint64_t e = g_spu_edge[w].exchange(0), x = g_spu_water[w].exchange(0);
+            if (!e && !x) continue;
+            char b[64];
+            std::snprintf(b, sizeof b, " wid%d edge %llu water %llu", w, static_cast<unsigned long long>(e), static_cast<unsigned long long>(x));
+            a += b;
+        }
+        if (!a.empty()) LOG_INFO("jsedge", "5s SPU-side entries:%s", a.c_str());
+        LOG_INFO("jsedge", "priority calls intercepted %llu, re-zeroed %llu", static_cast<unsigned long long>(g_st.prio_hooked.load()), static_cast<unsigned long long>(g_st.prio_fix.load()));
+    }
+    for (int m = 0; m < 256; m++)
+        if (g_fresh[m].runs.load() || g_fresh[m].skipped.load())
+            LOG_INFO("jsedge", "fresh mask 0x%x: %llu runs, %llu differ, %llu skipped", m, static_cast<unsigned long long>(g_fresh[m].runs.load()), static_cast<unsigned long long>(g_fresh[m].differ.load()),
+                     static_cast<unsigned long long>(g_fresh[m].skipped.load()));
     if (cfg().verify)
-        LOG_INFO("jsedge", "verify: loader %llu/%llu bad, exec %llu/%llu bad (%llu skipped, %llu bytes compared)", static_cast<unsigned long long>(g_st.lv_bad.load()), static_cast<unsigned long long>(g_st.lv_runs.load()),
-                 static_cast<unsigned long long>(g_st.xv_bad.load()), static_cast<unsigned long long>(g_st.xv_runs.load()), static_cast<unsigned long long>(g_st.xv_skip.load()),
-                 static_cast<unsigned long long>(g_st.xv_bytes.load()));
+        LOG_INFO("jsedge", "verify: loader %llu/%llu bad, exec %llu/%llu bad (%llu skipped, %llu bytes compared, %llu ring-B pointer races)", static_cast<unsigned long long>(g_st.lv_bad.load()),
+                 static_cast<unsigned long long>(g_st.lv_runs.load()), static_cast<unsigned long long>(g_st.xv_bad.load()), static_cast<unsigned long long>(g_st.xv_runs.load()),
+                 static_cast<unsigned long long>(g_st.xv_skip.load()), static_cast<unsigned long long>(g_st.xv_bytes.load()), static_cast<unsigned long long>(g_st.xv_ringb.load()));
 }
 
 void manager_main() {
@@ -561,14 +632,12 @@ struct Probe {
     bool active = false;
     Sandbox sb;
     uint32_t cmd = 0;
+    uint32_t rings = 0;
 };
 thread_local Probe t_probe;
 thread_local std::unique_ptr<spu::SpuThread> t_shadow;
 std::atomic<uint64_t> g_probe_seq{0};
 
-spu::SpuThread* owner(spu::Context& c) {
-    return reinterpret_cast<spu::SpuThread*>(reinterpret_cast<char*>(&c) - offsetof(spu::SpuThread, ctx));
-}
 
 uint32_t compare_ranges(const uint8_t* a, const uint8_t* b, const std::vector<std::pair<uint32_t, uint32_t>>& r, uint32_t& first) {
     uint32_t bad = 0;
@@ -583,10 +652,74 @@ uint32_t compare_ranges(const uint8_t* a, const uint8_t* b, const std::vector<st
     return bad;
 }
 
-bool probe_entry(spu::Context& c) {
-    if (!cfg().verify || (g_probe_seq.fetch_add(1, std::memory_order_relaxed) % cfg().verify)) return false;
+void fresh_check(spu::Context& c, const JobRef& j, const Cmd& cmd, uint32_t spu_num, uint32_t buf, uint32_t mask) {
+    static thread_local std::unique_ptr<spu::SpuThread> f;
+    if (!f) f = std::make_unique<spu::SpuThread>();
+    spu::SpuThread& s = *f;
     const uint8_t* ls = c.ls;
+    std::memset(s.ls, 0, spu::LS_SIZE);
+    auto take = [&](uint32_t lo, uint32_t hi) { std::memcpy(s.ls + lo, ls + lo, hi - lo); };
+    if (mask & 1) take(0, 0xa00);
+    if (mask & 2) take(0xa00, 0x4000);
+    if (mask & 4) take(0x10430, 0x11000);
+    uint32_t cur = set_base(cmd, 1, buf), other = set_base(cmd, 1, buf ^ 1), len = cmd.sets[1].pages * 0x400u;
+    if (mask & 8) take(other, other + len);
+    if (mask & 0x10) take(cur, cur + len);
+    if (mask & 0x20) take(0x29000, 0x3b000);
+    if (mask & 0x40) take(0x3b000, 0x40000);
+    if (mask & 0x80) std::memcpy(s.ctx.gpr, c.gpr, sizeof c.gpr);
+    else std::memset(s.ctx.gpr, 0, sizeof s.ctx.gpr);
+    prepare_ls(s.ls, s.ctx, j, cmd, spu_num, buf, true, !(mask & 2));
+    s.tag_mask = s.tag_stat = s.atomic_stat = 0;
+    s.tag_stat_count = s.atomic_stat_count = false;
+    s.raddr = 0;
+    ApiState st;
+    for (int k = 0; k < 4; k++) st.mask[k] = 0xff;
+    st.buf = buf;
+    st.cmd = &cmd;
+    Sandbox sb;
+    FreshStat& fs = g_fresh[mask & 255];
+    if (!run_sandboxed(s, st, sb)) {
+        fs.skipped.fetch_add(1);
+        return;
+    }
+    fs.runs.fetch_add(1);
+    uint32_t bad = 0, first = 0;
+    for (auto& [a, b] : t_probe.sb.writes) {
+        auto it = sb.writes.find(a);
+        if (it == sb.writes.end() || it->second != b) {
+            if (!bad) first = a;
+            bad++;
+        }
+    }
+    for (auto& [a, b] : sb.writes)
+        if (!t_probe.sb.writes.count(a)) bad++;
+    if (bad) {
+        fs.differ.fetch_add(1);
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 40) {
+            uint8_t mine = sb.writes.count(first) ? sb.writes[first] : 0;
+            LOG_WARN("jsedge", "fresh mask 0x%x cmd 0x%08x: %u bytes differ from the SPU-LS run, first ea 0x%08x (fresh %02x spu %02x), sizes %zu/%zu", mask, cmd.ea, bad, first, mine, t_probe.sb.writes[first], sb.writes.size(), t_probe.sb.writes.size());
+        }
+    }
+}
+
+spu::SpuThread* owner(spu::Context& c) {
+    return reinterpret_cast<spu::SpuThread*>(reinterpret_cast<char*>(&c) - offsetof(spu::SpuThread, ctx));
+}
+
+bool probe_water(spu::Context& c) {
+    if ((owner(c)->id >> 24) == 0x7d || !owner(c)->id) return false;
+    if (be32(c.ls + 0x4000) == 0x43898202u && be32(c.ls + 0x4004) == 0x421b2282u) g_spu_water[be32(c.ls + 0x1dc) & 63].fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+bool probe_entry(spu::Context& c) {
+    const uint8_t* ls = c.ls;
+    if ((owner(c)->id >> 24) == 0x7d || !owner(c)->id) return false;
     if (std::memcmp(ls + 0x4000, vm::ptr(kEdgeEa), 0x30) != 0) return false;
+    g_spu_edge[be32(ls + 0x1dc) & 63].fetch_add(1, std::memory_order_relaxed);
+    if (!cfg().verify || (g_probe_seq.fetch_add(1, std::memory_order_relaxed) % cfg().verify)) return false;
     const uint8_t* api = ls + kApiLs;
     JobRef j;
     uint32_t w10 = be32(api + 0x10);
@@ -622,7 +755,7 @@ bool probe_entry(spu::Context& c) {
     spu::Context mc = c;
     mc.ls = mine.data();
     prepare_ls(mine.data(), mc, j, cmd, spu_num, buf, true, false);
-    std::vector<std::pair<uint32_t, uint32_t>> rg = {{0x4000, 0x4000 + 0xc430}, {kCmdLs, kCmdLs + cmd.size}, {kApiLs, kApiLs + 0x54}, {kApiLs + 0xb0, kApiLs + 0xb4}, {0x1c8, 0x1cc}};
+    std::vector<std::pair<uint32_t, uint32_t>> rg = {{0x4000, 0x4000 + 0xc430}, {kCmdLs, kCmdLs + cmd.size}, {kApiLs, kApiLs + 0x18}, {kApiLs + 0x1c, kApiLs + 0x54}, {kApiLs + 0xb0, kApiLs + 0xb4}, {0x1c8, 0x1cc}};
     uint32_t base = set_base(cmd, 1, buf);
     uint32_t list_ls = base + s1.pages * 0x400u - ((s1.len + 15) & ~15u);
     rg.push_back({list_ls, list_ls + s1.len});
@@ -671,19 +804,27 @@ bool probe_entry(spu::Context& c) {
     }
     t_probe.active = true;
     t_probe.cmd = cmd.ea;
+    t_probe.rings = be32(cmd.raw + cmd.param_off) + 0x80;
+    static const std::vector<int> fresh = parse_list(std::getenv("GOWA_JOBSYS_EDGE_VFRESH"));
+    for (int m : fresh) fresh_check(c, j, cmd, spu_num, buf, static_cast<uint32_t>(m));
     return false;
 }
 
 bool probe_return(spu::Context&) {
     if (!t_probe.active) return false;
     t_probe.active = false;
-    uint32_t bad = 0, first = 0;
+    uint32_t bad = 0, first = 0, ringb = 0;
     for (auto& [a, b] : t_probe.sb.writes) {
         if (vm::ptr(a)[0] != b) {
+            if (a - t_probe.rings < 0x200 && (a & 0x7f) - 0x18 < 4) {
+                ringb++;
+                continue;
+            }
             if (!bad) first = a;
             bad++;
         }
     }
+    if (ringb) g_st.xv_ringb.fetch_add(1);
     g_st.xv_runs.fetch_add(1);
     g_st.xv_bytes.fetch_add(t_probe.sb.writes.size());
     static std::atomic<int> logged{0};
@@ -698,6 +839,26 @@ bool probe_return(spu::Context&) {
     return false;
 }
 
+bool (*g_prev_guard)(ppu::Context&) = nullptr;
+
+struct CsrScope {
+    unsigned saved;
+    CsrScope() : saved(_mm_getcsr()) { _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8040u); }
+    ~CsrScope() { _mm_setcsr(saved); }
+};
+
+#ifdef JSEDGE_CORE
+struct CoreConsumer final : jobsys::Consumer {
+    const char* name() const override { return "edge-lists"; }
+    bool has_work() override { return any_ready(); }
+    bool try_run(jobsys::JobCtx&) override {
+        CsrScope cs;
+        return work_once();
+    }
+};
+CoreConsumer g_core_consumer;
+#endif
+
 const uint32_t kEntrySig[16] = {0x24ffc0d0, 0x24ff80d1, 0x24ff40d2, 0x24ff00fe, 0x24004080, 0x24fe8081, 0x1ce80081, 0x1c000251,
                                 0x01a00452, 0x238ba883, 0x40800005, 0x238ba985, 0x4236e802, 0x330000fe, 0x081f817e, 0x42659003};
 const uint32_t kRetSig[8] = {0x40804000, 0x30826402, 0x40800103, 0x3082ce04, 0x21a00b00, 0x30873c00, 0x34000102, 0x21a00b83};
@@ -710,11 +871,10 @@ void init() {
     if (!enabled()) return;
     bool expected = false;
     if (!g_started.compare_exchange_strong(expected, true)) return;
-    if (cfg().verify) {
-        spu::hle::install_builtin();
-        spu::hle::register_function({0x3368, 8, kRetSig, probe_return, "EdgeConsumer.verify_ret"});
-        spu::hle::register_function({kEntryLs, 16, kEntrySig, probe_entry, "EdgeConsumer.verify_entry"});
-    }
+    spu::hle::install_builtin();
+    if (cfg().verify) spu::hle::register_function({0x3368, 8, kRetSig, probe_return, "EdgeConsumer.verify_ret"});
+    spu::hle::register_function({kEntryLs, 16, kEntrySig, probe_entry, "EdgeConsumer.probe_entry"});
+    spu::hle::register_function({0xb7c8, 0, nullptr, probe_water, "EdgeConsumer.probe_water", nullptr, 0xcbf29ce484222325ull});
     if (!cfg().on) {
         std::thread(manager_main).detach();
         return;
@@ -723,16 +883,39 @@ void init() {
     LOG_INFO("jsedge", "Edge list consumer on: %d workers, %u virtual SPUs, help %d, reference %d, verify %u", cfg().threads, cfg().vspus, cfg().help ? 1 : 0, cfg().reference ? 1 : 0, cfg().verify);
     std::thread(manager_main).detach();
     for (int k = 0; k < cfg().threads; k++) std::thread(worker_main, k).detach();
+#ifdef JSEDGE_CORE
+    if (jobsys::enabled()) jobsys::add_consumer(&g_core_consumer);
+#endif
 }
 
-bool on_wait_previous(ppu::Context&) {
-    if (!cfg().on || !cfg().help) return false;
+bool on_set_priorities(ppu::Context& ctx) {
+    if (!cfg().on) return false;
+    uint32_t obj = static_cast<uint32_t>(ctx.gpr[3]);
+    if (!vm::range_mapped(obj, 12)) return false;
+    uint32_t wid = vm::read32(obj + 8);
+    if (wid < kFirstWid || wid >= kFirstWid + kLists) return false;
+    List& L = g_lists[wid - kFirstWid];
+    int s = L.state.load(std::memory_order_acquire);
+    if (s != S_PENDING && s != S_OWNED) return false;
+    uint32_t p = static_cast<uint32_t>(ctx.gpr[4]);
+    if (!vm::range_mapped(p, 8)) return false;
+    std::memcpy(L.prio_saved, vm::ptr(p), 8);
+    g_st.prio_hooked.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void set_prev_guard(bool (*g)(ppu::Context&)) {
+    if (g != on_wait_previous) g_prev_guard = g;
+}
+
+bool on_wait_previous(ppu::Context& ctx) {
+    if (!cfg().on || !cfg().help) return g_prev_guard ? g_prev_guard(ctx) : false;
     uint32_t cur = vm::read32(0xa0c13c);
-    if (cur > 2) return false;
+    if (cur > 2) return g_prev_guard ? g_prev_guard(ctx) : false;
     uint32_t prev = (cur + 2) % 3;
-    if (!*vm::ptr(0xa0c12b + prev)) return false;
+    if (!*vm::ptr(0xa0c12b + prev)) return g_prev_guard ? g_prev_guard(ctx) : false;
     uint32_t counter = 0xa0b740 + 4 * prev;
-    if (!vm::read16(counter)) return false;
+    if (!vm::read16(counter)) return g_prev_guard ? g_prev_guard(ctx) : false;
     static thread_local bool csr = false;
     unsigned saved = _mm_getcsr();
     if (!csr) spu::hle::install_builtin();
@@ -750,7 +933,7 @@ bool on_wait_previous(ppu::Context&) {
         else break;
     }
     _mm_setcsr(saved);
-    return false;
+    return g_prev_guard ? g_prev_guard(ctx) : false;
 }
 
 }

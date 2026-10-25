@@ -9,6 +9,9 @@
 namespace spu {
 struct SpuThread;
 struct Context;
+namespace hle {
+struct Function;
+}
 }
 
 namespace jsedge {
@@ -88,6 +91,9 @@ public:
     ApiState api;
     HostCounters hc;
     uint32_t fail_pc = 0;
+    uint64_t dispatches = 0, fallbacks = 0;
+    std::vector<const spu::hle::Function*> hcache;
+    std::vector<uint8_t> hvalid;
     std::unique_ptr<spu::SpuThread> t;
 };
 
