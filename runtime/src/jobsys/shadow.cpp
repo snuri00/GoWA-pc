@@ -155,10 +155,10 @@ void compare(Pending& p) {
     c.diff_bytes += diff;
     if (diff) c.differ++;
     else c.same++;
-    static std::atomic<int> logged{0};
-    if (diff && logged.fetch_add(1) < 20) {
+    if (diff && c.differ <= 12) {
         const ModuleInfo* m = find_module(p.mod);
-        LOG_ERROR("jobsys", "shadow DIFFERS %s: %u of %u written bytes differ from the WWS run, first 0x%08x", m ? m->name : "?", diff, n, first);
+        LOG_ERROR("jobsys", "shadow DIFFERS %s: %u of %u written bytes differ from the WWS run, first 0x%08x (%02x vs %02x), %.2f ms after push", m ? m->name : "?", diff, n, first, p.writes[first], vm::ptr(first)[0],
+                  double(__rdtsc() - p.t0) / tsc_hz() * 1e3);
     }
 }
 
