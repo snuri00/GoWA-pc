@@ -31,6 +31,7 @@ WHOLE_PM = False
 WHOLE_RETCHECK = False
 WHOLE_HDR_EXTRA = ()
 WHOLE_PM_DECLS = True
+JUMP_ABS = False
 WHOLE_ICALL_DEFAULT = "ctl.icall_miss = t; FAIL(pc);"
 PM_EA = 0x7A7B00
 PM_LS = 0xA00
@@ -113,7 +114,7 @@ def jump_table(pc):
         v = word(base + 4 * len(out))
         if v >= 0x10000 or v & 3 or v == 0:
             break
-        out.append(base + v)
+        out.append(v if JUMP_ABS else base + v)
     return out
 
 

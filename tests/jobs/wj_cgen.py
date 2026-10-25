@@ -103,6 +103,7 @@ def generate(job, outdir):
         G.RR3.update({"dfa", "dfs", "dfm"})
         G.RR2.update({"fesd", "frds"})
         sc_indirect.install()
+        G.JUMP_ABS = True
     entry, tail, ctors = crt(data, ea)
     lo, hi = 0x4030, 0x4000 + size
     found = (set(ctors) | icalls(ic, lo, hi) | extra_icalls(short, lo, hi) | set(extra) | data_targets(data, ea, size, hi)) - {entry}
