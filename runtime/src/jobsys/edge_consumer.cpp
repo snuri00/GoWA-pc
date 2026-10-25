@@ -76,7 +76,7 @@ const Config& cfg() {
     static const Config c = [] {
         Config c;
         const char* e = std::getenv("GOWA_JOBSYS_EDGE");
-        c.on = e && e[0] && e[0] != '0';
+        c.on = !e || !e[0] || e[0] != '0';
         if (const char* t = std::getenv("GOWA_JOBSYS_EDGE_THREADS")) c.threads = std::clamp(std::atoi(t), 0, 8);
         c.cpus = parse_list(std::getenv("GOWA_JOBSYS_EDGE_CPUS"));
         if (const char* p = std::getenv("GOWA_JOBSYS_EDGE_PRIO")) {

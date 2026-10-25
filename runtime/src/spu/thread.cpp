@@ -303,7 +303,7 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
                 } else {
                     lk.unlock();
                     waiting.store(1, std::memory_order_relaxed);
-                    if (!job_mode && ctx.pc < 0xa00 && jsedge::spu_idle(slot)) {
+                    if (!job_mode && ctx.pc < 0x4000 && jsedge::spu_idle(slot)) {
                         waiting.store(0, std::memory_order_relaxed);
                         lk.lock();
                         collect_events();
