@@ -362,6 +362,8 @@ const Function* lookup_dyn(const uint8_t* ls, uint32_t pc) {
     return e ? &g_ovl_funcs[size_t(edge::ovl::index_of(e))] : nullptr;
 }
 
+void (*g_after_install)() = nullptr;
+
 void install_builtin() {
     static std::once_flag once;
     std::call_once(once, [] {
@@ -380,6 +382,7 @@ void install_builtin() {
         install_tasks();
         install_mpjob();
         wj::install_inplace();
+        if (g_after_install) g_after_install();
     });
 }
 

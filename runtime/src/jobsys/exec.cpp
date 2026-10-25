@@ -45,6 +45,18 @@ bool trap(spu::SpuThread& t) {
         t.ctx.pc = t.ctx.gpr[0].u32[3] & spu::PC_MASK;
         return true;
     }
+    if (pc == 0x2fd8 && t.job_user) {
+        const JobDesc* j = static_cast<Executor*>(t.job_user)->cur;
+        uint32_t out[4];
+        if (j && get_buffer(*j, t.ls, t.ctx.gpr[4].u32[3], t.ctx.gpr[5].u32[3], t.ctx.gpr[6].u32[3], out)) {
+            t.ctx.gpr[3].u32[3] = out[0];
+            t.ctx.gpr[3].u32[2] = out[1];
+            t.ctx.gpr[3].u32[1] = out[2];
+            t.ctx.gpr[3].u32[0] = out[3];
+            t.ctx.pc = t.ctx.gpr[0].u32[3] & spu::PC_MASK;
+            return true;
+        }
+    }
     if (pc == 0x16f0 || pc == 0x2fd8 || pc == 0x1760 || pc == 0x1af0 || pc == 0x1b10 || pc == 0x1a90) {
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 16) LOG_ERROR("jobsys", "job called unsupported JobApi 0x%04x from 0x%05x", pc, t.ctx.gpr[0].u32[3]);
@@ -183,6 +195,48 @@ void prepare_job(Executor& x, const JobDesc& j) {
     load_ls(t, 0x1c0, kctx, sizeof kctx);
     reset_regs(t, j);
     x.last_module = j.module_ea;
+    x.cur = &j;
+    t.job_user = &x;
+}
+
+thread_local const JobDesc* t_job = nullptr;
+
+bool simple_buffers(const JobDesc& j) {
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < j.nloads; i++) {
+        const Load& l = j.loads[i];
+        if (l.code) continue;
+        const BufferSet& s = j.sets[l.set];
+        if (!s.reserved || s.buffers != 1 || l.buf != 0 || l.list || !l.size || l.set == 0) return false;
+        if (seen & (1u << l.set)) return false;
+        seen |= 1u << l.set;
+    }
+    return true;
+}
+
+bool get_buffer(const JobDesc& j, uint8_t* ls, uint32_t set, uint32_t buf, uint32_t flag, uint32_t out[4]) {
+    if (set >= kMaxSets || buf != 0 || flag != 1) return false;
+    const BufferSet& s = j.sets[set];
+    if (!s.reserved || s.buffers != 1) return false;
+    const Load* ld = nullptr;
+    for (uint32_t i = 0; i < j.nloads; i++)
+        if (!j.loads[i].code && j.loads[i].set == set && !j.loads[i].list && j.loads[i].size) ld = &j.loads[i];
+    if (!ld) return false;
+    uint32_t mask = uint32_t(ls[0x1290]) << 24 | uint32_t(ls[0x1291]) << 16 | uint32_t(ls[0x1292]) << 8 | ls[0x1293];
+    if (mask == 0xffffffffu) return false;
+    uint32_t tag = 31 - static_cast<uint32_t>(__builtin_clz(~mask));
+    for (int k = 0; k < 4; k++) {
+        uint8_t* p = ls + 0x1290 + 4 * k;
+        uint32_t w = uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+        if (w == 0xffffffffu) continue;
+        w |= 1u << (31 - __builtin_clz(~w));
+        write_be32(p, w);
+    }
+    out[0] = set << 24 | tag;
+    out[1] = uint32_t(s.first_page) << 24 | uint32_t(s.pages) << 8;
+    out[2] = ld->ea;
+    out[3] = ld->size;
+    return true;
 }
 
 void emulate(spu::SpuThread& t, spu::Host* host) {
@@ -194,14 +248,22 @@ void emulate(spu::SpuThread& t, spu::Host* host) {
     t.exec_host = nullptr;
 }
 
-void emulate_fast(spu::SpuThread& t, JobCtx& c) {
+void emulate_fast(Executor& x, JobCtx& c) {
+    spu::SpuThread& t = *x.t;
     if (!cfg().fast_mfc) {
         emulate(t, nullptr);
+        x.unmarked = false;
         return;
     }
+    for (uint32_t k = 0; k < 64; k++) t.clear_snap(k);
+    if (x.unmarked) t.mark_all_ls();
+    x.unmarked = false;
     MfcHost h(t, c);
     MfcSpuHost sh(h);
-    emulate(t, &sh);
+    t.exec_host = &sh;
+    t.stop_flag.store(false);
+    t.exec();
+    t.exec_host = nullptr;
     if (h.st.slow) stats().slow_dma.fetch_add(h.st.slow, std::memory_order_relaxed);
 }
 
@@ -238,7 +300,10 @@ bool exec_job(Executor& x, const JobDesc& j, Tier tier) {
     if (cfg().poison) verify::poison(t, j.seq, cfg().poison);
     if (tier == Tier::Whole && m && m->whole && (m->whole_entry == 0 || m->whole_entry == j.entry)) {
         MfcStats st;
+        x.unmarked = true;
+        t_job = &j;
         WholeResult r = run_whole_live(x, *m, c, &st);
+        t_job = nullptr;
         if (st.slow) stats().slow_dma.fetch_add(st.slow, std::memory_order_relaxed);
         if (r.done) {
             t.ctx.pc = kJobReturn;
@@ -249,11 +314,11 @@ bool exec_job(Executor& x, const JobDesc& j, Tier tier) {
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 24) LOG_WARN("jobsys", "whole %s resumed in the emulator at 0x%05x (icall 0x%05x)", m->name, r.fail_pc, r.icall_miss);
         t.ctx.pc = r.fail_pc;
-        emulate_fast(t, c);
+        emulate_fast(x, c);
         x.last = Tier::Executor;
         return true;
     }
-    emulate_fast(t, c);
+    emulate_fast(x, c);
     x.last = Tier::Executor;
     return true;
 }

@@ -129,6 +129,8 @@ enum ModuleFlags : uint32_t {
     kSerial = 1u << 2,
     kTexTable = 1u << 3,
     kOptIn = 1u << 4,
+    kWholeUnverified = 1u << 5,
+    kBuffers = 1u << 6,
 };
 
 struct ModuleInfo {
@@ -203,6 +205,9 @@ bool on_switch(ppu::Context& ctx);
 bool on_help_site(ppu::Context& ctx);
 void install(void (*hook)(uint32_t addr, bool (*guard)(ppu::Context&)));
 }
+
+bool get_buffer(const JobDesc& job, uint8_t* ls, uint32_t set, uint32_t buf, uint32_t flag, uint32_t out[4]);
+bool simple_buffers(const JobDesc& job);
 
 bool spu_idle_donate(uint32_t spu_slot);
 void spu_thread_started(uint32_t spu_slot);

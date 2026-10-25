@@ -385,6 +385,8 @@ void load_start(Executor& x, spu::SpuThread& s, const JobDesc& j) {
     s.mark_all_ls();
     std::memcpy(s.ctx.gpr, x.start_gpr, sizeof s.ctx.gpr);
     reset_regs(s, j);
+    s.job_user = &x;
+    x.cur = &j;
 }
 
 }
@@ -455,7 +457,9 @@ bool run_verified(Executor& x, const JobDesc& j, Tier tier) {
         bool resumed = false;
         if (whole && m && m->whole) {
             SpuHostChan ch(rp, s);
+            t_job = &j;
             WholeResult r = m->whole(s.ls, s.ctx, ch);
+            t_job = nullptr;
             if (r.done) s.ctx.pc = kJobReturn;
             else if (!s.ctx.halted && rp.error.empty()) {
                 s.ctx.pc = r.fail_pc;
@@ -482,10 +486,14 @@ bool run_verified(Executor& x, const JobDesc& j, Tier tier) {
             load_start(x, s, j);
             if (mask) poison(s, j.seq * 17 + 3, mask);
             SandboxHost h(s, in);
+            t_job = &j;
             WholeResult r = m->whole(s.ls, s.ctx, h);
+            t_job = nullptr;
             Outcome o;
             if (!r.done || h.abort) {
                 note(j.module_ea, 0x2000u | mask, 2);
+                static std::atomic<int> sk{0};
+                if (sk.fetch_add(1) < 6) LOG_INFO("jobsys", "sandbox skipped %s: done %d abort %d fail 0x%05x icall 0x%05x", m->name, r.done ? 1 : 0, h.abort ? 1 : 0, r.fail_pc, r.icall_miss);
                 continue;
             }
             compare_maps(in.writes, h.r.writes, o);

@@ -77,8 +77,21 @@ bool accept(const JobDesc& j) {
     Tier t = tier_for(j.module_ea);
     if (t == Tier::Wws) return false;
     const ModuleInfo* m = find_module(j.module_ea);
-    if (!j.only_code() && !(m && m->semantic && t == Tier::Semantic)) return false;
+    if (!j.only_code() && !(m && m->semantic && t == Tier::Semantic) && !(m && (m->flags & kBuffers) && simple_buffers(j))) return false;
     return true;
+}
+
+void flush_capture() {
+    if (t_cap.jobs.empty()) return;
+    uint32_t obj = t_cap.jobs[0].list_obj;
+    ListState* ls = list_state(obj, true);
+    std::vector<JobDesc*> ptrs;
+    for (JobDesc& j : t_cap.jobs) ptrs.push_back(&j);
+    submit(ptrs.data(), static_cast<uint32_t>(ptrs.size()), ls ? &ls->done : nullptr);
+    stats().captured.fetch_add(t_cap.jobs.size(), std::memory_order_relaxed);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 4) LOG_WARN("jobsys", "%zu captured jobs without a kick submitted at the next capture", t_cap.jobs.size());
+    t_cap.jobs.clear();
 }
 
 }
@@ -89,6 +102,7 @@ bool on_submit(ppu::Context& ctx) {
     if (!cfg().on) return false;
     uint32_t mod = static_cast<uint32_t>(ctx.gpr[5]);
     if (!module_enabled(mod) || tier_for(mod) == Tier::Wws) return false;
+    flush_capture();
     t_cap.active = true;
     t_cap.real_push = false;
     t_cap.site = static_cast<uint32_t>(ctx.lr);
@@ -99,6 +113,7 @@ bool on_submit(ppu::Context& ctx) {
 bool on_single(ppu::Context& ctx) {
     if (!cfg().on) return false;
     if (!t_cap.active) {
+        flush_capture();
         t_cap.active = true;
         t_cap.real_push = false;
         t_cap.site = static_cast<uint32_t>(ctx.lr);
@@ -113,6 +128,11 @@ bool on_push(ppu::Context& ctx) {
     uint64_t header = ctx.gpr[5];
     uint32_t list_obj = static_cast<uint32_t>(ctx.gpr[4]);
     Decode d = decode(header, list_obj, j);
+    if (d == Decode::Ok && shadow_module(j.module_ea)) {
+        shadow_job(j);
+        t_cap.real_push = true;
+        return false;
+    }
     ListState* ls = d == Decode::Ok ? list_state(list_obj, true) : nullptr;
     if (d != Decode::Ok || !ls || ls->passthru.load(std::memory_order_relaxed) || !accept(j)) {
         t_cap.real_push = true;
@@ -133,19 +153,20 @@ bool on_kick(ppu::Context& ctx) {
     ListState* ls = list_state(obj, !t_cap.jobs.empty());
     bool need = ls && ls->need_kick.exchange(false);
     if (t_cap.jobs.empty()) return false;
+    if (!ls) ls = list_state(t_cap.jobs[0].list_obj, false);
     if (!ls) {
-        LOG_ERROR("jobsys", "too many job lists, %zu jobs lost", t_cap.jobs.size());
-        return false;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 4) LOG_ERROR("jobsys", "no list slot for 0x%08x: %zu jobs run without a list completion", obj, t_cap.jobs.size());
     }
     uint64_t now = __rdtsc();
     std::vector<JobDesc*> ptrs;
     ptrs.reserve(t_cap.jobs.size());
     for (JobDesc& j : t_cap.jobs) {
-        if (j.list_obj != obj) j.list_obj = obj;
+        if (ls) j.list_obj = ls->obj.load(std::memory_order_relaxed);
         j.t_submit = now;
         ptrs.push_back(&j);
     }
-    submit(ptrs.data(), static_cast<uint32_t>(ptrs.size()), &ls->done);
+    submit(ptrs.data(), static_cast<uint32_t>(ptrs.size()), ls ? &ls->done : nullptr);
     stats().captured.fetch_add(t_cap.jobs.size(), std::memory_order_relaxed);
     t_cap.jobs.clear();
     return !(t_cap.real_push || need);

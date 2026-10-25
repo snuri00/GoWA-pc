@@ -16,6 +16,7 @@ namespace jobsys::jw {
 extern thread_local spu::Context* t_ctx;
 
 bool hle_call(renjob::xo::V* R, uint8_t* ls, renjob::xo::Ctl& ctl, uint32_t pc);
+void pm_getbuffer(renjob::xo::V* R, uint8_t* ls, renjob::xo::Ctl& ctl);
 
 struct Frame {
     static constexpr unsigned kWant = 0x6000u | 0x8040u;
