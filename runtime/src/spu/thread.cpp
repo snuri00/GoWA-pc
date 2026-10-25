@@ -1,5 +1,6 @@
 #include "runtime/placement.h"
 #include "runtime/ppujobs.h"
+#include "../jobsys/edge_consumer.h"
 #include "spu/aot.h"
 #include "hle.h"
 #include "edge/edge_gpu.h"
@@ -302,6 +303,12 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
                 } else {
                     lk.unlock();
                     waiting.store(1, std::memory_order_relaxed);
+                    if (!job_mode && ctx.pc < 0xa00 && jsedge::spu_idle(slot)) {
+                        waiting.store(0, std::memory_order_relaxed);
+                        lk.lock();
+                        collect_events();
+                        continue;
+                    }
                     rsv::wait_lost(line, rt, snap, 1000);
                     waiting.store(0, std::memory_order_relaxed);
                     lk.lock();

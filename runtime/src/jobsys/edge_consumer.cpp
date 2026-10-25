@@ -47,13 +47,14 @@ constexpr uint32_t kLists = 3;
 
 struct Config {
     bool on = false;
-    int threads = 3;
+    int threads = 4;
     std::vector<int> cpus;
     int prio = 0;
     bool prio_set = false;
     bool help = true;
     uint32_t verify = 0;
     bool reference = false;
+    bool donate = true;
     uint32_t vspus = kVspus;
 };
 
@@ -85,6 +86,7 @@ const Config& cfg() {
         if (const char* h = std::getenv("GOWA_JOBSYS_EDGE_HELP")) c.help = h[0] != '0';
         if (const char* v = std::getenv("GOWA_JOBSYS_EDGE_VERIFY")) c.verify = static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
         if (const char* r = std::getenv("GOWA_JOBSYS_EDGE_REF")) c.reference = r[0] == '1';
+        if (const char* d = std::getenv("GOWA_JOBSYS_EDGE_DONATE")) c.donate = d[0] != '0';
         if (const char* n = std::getenv("GOWA_JOBSYS_EDGE_VSPUS")) c.vspus = static_cast<uint32_t>(std::clamp(std::atoi(n), 1, 4));
         return c;
     }();
@@ -125,8 +127,8 @@ VSpu g_vspu[kVspus];
 
 struct Stats {
     std::atomic<uint64_t> edge{0}, ab{0}, cr{0}, nops{0}, barriers{0}, blocked{0}, rc_zero{0}, helped{0}, failed{0}, unsupported{0};
-    std::atomic<uint64_t> tsc{0}, cpu{0}, cpu_n{0}, ab_wait{0}, prio_fix{0}, prio_hooked{0};
-    std::atomic<uint64_t> gets{0}, get_bytes{0}, puts{0}, put_bytes{0}, slow{0}, insns{0}, disp{0}, fb{0};
+    std::atomic<uint64_t> tsc{0}, cpu{0}, cpu_n{0}, ab_wait{0}, prio_fix{0}, prio_hooked{0}, donated{0};
+    std::atomic<uint64_t> gets{0}, get_bytes{0}, puts{0}, put_bytes{0}, slow{0}, insns{0}, disp{0}, fb{0}, decr{0}, labg{0}, othr{0};
     std::atomic<uint64_t> lv_runs{0}, lv_bad{0}, xv_runs{0}, xv_bad{0}, xv_skip{0}, xv_bytes{0}, xv_ringb{0};
 };
 Stats g_st;
@@ -347,6 +349,9 @@ bool run_claimed(List& L, uint32_t v, Claimed& c) {
         g_st.puts.fetch_add(x.hc.puts - before.puts, std::memory_order_relaxed);
         g_st.put_bytes.fetch_add(x.hc.put_bytes - before.put_bytes, std::memory_order_relaxed);
         g_st.slow.fetch_add(x.hc.slow - before.slow, std::memory_order_relaxed);
+        g_st.decr.fetch_add(x.hc.dec_reads - before.dec_reads, std::memory_order_relaxed);
+        g_st.labg.fetch_add(x.hc.label_gets - before.label_gets, std::memory_order_relaxed);
+        g_st.othr.fetch_add(x.hc.other_reads - before.other_reads, std::memory_order_relaxed);
         if (!ok) {
             g_st.failed.fetch_add(1, std::memory_order_relaxed);
             static std::atomic<int> logged{0};
@@ -428,16 +433,25 @@ bool scan(List& L, uint32_t v) {
     return !zeroed;
 }
 
-int grab_vspu() {
-    for (uint32_t i = 0; i < cfg().vspus; i++) {
+std::atomic<uint32_t> g_rr{0};
+
+int grab_vspu(int pref = -1) {
+    uint32_t n = cfg().vspus;
+    if (pref >= 0 && static_cast<uint32_t>(pref) < n) {
+        bool f = false;
+        if (!g_vspu[pref].busy.load(std::memory_order_relaxed) && g_vspu[pref].busy.compare_exchange_strong(f, true, std::memory_order_acquire)) return pref;
+    }
+    uint32_t start = g_rr.fetch_add(1, std::memory_order_relaxed);
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t i = (start + k) % n;
         bool f = false;
         if (!g_vspu[i].busy.load(std::memory_order_relaxed) && g_vspu[i].busy.compare_exchange_strong(f, true, std::memory_order_acquire)) return static_cast<int>(i);
     }
     return -1;
 }
 
-bool work_once() {
-    int v = grab_vspu();
+bool work_once(int pref = -1) {
+    int v = grab_vspu(pref);
     if (v < 0) return false;
     bool did = false;
     for (uint32_t k = 0; k < kLists; k++) {
@@ -592,6 +606,12 @@ void stats_line() {
     last_insns = ins;
     last_disp = dsp;
     last_fb = fbk;
+    static uint64_t l_dec = 0, l_lab = 0, l_oth = 0;
+    uint64_t vd = g_st.decr.load(), vl = g_st.labg.load(), vo = g_st.othr.load();
+    LOG_INFO("jsedge", "5s per edge job: %.1f decrementer reads, %.2f label GETs, %.1f other channel reads", double(vd - l_dec) / jn, double(vl - l_lab) / jn, double(vo - l_oth) / jn);
+    l_dec = vd;
+    l_lab = vl;
+    l_oth = vo;
     {
         std::string a;
         for (int w = 0; w < 64; w++) {
@@ -602,7 +622,11 @@ void stats_line() {
             a += b;
         }
         if (!a.empty()) LOG_INFO("jsedge", "5s SPU-side entries:%s", a.c_str());
-        LOG_INFO("jsedge", "priority calls intercepted %llu, re-zeroed %llu", static_cast<unsigned long long>(g_st.prio_hooked.load()), static_cast<unsigned long long>(g_st.prio_fix.load()));
+        static uint64_t l_don = 0;
+        uint64_t dn = g_st.donated.load();
+        LOG_INFO("jsedge", "priority calls intercepted %llu, re-zeroed %llu; SPU-donated jobs %llu", static_cast<unsigned long long>(g_st.prio_hooked.load()), static_cast<unsigned long long>(g_st.prio_fix.load()),
+                 static_cast<unsigned long long>(dn - l_don));
+        l_don = dn;
     }
     for (int m = 0; m < 256; m++)
         if (g_fresh[m].runs.load() || g_fresh[m].skipped.load())
@@ -886,6 +910,13 @@ void init() {
 #ifdef JSEDGE_CORE
     if (jobsys::enabled()) jobsys::add_consumer(&g_core_consumer);
 #endif
+}
+
+bool spu_idle(unsigned slot) {
+    if (!cfg().on || !cfg().donate || !g_started.load(std::memory_order_relaxed) || !any_ready()) return false;
+    if (!work_once(slot < kVspus ? static_cast<int>(slot) : -1)) return false;
+    g_st.donated.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 bool on_set_priorities(ppu::Context& ctx) {

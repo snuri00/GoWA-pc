@@ -9,6 +9,8 @@
 
 #include <cstring>
 
+#include <windows.h>
+
 #include <immintrin.h>
 
 namespace jsedge {
@@ -40,10 +42,14 @@ bool plain(uint32_t ea, uint32_t size, uint32_t lsa) {
 struct FastHost final : spu::Host {
     spu::SpuThread& t;
     HostCounters& hc;
+    uint32_t dec_run = 0;
     FastHost(spu::SpuThread& th, HostCounters& c) : t(th), hc(c) {}
     uint32_t read_channel(uint32_t ch) override {
         switch (ch) {
-        case 8: return 0u - static_cast<uint32_t>(__rdtsc() >> 5);
+        case 8:
+            hc.dec_reads++;
+            if ((++dec_run & 127) == 0) SwitchToThread();
+            return 0u - static_cast<uint32_t>(__rdtsc() >> 5);
         case 13: return t.ctx.interrupts_enabled ? 1 : 0;
         case 24:
             if (t.tag_stat_count) {
@@ -59,6 +65,7 @@ struct FastHost final : spu::Host {
             break;
         default: break;
         }
+        hc.other_reads++;
         return t.read_channel(ch);
     }
     uint32_t channel_count(uint32_t ch) override {
@@ -80,7 +87,7 @@ struct FastHost final : spu::Host {
         case 18: t.mfc_eal = v; return;
         case 19: t.mfc_size = v > 0xFFFF ? 0xFFFF : v; return;
         case 20: t.mfc_tag = v & 0x1F; return;
-        case 21: mfc(v & 0xFF); return;
+        case 21: dec_run = 0; mfc(v & 0xFF); return;
         case 22: t.tag_mask = v; return;
         case 23:
             t.tag_stat = t.tag_mask;
@@ -92,6 +99,7 @@ struct FastHost final : spu::Host {
     }
     void get(uint32_t lsa, uint32_t ea, uint32_t size) {
         hc.gets++;
+        if (ea - 0x50300c80u < 0xa0u) hc.label_gets++;
         hc.get_bytes += size;
         lsa &= 0x3FFFF;
         if (vm::is_immutable(ea, size)) {

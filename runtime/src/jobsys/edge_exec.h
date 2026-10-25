@@ -75,7 +75,7 @@ uint32_t set_base(const Cmd& c, uint32_t set, uint32_t buf);
 bool api_call(spu::Context& ctx, ApiState& st);
 
 struct HostCounters {
-    uint64_t gets = 0, get_bytes = 0, puts = 0, put_bytes = 0, slow = 0, atomics = 0;
+    uint64_t gets = 0, get_bytes = 0, puts = 0, put_bytes = 0, slow = 0, atomics = 0, dec_reads = 0, label_gets = 0, other_reads = 0;
 };
 
 class Executor {
