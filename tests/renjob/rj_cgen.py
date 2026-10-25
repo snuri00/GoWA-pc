@@ -32,6 +32,7 @@ WHOLE_RETCHECK = False
 WHOLE_HDR_EXTRA = ()
 WHOLE_PM_DECLS = True
 JUMP_ABS = False
+KERNEL_IMG = None
 WHOLE_ICALL_DEFAULT = "ctl.icall_miss = t; FAIL(pc);"
 PM_EA = 0x7A7B00
 PM_LS = 0xA00
@@ -54,6 +55,8 @@ def configure(**kw):
 
 
 def word(pc):
+    if WHOLE_PM and pc < PM_LS:
+        return struct.unpack_from(">I", KERNEL_IMG, pc)[0] if KERNEL_IMG and pc + 4 <= len(KERNEL_IMG) else 0
     if WHOLE_PM and PM_LS <= pc < IMG_LS:
         return struct.unpack_from(">I", data, PM_EA - 0x10000 + pc - PM_LS)[0] if pc < PM_LS + PM_SIZE else 0
     if WHOLE_PM and not (IMG_LS <= pc < IMG_LS + len(img)):
@@ -791,6 +794,10 @@ def whole_main(outp, hdr):
         emit_func(funcs[e], out)
     cases = " ".join("case 0x%05x: f_%05x(R, ls, ctl%s); return;" % (e, e, ", 0x%05x" % e if e in WHOLE_MULTI else "") for e in sorted(funcs) if e not in SPEC and e not in PM_CALLS)
     cases += " " + " ".join("case 0x%05x: %s return;" % (t, c) for t, c in sorted(PM_CALLS.items()))
+    if KERNEL_IMG:
+        kp = sorted({(pc, d["w"]) for f in funcs.values() for pc, d in f.insns.items() if pc < PM_LS})
+        out.append("static const uint32_t kKern[%d][2] = {%s};" % (max(len(kp), 1), ", ".join("{0x%05x, 0x%08xu}" % x for x in kp) or "{0, 0}"))
+        out.append("static bool kernel_ok(const uint8_t* ls) { thread_local const uint8_t* ok = nullptr; if (ok == ls) return true; for (const auto& k : kKern) { uint32_t w; std::memcpy(&w, ls + k[0], 4); if (__builtin_bswap32(w) != k[1]) return false; } ok = ls; return true; }")
     out.append("void icall(V* R, uint8_t* ls, Ctl& ctl, uint32_t t, uint32_t pc) { switch (t & 0x3fffc) { %s default: %s } }" % (cases, WHOLE_ICALL_DEFAULT))
     out = [re.sub(r"(?<![A-Za-z0-9_])st\(ls,", "stp(ls,", l) for l in out]
     out = [re.sub(r"(?<![A-Za-z0-9_])st32\(ls,", "st32p(ls,", l) for l in out]

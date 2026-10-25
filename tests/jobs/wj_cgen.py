@@ -22,6 +22,21 @@ JOBS = (
 )
 
 PM_API = (0x16F0, 0x2FD8, 0x1760, 0x17B8, 0x17C0, 0x17E0, 0x1AF0, 0x1B10, 0x1A90)
+KERNEL_POLL = 0x290
+KERNEL_HASH = "7fc5b882b93f5dec"
+
+
+def kernel_image():
+    import hashlib
+    fw = os.environ.get("GOWA_FW") or os.path.join(ROOT, "fw", "4.91")
+    path = os.path.join(fw, "libsre.prx")
+    if not os.path.exists(path):
+        return None
+    d = open(path, "rb").read()
+    for o in range(0, len(d) - 0xa00, 16):
+        if hashlib.sha256(d[o + KERNEL_POLL:o + KERNEL_POLL + 16]).hexdigest()[:16] == KERNEL_HASH:
+            return d[o:o + 0xa00]
+    return None
 
 
 def u32(data, ea):
@@ -107,14 +122,19 @@ def generate(job, outdir):
     entry, tail, ctors = crt(data, ea)
     lo, hi = 0x4030, 0x4000 + size
     found = (set(ctors) | icalls(ic, lo, hi) | extra_icalls(short, lo, hi) | set(extra) | data_targets(data, ea, size, hi)) - {entry}
-    roots = [entry] + sorted(r for r in found if lo <= r < hi) + list(PM_API)
+    kimg = kernel_image()
+    roots = [entry] + sorted(r for r in found if lo <= r < hi) + list(PM_API) + ([KERNEL_POLL] if kimg else [])
+    ext = "{ uint32_t r_ = ::wj::ext_call(R, ls, 0x%x, pc + 4); if (r_ != pc + 4) { ctl.fail = true; ctl.out = true; ctl.fail_pc = r_; } }" % KERNEL_POLL
+    pm_calls = {0x017E0: "if (::wj::t_lnj) { f_017e0(R, ls, ctl); if (ctl.out) return; }"}
+    if kimg:
+        pm_calls[KERNEL_POLL] = "if (kernel_ok(ls)) { f_%05x(R, ls, ctl); } else %s" % (KERNEL_POLL, ext)
     pc_counts = os.path.join(ROOT, "tests", "meshprep", "pc_counts_%s.txt" % ic) if ic else None
     G.configure(IMG_EA=ea, IMG_SIZE=size, CODE_END=hi, ENTRY_ROOTS=(entry,), INLINE_EXCEPT=(), OPS_INCLUDE="../scream/scream_ops.h" if scream else "renjob_ops.h", BASE_NS="renjob::xo",
                 PC_COUNTS_PATH=pc_counts, KERNELS={}, ICALLS={}, RECURSION_LIMIT=0, LOOP_BUDGET=False,
                 WHOLE_ROOTS=tuple(roots), WHOLE_MULTI={entry: (entry, tail)}, WHOLE_NS="renjob::wj_%s" % short, WHOLE_PM=True, WHOLE_RETCHECK=True,
                 WHOLE_HDR_EXTRA=('#include "jobs_flags.h"',), WHOLE_PM_DECLS=False,
                 WHOLE_ICALL_DEFAULT="{ ctl.icall_miss = t; uint32_t r_ = ::wj::ext_call(R, ls, t & 0x3fffc, pc + 4); if (r_ == pc + 4) return; ctl.fail = true; ctl.out = true; ctl.fail_pc = r_; return; }",
-                PM_CALLS={0x017E0: "if (::wj::t_lnj) { f_017e0(R, ls, ctl); if (ctl.out) return; }"})
+                PM_CALLS=pm_calls, KERNEL_IMG=kimg)
     G.PC_COUNTS = None
     G.NOCALL.clear()
     G.SPEC.clear()
