@@ -12,7 +12,7 @@ const Registrar r_writepk({0x77a580, "WritePackets", nullptr, nullptr, 0, 0, 0, 
 const Registrar r_sortprim({0x6f4a00, "SortPrim", nullptr, nullptr, 0, 0, 0, 0});
 const Registrar r_meshprep({0x74b100, "MeshPrep", nullptr, nullptr, 0, 0, 0, kOptIn});
 const Registrar r_waterproc({0x71c500, "WaterProc", nullptr, nullptr, 0, 0, 0, kOptIn});
-const Registrar r_cloth({0x728400, "Cloth", nullptr, nullptr, 0, 0, 0, kBuffers});
+const Registrar r_cloth({0x728400, "Cloth", nullptr, nullptr, 0, 0, 0, kBuffers | kOptIn});
 const Registrar r_stereo({0x7a5c80, "StereoDepth", nullptr, nullptr, 0, 0, 0, kOptIn});
 
 }
