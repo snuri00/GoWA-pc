@@ -46,12 +46,21 @@ uint32_t g_sig_gb[8], g_sig_r1[6], g_sig_r2[6];
 void install_trace() {
     const char* e = std::getenv("GOWA_JOBSYS_TRACE_GETBUF");
     if (!e || e[0] == '0') return;
+    if (!vm::range_mapped(kPmEa, 0x3000) || !vm::range_mapped(0x728400, 0x8400)) return;
     for (int i = 0; i < 8; i++) g_sig_gb[i] = vm::read32(kPmEa + 0x2fd8 - 0xa00 + 4 * i);
     for (int i = 0; i < 6; i++) g_sig_r1[i] = vm::read32(0x728400 + 0xbde8 - 0x4000 + 4 * i);
     for (int i = 0; i < 6; i++) g_sig_r2[i] = vm::read32(0x728400 + 0xbe28 - 0x4000 + 4 * i);
     spu::hle::register_function({0x2fd8, 8, g_sig_gb, on_getbuffer, "trace GetBuffer"});
     spu::hle::register_function({0xbde8, 6, g_sig_r1, on_ret, "trace GetBuffer ret 1"});
     spu::hle::register_function({0xbe28, 6, g_sig_r2, on_ret, "trace GetBuffer ret 2"});
+}
+
+namespace {
+
+struct TraceHook {
+    TraceHook() { spu::hle::g_after_install = install_trace; }
+} g_trace_hook;
+
 }
 
 }

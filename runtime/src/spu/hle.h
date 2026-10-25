@@ -33,6 +33,7 @@ extern uint8_t g_max_words[LS_SIZE / 4];
 inline uint32_t max_sig_words(uint32_t pc) { return g_max_words[(pc & PC_MASK) >> 2]; }
 inline bool any_at(uint32_t pc) { return g_first[(pc & PC_MASK) >> 2] != 0; }
 void install_builtin();
+extern void (*g_after_install)();
 extern bool g_dyn_on;
 inline bool dyn_at(uint32_t pc) { return g_dyn_on && pc - 0x10c80u < 0x29000u - 0x10c80u; }
 const Function* lookup_dyn(const uint8_t* ls, uint32_t pc);
