@@ -129,6 +129,7 @@ enum ModuleFlags : uint32_t {
     kSerial = 1u << 2,
     kTexTable = 1u << 3,
     kOptIn = 1u << 4,
+    kWholeUnverified = 1u << 5,
 };
 
 struct ModuleInfo {

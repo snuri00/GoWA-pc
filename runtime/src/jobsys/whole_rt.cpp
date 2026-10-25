@@ -68,8 +68,16 @@ namespace jobsys {
 
 namespace {
 
+constexpr uint32_t kVerified[] = {0x730800, 0x6f7200};
+
+constexpr uint32_t verified_flag(uint32_t ea) {
+    for (uint32_t v : kVerified)
+        if (v == ea) return 0;
+    return kWholeUnverified;
+}
+
 #ifdef JW_MODULES
-#define JW_REG(ea, name, ns) const Registrar reg_##ns({ea, name, nullptr, renjob::ns::run, renjob::ns::kEntry, 0, 0, 0});
+#define JW_REG(ea, name, ns) const Registrar reg_##ns({ea, name, nullptr, renjob::ns::run, renjob::ns::kEntry, 0, 0, verified_flag(ea)});
 JW_MODULES(JW_REG)
 #undef JW_REG
 #endif

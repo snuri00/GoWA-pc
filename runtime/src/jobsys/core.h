@@ -15,7 +15,7 @@ struct SpuThread;
 
 namespace jobsys {
 
-constexpr bool kDefaultOn = false;
+constexpr bool kDefaultOn = true;
 
 struct Config {
     bool on = false;

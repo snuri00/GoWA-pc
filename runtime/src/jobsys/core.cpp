@@ -279,7 +279,7 @@ Tier tier_for(uint32_t ea) {
         if (m == ea) want = t;
     const ModuleInfo* m = find_module(ea);
     Tier best = Tier::Executor;
-    if (m && m->whole) best = Tier::Whole;
+    if (m && m->whole && !(m->flags & kWholeUnverified)) best = Tier::Whole;
     if (m && m->semantic) best = Tier::Semantic;
     if (m && (m->flags & kNoExecutor) && best == Tier::Executor) best = Tier::Wws;
     if (want == Tier::Auto) return best;
