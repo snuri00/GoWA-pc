@@ -177,6 +177,10 @@ void prepare_job(Executor& x, const JobDesc& j) {
     uint8_t tags[0x20] = {};
     write_be32(tags, 0xff);
     load_ls(t, 0x1290, tags, sizeof tags);
+    uint8_t kctx[0x10] = {};
+    write_be32(kctx + 4, j.spurs);
+    write_be32(kctx + 8, x.index < 16 ? x.index % 6 : x.index < 22 ? x.index - 16 : (5 + 6 - (31 - x.index) % 6) % 6);
+    load_ls(t, 0x1c0, kctx, sizeof kctx);
     reset_regs(t, j);
     x.last_module = j.module_ea;
 }
