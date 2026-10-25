@@ -52,16 +52,17 @@ Pop pop(Item& out, uint32_t only_list = 0) {
     if (!g_qn.load(std::memory_order_acquire)) return Pop::Empty;
     std::lock_guard lk(g_m);
     if (g_q.empty()) return Pop::Empty;
-    uint32_t closed_list = 0, closed_gate = 0;
+    uint32_t closed[8];
+    uint32_t nclosed = 0;
     bool any = false;
     for (auto it = g_q.begin(); it != g_q.end(); ++it) {
         if (only_list && it->d.list_obj != only_list) continue;
         any = true;
+        if (std::find(closed, closed + nclosed, it->d.list_obj) != closed + nclosed) continue;
         if (it->d.gate_ea) {
-            if (closed_list == it->d.list_obj && closed_gate == it->d.gate_ea) continue;
             if (!gate_open(it->d.gate_ea)) {
-                closed_list = it->d.list_obj;
-                closed_gate = it->d.gate_ea;
+                if (nclosed < 8) closed[nclosed++] = it->d.list_obj;
+                else return Pop::Blocked;
                 continue;
             }
             uint32_t g = it->d.gate_ea, l = it->d.list_obj;

@@ -190,14 +190,22 @@ void emulate(spu::SpuThread& t, spu::Host* host) {
     t.exec_host = nullptr;
 }
 
-void emulate_fast(spu::SpuThread& t, JobCtx& c) {
+void emulate_fast(Executor& x, JobCtx& c) {
+    spu::SpuThread& t = *x.t;
     if (!cfg().fast_mfc) {
         emulate(t, nullptr);
+        x.unmarked = false;
         return;
     }
+    for (uint32_t k = 0; k < 64; k++) t.clear_snap(k);
+    if (x.unmarked) t.mark_all_ls();
+    x.unmarked = false;
     MfcHost h(t, c);
     MfcSpuHost sh(h);
-    emulate(t, &sh);
+    t.exec_host = &sh;
+    t.stop_flag.store(false);
+    t.exec();
+    t.exec_host = nullptr;
     if (h.st.slow) stats().slow_dma.fetch_add(h.st.slow, std::memory_order_relaxed);
 }
 
@@ -234,6 +242,7 @@ bool exec_job(Executor& x, const JobDesc& j, Tier tier) {
     if (cfg().poison) verify::poison(t, j.seq, cfg().poison);
     if (tier == Tier::Whole && m && m->whole && (m->whole_entry == 0 || m->whole_entry == j.entry)) {
         MfcStats st;
+        x.unmarked = true;
         WholeResult r = run_whole_live(x, *m, c, &st);
         if (st.slow) stats().slow_dma.fetch_add(st.slow, std::memory_order_relaxed);
         if (r.done) {
@@ -245,11 +254,11 @@ bool exec_job(Executor& x, const JobDesc& j, Tier tier) {
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 24) LOG_WARN("jobsys", "whole %s resumed in the emulator at 0x%05x (icall 0x%05x)", m->name, r.fail_pc, r.icall_miss);
         t.ctx.pc = r.fail_pc;
-        emulate_fast(t, c);
+        emulate_fast(x, c);
         x.last = Tier::Executor;
         return true;
     }
-    emulate_fast(t, c);
+    emulate_fast(x, c);
     x.last = Tier::Executor;
     return true;
 }

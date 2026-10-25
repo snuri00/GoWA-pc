@@ -65,6 +65,7 @@ struct Executor {
     std::vector<uint8_t> start_ls;
     alignas(16) uint8_t start_gpr[128 * 16] = {};
     uint32_t last_module = 0;
+    bool unmarked = true;
 };
 
 Executor& thread_executor(uint32_t index);
