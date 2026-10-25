@@ -3,7 +3,8 @@
 #include "runtime/hooks.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
-#include "runtime/ppujobs.h"
+#include "runtime/jobsys.h"
+#include "jobsys/jobs_graph.h"
 #include "runtime/reservation.h"
 #include "runtime/trace.h"
 
@@ -568,23 +569,21 @@ void install_patches() {
     }
 }
 
-void install_ppujobs() {
-    if (!ppujobs::enabled()) return;
-    struct Patch {
-        uint32_t addr;
-        bool (*guard)(ppu::Context&);
-    };
-    static const Patch patches[] = {{0x3e13e0, ppujobs::on_submit}, {0x49e540, ppujobs::on_push}, {0x49ce50, ppujobs::on_kick}, {0x49e368, ppujobs::on_wait}};
-    for (const Patch& p : patches) {
-        Hook*& h = g_hooks[p.addr];
-        if (!h) {
-            h = new Hook;
-            h->addr = p.addr;
-            h->quiet = true;
-        }
-        h->guard = p.guard;
-        ppu::hook_flags[p.addr >> 2] = 1;
+void add_guard(uint32_t addr, bool (*guard)(ppu::Context&)) {
+    Hook*& h = g_hooks[addr];
+    if (!h) {
+        h = new Hook;
+        h->addr = addr;
+        h->quiet = true;
     }
+    if (h->guard) LOG_WARN("hook", "guard at 0x%08x replaced by jobsys", addr);
+    h->guard = guard;
+    ppu::hook_flags[addr >> 2] = 1;
+}
+
+void install_ppujobs() {
+    jobsys::wws::install(add_guard);
+    wj::install(add_guard);
 }
 
 void hog_thread(int lp, int on_ms, int off_ms, double from) {
