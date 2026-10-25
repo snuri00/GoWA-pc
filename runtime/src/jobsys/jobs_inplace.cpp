@@ -307,7 +307,11 @@ bool selected(int job) { return job >= 0 && job < kJobCount && g_on[job]; }
 
 void install_inplace() {
     const char* e = std::getenv("GOWA_WJ");
-    if (!e || !*e || e[0] == '0') return;
+    if (!e) {
+        const char* j = std::getenv("GOWA_JOBSYS_JOBS");
+        e = j && j[0] == '0' ? "0" : "1";
+    }
+    if (!*e || e[0] == '0') return;
     std::string sel(e);
     for (int j = 0; j < kJobCount; j++) g_on[j] = ((sel == "1" || sel == "all") && j != kAnim) || sel.find(kShort[j]) != std::string::npos;
     if (const char* v = std::getenv("GOWA_WJ_VERIFY")) g_verify = static_cast<uint32_t>(std::strtoul(v, nullptr, 0));

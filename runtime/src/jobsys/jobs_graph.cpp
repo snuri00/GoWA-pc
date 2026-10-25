@@ -33,7 +33,7 @@ GraphCfg& gcfg() {
     static GraphCfg c = [] {
         GraphCfg g;
         const char* e = std::getenv("GOWA_JOBSYS_JOBS");
-        g.on = e && e[0] == '1';
+        g.on = !(e && e[0] == '0');
         g.loaded = true;
         return g;
     }();
@@ -86,9 +86,6 @@ bool on_flush(ppu::Context& ctx) {
     if (!count) return false;
     uint32_t list = 0;
     int node = node_of(vm::read32(b + 52), list);
-    static std::atomic<int> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
-        LOG_INFO("wj", "graph flush B 0x%08x count %u data 0x%08x ents 0x%08x arr 0x%08x obj 0x%08x -> node %d", b, count, vm::read32(b), vm::read32(b + 48), vm::read32(b + 52), vm::read32(b + 32), node);
     if (node < 0) return false;
     NodeState& ns = g_nodes[node];
     uint32_t data = vm::read32(b + 0);
