@@ -23,19 +23,25 @@ bool on_getbuffer(spu::Context& c) {
     if (be32(c.ls + 0x4000 + 0x10) != 0x7f60) return false;
     g_logged.fetch_add(1, std::memory_order_relaxed);
     std::string cmd;
-    for (uint32_t off = 0; off < 0x60; off += 4) {
+    for (uint32_t off = 0; off < 0x40; off += 4) {
         char b[12];
-        std::snprintf(b, sizeof b, " %08x", be32(c.ls + 0xc00 + off));
+        std::snprintf(b, sizeof b, " %08x", be32(c.ls + 0xdf0 + off));
         cmd += b;
     }
-    LOG_INFO("jstrace", "GetBuffer r3 %08x r4 %08x r5 %08x r6 %08x lr %05x cmd%s", c.gpr[3].u32[3], c.gpr[4].u32[3], c.gpr[5].u32[3], c.gpr[6].u32[3], c.gpr[0].u32[3], cmd.c_str());
+    cmd += " |";
+    for (uint32_t off = 0; off < 0x40; off += 4) {
+        char b[12];
+        std::snprintf(b, sizeof b, " %08x", be32(c.ls + 0xeb0 + off));
+        cmd += b;
+    }
+    LOG_INFO("jstrace", "GetBuffer r3 %08x r4 %08x r5 %08x r6 %08x lr %05x mask %08x set tables%s", c.gpr[3].u32[3], c.gpr[4].u32[3], c.gpr[5].u32[3], c.gpr[6].u32[3], c.gpr[0].u32[3], be32(c.ls + 0x1290), cmd.c_str());
     return false;
 }
 
 bool on_ret(spu::Context& c) {
     if (g_logged.load(std::memory_order_relaxed) >= kMaxLog) return false;
     g_logged.fetch_add(1, std::memory_order_relaxed);
-    LOG_INFO("jstrace", "GetBuffer returned r3 %08x at %05x", c.gpr[3].u32[3], c.pc);
+    LOG_INFO("jstrace", "GetBuffer returned r3 %08x %08x %08x %08x at %05x mask %08x %08x", c.gpr[3].u32[3], c.gpr[3].u32[2], c.gpr[3].u32[1], c.gpr[3].u32[0], c.pc, be32(c.ls + 0x1290), be32(c.ls + 0x1294));
     return false;
 }
 
