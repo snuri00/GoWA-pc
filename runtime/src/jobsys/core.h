@@ -66,7 +66,10 @@ struct Executor {
     alignas(16) uint8_t start_gpr[128 * 16] = {};
     uint32_t last_module = 0;
     bool unmarked = true;
+    const JobDesc* cur = nullptr;
 };
+
+extern thread_local const JobDesc* t_job;
 
 Executor& thread_executor(uint32_t index);
 void prepare_job(Executor& x, const JobDesc& j);
@@ -95,5 +98,7 @@ void help_until_list(const Completion& c, uint32_t list);
 uint32_t queued();
 void start_workers();
 void install_trace();
+bool shadow_module(uint32_t mod);
+void shadow_job(const JobDesc& j);
 
 }

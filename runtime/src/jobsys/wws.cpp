@@ -77,7 +77,7 @@ bool accept(const JobDesc& j) {
     Tier t = tier_for(j.module_ea);
     if (t == Tier::Wws) return false;
     const ModuleInfo* m = find_module(j.module_ea);
-    if (!j.only_code() && !(m && m->semantic && t == Tier::Semantic)) return false;
+    if (!j.only_code() && !(m && m->semantic && t == Tier::Semantic) && !(m && (m->flags & kBuffers) && simple_buffers(j))) return false;
     return true;
 }
 
@@ -128,6 +128,11 @@ bool on_push(ppu::Context& ctx) {
     uint64_t header = ctx.gpr[5];
     uint32_t list_obj = static_cast<uint32_t>(ctx.gpr[4]);
     Decode d = decode(header, list_obj, j);
+    if (d == Decode::Ok && shadow_module(j.module_ea)) {
+        shadow_job(j);
+        t_cap.real_push = true;
+        return false;
+    }
     ListState* ls = d == Decode::Ok ? list_state(list_obj, true) : nullptr;
     if (d != Decode::Ok || !ls || ls->passthru.load(std::memory_order_relaxed) || !accept(j)) {
         t_cap.real_push = true;

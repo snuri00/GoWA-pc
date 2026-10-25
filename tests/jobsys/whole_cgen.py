@@ -22,7 +22,7 @@ EXTRA_ROOTS = {
     0x6f7200: (0x04038,),
 }
 
-PM_CALLS = {0x017b8: "renjob::wh::pm_gettag(R, ls, ctl);", 0x017c0: "renjob::wh::pm_releasetag(R, ls, ctl);", 0x017e0: ""}
+PM_CALLS = {0x017b8: "renjob::wh::pm_gettag(R, ls, ctl);", 0x017c0: "renjob::wh::pm_releasetag(R, ls, ctl);", 0x017e0: "", 0x02fd8: "jobsys::jw::pm_getbuffer(R, ls, ctl);"}
 TAIL_RE = re.compile(r"\{\s*f_([0-9a-f]{5})\(R, ls, ctl\); return; \}")
 CALL_RE = re.compile(r"(r0 = pref_only\(0x[0-9a-f]+\); \{\s*)f_([0-9a-f]{5})\(R, ls, ctl\); if \(ctl\.out\) return;")
 

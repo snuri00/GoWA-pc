@@ -1,4 +1,5 @@
 #include "jwhole_rt.h"
+#include "core.h"
 
 #include "spu/hle.h"
 
@@ -33,6 +34,22 @@ struct ChanAsHost final : spu::Host {
 
 std::atomic<uint64_t> g_hle_calls{0};
 
+}
+
+void pm_getbuffer(renjob::xo::V* R, uint8_t* ls, renjob::xo::Ctl& ctl) {
+    uint32_t out[4];
+    spu::Context* c = t_ctx;
+    if (!t_job || !c || !get_buffer(*t_job, ls, c->gpr[4].u32[3], c->gpr[5].u32[3], c->gpr[6].u32[3], out)) {
+        ctl.fail = true;
+        ctl.out = true;
+        ctl.fail_pc = 0x2fd8;
+        return;
+    }
+    c->gpr[3].u32[3] = out[0];
+    c->gpr[3].u32[2] = out[1];
+    c->gpr[3].u32[1] = out[2];
+    c->gpr[3].u32[0] = out[3];
+    (void)R;
 }
 
 bool hle_call(renjob::xo::V* R, uint8_t* ls, renjob::xo::Ctl& ctl, uint32_t pc) {
