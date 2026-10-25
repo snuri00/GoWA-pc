@@ -423,11 +423,19 @@ bool run_claimed(List& L, uint32_t v, Claimed& c) {
     return ok;
 }
 
+std::atomic<bool> g_handback{false};
+
 void handback(List& L, const char* why, uint32_t idx) {
-    int expected = S_OWNED;
-    if (!L.state.compare_exchange_strong(expected, S_HANDBACK)) return;
+    if (g_handback.exchange(true)) return;
     g_st.unsupported.fetch_add(1, std::memory_order_relaxed);
-    LOG_WARN("jsedge", "wid %u entry %u: %s, handing the list back to the SPUs", L.wid, idx, why);
+    LOG_WARN("jsedge", "wid %u entry %u: %s, handing all Edge lists back to the SPUs", L.wid, idx, why);
+    for (List& o : g_lists) {
+        int expected = S_OWNED;
+        if (!o.state.compare_exchange_strong(expected, S_HANDBACK)) {
+            expected = S_PENDING;
+            o.state.compare_exchange_strong(expected, S_HANDBACK);
+        }
+    }
 }
 
 bool scan(List& L, uint32_t v) {
@@ -567,6 +575,10 @@ void manage() {
     for (uint32_t k = 0; k < kLists; k++) {
         List& L = g_lists[k];
         int s = L.state.load(std::memory_order_acquire);
+        if (s == S_SPU && g_handback.load(std::memory_order_acquire)) {
+            L.state.store(S_DISABLED, std::memory_order_release);
+            continue;
+        }
         if (s == S_SPU) {
             L.wid = kFirstWid + k;
             if (!vm::range_mapped(kSpurs, 0x1100)) continue;
@@ -692,7 +704,11 @@ void manager_main() {
     if (rsv::g_watch_line.load() == 0xFFFFFFFFu) rsv::g_watch_line.store(kSpurs);
     auto next = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     for (;;) {
-        if (cfg().on) manage();
+        if (cfg().on) {
+            static const double hb_at = std::getenv("GOWA_JOBSYS_EDGE_HANDBACK_AT") ? std::atof(std::getenv("GOWA_JOBSYS_EDGE_HANDBACK_AT")) : 0.0;
+            if (hb_at > 0.0 && logging::uptime() >= hb_at && !g_handback.load()) handback(g_lists[0], "test trigger", 0);
+            manage();
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         if (std::chrono::steady_clock::now() >= next) {
             next += std::chrono::seconds(5);
