@@ -207,6 +207,7 @@ bool on_help_site(ppu::Context& ctx) {
 }
 
 void install(void (*hook)(uint32_t addr, bool (*guard)(ppu::Context&))) {
+    install_trace();
     if (!cfg().on) return;
     hook(0x3e13e0, on_submit);
     hook(0x3e16a8, on_single);

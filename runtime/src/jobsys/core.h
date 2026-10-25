@@ -93,5 +93,6 @@ ModStat& mod_stat(uint32_t ea);
 void help_until_list(const Completion& c, uint32_t list);
 uint32_t queued();
 void start_workers();
+void install_trace();
 
 }
