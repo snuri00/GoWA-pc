@@ -50,14 +50,20 @@ NodeState g_nodes[kMaxNodes];
 std::atomic<uint64_t> g_taken{0}, g_left{0}, g_flushes{0}, g_waits{0}, g_wait_cyc{0};
 std::atomic<uint64_t> g_seq{1};
 
-int node_of(uint32_t list) {
+int node_of(uint32_t arr, uint32_t& list) {
     uint32_t n = vm::read16(kGraph + 10);
     uint32_t nodes = vm::read32(kGraph + 0x20);
-    if (!nodes || n > kMaxNodes) return -1;
+    if (!nodes || n > kMaxNodes || !arr) return -1;
     for (uint32_t i = 0; i < n; i++) {
-        if (vm::read32(nodes + 0x70 * i + 0x2c) == list) {
-            g_nodes[i].list.store(list, std::memory_order_relaxed);
-            return int(i);
+        uint32_t obj = vm::read32(nodes + 0x70 * i + 0x2c);
+        uint32_t hdr = obj ? vm::read32(obj) : 0;
+        if (!hdr) continue;
+        for (uint32_t k = 0; k < 4; k++) {
+            if (vm::read32(hdr + 0x30 + 4 * k) == arr) {
+                list = obj;
+                g_nodes[i].list.store(obj, std::memory_order_relaxed);
+                return int(i);
+            }
         }
     }
     return -1;
@@ -78,8 +84,11 @@ bool on_flush(ppu::Context& ctx) {
     uint32_t b = static_cast<uint32_t>(ctx.gpr[3]);
     uint32_t count = vm::read32(b + 20);
     if (!count) return false;
-    uint32_t list = vm::read32(b + 32);
-    int node = node_of(list);
+    uint32_t list = 0;
+    int node = node_of(vm::read32(b + 52), list);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
+        LOG_INFO("wj", "graph flush B 0x%08x count %u data 0x%08x ents 0x%08x arr 0x%08x obj 0x%08x -> node %d", b, count, vm::read32(b), vm::read32(b + 48), vm::read32(b + 52), vm::read32(b + 32), node);
     if (node < 0) return false;
     NodeState& ns = g_nodes[node];
     uint32_t data = vm::read32(b + 0);

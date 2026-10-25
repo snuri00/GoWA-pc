@@ -251,6 +251,7 @@ bool handler(spu::Context& c, spu::Host& h) {
     if (!g_on[J] || job_in_ls(c.ls) != J) return false;
     JobStats& st = g_stats[J];
     st.runs++;
+    if (g_prep_diff) g_prep_diff(J, c);
     if (g_verify && g_seq[J].fetch_add(1, std::memory_order_relaxed) % g_verify == 0) {
         verify_run(J, c, h);
         return true;
@@ -299,6 +300,8 @@ void stats_thread() {
 }
 
 }
+
+void (*g_prep_diff)(int job, spu::Context& c) = nullptr;
 
 bool selected(int job) { return job >= 0 && job < kJobCount && g_on[job]; }
 
