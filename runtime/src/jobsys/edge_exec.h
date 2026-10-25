@@ -78,11 +78,13 @@ struct HostCounters {
     uint64_t gets = 0, get_bytes = 0, puts = 0, put_bytes = 0, slow = 0, atomics = 0, dec_reads = 0, label_gets = 0, other_reads = 0;
 };
 
+struct Sandbox;
+
 class Executor {
 public:
     explicit Executor(uint32_t spu_num);
     ~Executor();
-    bool run_edge(const JobRef& j, const Cmd& c, bool reference);
+    bool run_edge(const JobRef& j, const Cmd& c, bool reference, Sandbox* pre = nullptr);
     spu::SpuThread& thread() { return *t; }
     uint32_t spu_num;
     uint32_t toggle = 0;
@@ -95,6 +97,7 @@ public:
     std::vector<const spu::hle::Function*> hcache;
     std::vector<uint8_t> hvalid;
     std::unique_ptr<spu::SpuThread> t;
+    std::unique_ptr<spu::SpuThread> shadow;
 };
 
 struct Sandbox {

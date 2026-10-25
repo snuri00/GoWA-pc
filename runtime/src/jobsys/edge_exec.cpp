@@ -588,7 +588,7 @@ Executor::Executor(uint32_t n) : spu_num(n), t(std::make_unique<spu::SpuThread>(
 
 Executor::~Executor() = default;
 
-bool Executor::run_edge(const JobRef& j, const Cmd& c, bool reference) {
+bool Executor::run_edge(const JobRef& j, const Cmd& c, bool reference, Sandbox* pre) {
     spu::SpuThread& th = *t;
     toggle ^= 1;
     bool load_code = code_ea != c.module;
@@ -614,6 +614,19 @@ bool Executor::run_edge(const JobRef& j, const Cmd& c, bool reference) {
     th.events = 0;
     th.event_mask = 0;
     th.event_count = false;
+    if (pre) {
+        if (!shadow) shadow = std::make_unique<spu::SpuThread>();
+        spu::SpuThread& s = *shadow;
+        std::memcpy(s.ls, th.ls, spu::LS_SIZE);
+        std::memcpy(s.ctx.gpr, th.ctx.gpr, sizeof th.ctx.gpr);
+        s.ctx.pc = th.ctx.pc;
+        s.ctx.interrupts_enabled = th.ctx.interrupts_enabled;
+        s.tag_mask = s.tag_stat = s.atomic_stat = 0;
+        s.tag_stat_count = s.atomic_stat_count = false;
+        s.raddr = 0;
+        ApiState st = api;
+        if (!run_sandboxed(s, st, *pre)) pre->abort = true;
+    }
     FastHost fh(th, hc);
     if (load_code || hvalid.empty()) {
         hcache.assign(spu::LS_SIZE / 4, nullptr);

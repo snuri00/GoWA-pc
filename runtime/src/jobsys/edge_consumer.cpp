@@ -47,7 +47,7 @@ constexpr uint32_t kLists = 3;
 
 struct Config {
     bool on = false;
-    int threads = 4;
+    int threads = 0;
     std::vector<int> cpus;
     int prio = 0;
     bool prio_set = false;
@@ -120,16 +120,19 @@ List g_lists[kLists];
 
 struct VSpu {
     std::atomic<bool> busy{false};
+    std::atomic<uint64_t> cool_until{0};
     std::unique_ptr<Executor> x;
 };
+
+uint64_t g_cool_cycles = 0;
 
 VSpu g_vspu[kVspus];
 
 struct Stats {
     std::atomic<uint64_t> edge{0}, ab{0}, cr{0}, nops{0}, barriers{0}, blocked{0}, rc_zero{0}, helped{0}, failed{0}, unsupported{0};
-    std::atomic<uint64_t> tsc{0}, cpu{0}, cpu_n{0}, ab_wait{0}, prio_fix{0}, prio_hooked{0}, donated{0};
+    std::atomic<uint64_t> tsc{0}, cpu{0}, cpu_n{0}, ab_wait{0}, prio_fix{0}, prio_hooked{0}, donated{0}, idle_calls{0}, cooled{0};
     std::atomic<uint64_t> gets{0}, get_bytes{0}, puts{0}, put_bytes{0}, slow{0}, insns{0}, disp{0}, fb{0}, decr{0}, labg{0}, othr{0};
-    std::atomic<uint64_t> lv_runs{0}, lv_bad{0}, xv_runs{0}, xv_bad{0}, xv_skip{0}, xv_bytes{0}, xv_ringb{0};
+    std::atomic<uint64_t> lv_runs{0}, lv_bad{0}, xv_runs{0}, xv_bad{0}, xv_skip{0}, xv_bytes{0}, xv_ringb{0}, sc_runs{0}, sc_bad{0}, sc_skip{0}, sc_bytes{0}, sc_ringb{0};
 };
 Stats g_st;
 
@@ -329,6 +332,32 @@ void store_event(uint32_t ea, uint32_t v, uint32_t wid, uint32_t module) {
     critpath::spu_stored(s, 0x40 + v, ea, 2);
 }
 
+void self_check(Sandbox& sb, const Claimed& c) {
+    if (sb.abort) {
+        g_st.sc_skip.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    uint32_t rings = be32(c.kind.cmd.raw + c.kind.cmd.param_off) + 0x80;
+    uint32_t bad = 0, first = 0, ringb = 0;
+    for (auto& [a, b] : sb.writes) {
+        if (vm::ptr(a)[0] == b) continue;
+        if (a - rings < 0x200 && (a & 0x7f) - 0x18 < 0x18) {
+            ringb++;
+            continue;
+        }
+        if (!bad) first = a;
+        bad++;
+    }
+    g_st.sc_runs.fetch_add(1, std::memory_order_relaxed);
+    g_st.sc_bytes.fetch_add(sb.writes.size(), std::memory_order_relaxed);
+    if (ringb) g_st.sc_ringb.fetch_add(1, std::memory_order_relaxed);
+    if (bad) {
+        g_st.sc_bad.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 20) LOG_ERROR("jsedge", "self-check MISMATCH cmd 0x%08x: %u of %zu bytes differ, first ea 0x%08x (sandbox %02x live %02x)", c.kind.cmd.ea, bad, sb.writes.size(), first, sb.writes[first], vm::ptr(first)[0]);
+    }
+}
+
 bool run_claimed(List& L, uint32_t v, Claimed& c) {
     static thread_local uint32_t sample = 0;
     bool timed = (sample++ & 15) == 0;
@@ -339,7 +368,15 @@ bool run_claimed(List& L, uint32_t v, Claimed& c) {
         Executor& x = *g_vspu[v].x;
         HostCounters before = x.hc;
         uint64_t n0 = x.thread().exec_insns, d0 = x.dispatches, f0 = x.fallbacks;
-        ok = x.run_edge(c.ref, c.kind.cmd, cfg().reference);
+        static std::atomic<uint64_t> seq{0};
+        bool check = cfg().verify && cfg().on && seq.fetch_add(1, std::memory_order_relaxed) % cfg().verify == 0;
+        Sandbox sb;
+        ok = x.run_edge(c.ref, c.kind.cmd, cfg().reference, check ? &sb : nullptr);
+        if (check) self_check(sb, c);
+        if (g_cool_cycles && be32(x.thread().ls + kApiLs + 0xa0) == 0) {
+            g_vspu[v].cool_until.store(__rdtsc() + g_cool_cycles, std::memory_order_relaxed);
+            g_st.cooled.fetch_add(1, std::memory_order_relaxed);
+        }
         g_st.insns.fetch_add(x.thread().exec_insns - n0, std::memory_order_relaxed);
         g_st.disp.fetch_add(x.dispatches - d0, std::memory_order_relaxed);
         g_st.fb.fetch_add(x.fallbacks - f0, std::memory_order_relaxed);
@@ -435,17 +472,20 @@ bool scan(List& L, uint32_t v) {
 
 std::atomic<uint32_t> g_rr{0};
 
+bool try_take(uint32_t i, uint64_t now) {
+    if (g_vspu[i].busy.load(std::memory_order_relaxed) || g_vspu[i].cool_until.load(std::memory_order_relaxed) > now) return false;
+    bool f = false;
+    return g_vspu[i].busy.compare_exchange_strong(f, true, std::memory_order_acquire);
+}
+
 int grab_vspu(int pref = -1) {
     uint32_t n = cfg().vspus;
-    if (pref >= 0 && static_cast<uint32_t>(pref) < n) {
-        bool f = false;
-        if (!g_vspu[pref].busy.load(std::memory_order_relaxed) && g_vspu[pref].busy.compare_exchange_strong(f, true, std::memory_order_acquire)) return pref;
-    }
+    uint64_t now = __rdtsc();
+    if (pref >= 0 && static_cast<uint32_t>(pref) < n && try_take(static_cast<uint32_t>(pref), now)) return pref;
     uint32_t start = g_rr.fetch_add(1, std::memory_order_relaxed);
     for (uint32_t k = 0; k < n; k++) {
         uint32_t i = (start + k) % n;
-        bool f = false;
-        if (!g_vspu[i].busy.load(std::memory_order_relaxed) && g_vspu[i].busy.compare_exchange_strong(f, true, std::memory_order_acquire)) return static_cast<int>(i);
+        if (try_take(i, now)) return static_cast<int>(i);
     }
     return -1;
 }
@@ -624,14 +664,23 @@ void stats_line() {
         if (!a.empty()) LOG_INFO("jsedge", "5s SPU-side entries:%s", a.c_str());
         static uint64_t l_don = 0;
         uint64_t dn = g_st.donated.load();
-        LOG_INFO("jsedge", "priority calls intercepted %llu, re-zeroed %llu; SPU-donated jobs %llu", static_cast<unsigned long long>(g_st.prio_hooked.load()), static_cast<unsigned long long>(g_st.prio_fix.load()),
-                 static_cast<unsigned long long>(dn - l_don));
+        static uint64_t l_idle = 0;
+        uint64_t ic = g_st.idle_calls.load();
+        static uint64_t l_cool = 0;
+        uint64_t cl = g_st.cooled.load();
+        LOG_INFO("jsedge", "priority calls intercepted %llu, re-zeroed %llu; SPU idle calls %llu, donated jobs %llu, ring-short cool-downs %llu", static_cast<unsigned long long>(g_st.prio_hooked.load()),
+                 static_cast<unsigned long long>(g_st.prio_fix.load()), static_cast<unsigned long long>(ic - l_idle), static_cast<unsigned long long>(dn - l_don), static_cast<unsigned long long>(cl - l_cool));
+        l_cool = cl;
+        l_idle = ic;
         l_don = dn;
     }
     for (int m = 0; m < 256; m++)
         if (g_fresh[m].runs.load() || g_fresh[m].skipped.load())
             LOG_INFO("jsedge", "fresh mask 0x%x: %llu runs, %llu differ, %llu skipped", m, static_cast<unsigned long long>(g_fresh[m].runs.load()), static_cast<unsigned long long>(g_fresh[m].differ.load()),
                      static_cast<unsigned long long>(g_fresh[m].skipped.load()));
+    if (cfg().verify && cfg().on)
+        LOG_INFO("jsedge", "self-check: %llu/%llu bad (%llu skipped, %llu bytes, %llu ring-B pointer races)", static_cast<unsigned long long>(g_st.sc_bad.load()), static_cast<unsigned long long>(g_st.sc_runs.load()),
+                 static_cast<unsigned long long>(g_st.sc_skip.load()), static_cast<unsigned long long>(g_st.sc_bytes.load()), static_cast<unsigned long long>(g_st.sc_ringb.load()));
     if (cfg().verify)
         LOG_INFO("jsedge", "verify: loader %llu/%llu bad, exec %llu/%llu bad (%llu skipped, %llu bytes compared, %llu ring-B pointer races)", static_cast<unsigned long long>(g_st.lv_bad.load()),
                  static_cast<unsigned long long>(g_st.lv_runs.load()), static_cast<unsigned long long>(g_st.xv_bad.load()), static_cast<unsigned long long>(g_st.xv_runs.load()),
@@ -904,6 +953,15 @@ void init() {
         return;
     }
     for (uint32_t i = 0; i < kVspus; i++) g_vspu[i].x = std::make_unique<Executor>(i);
+    {
+        uint32_t us = 100;
+        if (const char* e = std::getenv("GOWA_JOBSYS_EDGE_COOL_US")) us = static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+        auto c0 = std::chrono::steady_clock::now();
+        uint64_t t0 = __rdtsc();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        double hz = double(__rdtsc() - t0) / std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+        g_cool_cycles = static_cast<uint64_t>(hz * 1e-6 * us);
+    }
     LOG_INFO("jsedge", "Edge list consumer on: %d workers, %u virtual SPUs, help %d, reference %d, verify %u", cfg().threads, cfg().vspus, cfg().help ? 1 : 0, cfg().reference ? 1 : 0, cfg().verify);
     std::thread(manager_main).detach();
     for (int k = 0; k < cfg().threads; k++) std::thread(worker_main, k).detach();
@@ -913,7 +971,9 @@ void init() {
 }
 
 bool spu_idle(unsigned slot) {
-    if (!cfg().on || !cfg().donate || !g_started.load(std::memory_order_relaxed) || !any_ready()) return false;
+    if (!cfg().on || !cfg().donate || !g_started.load(std::memory_order_relaxed)) return false;
+    g_st.idle_calls.fetch_add(1, std::memory_order_relaxed);
+    if (!any_ready()) return false;
     if (!work_once(slot < kVspus ? static_cast<int>(slot) : -1)) return false;
     g_st.donated.fetch_add(1, std::memory_order_relaxed);
     return true;
