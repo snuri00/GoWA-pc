@@ -282,6 +282,17 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
                 uint64_t rt = rtime;
                 uint8_t snap[128];
                 std::memcpy(snap, rdata, 128);
+                if (!job_mode && ctx.pc < 0x4000) {
+                    lk.unlock();
+                    waiting.store(1, std::memory_order_relaxed);
+                    bool ran = jsedge::spu_idle(slot) || (ctx.pc < 0xa00 && jobsys::spu_idle_donate(slot));
+                    waiting.store(0, std::memory_order_relaxed);
+                    lk.lock();
+                    if (ran) {
+                        collect_events();
+                        continue;
+                    }
+                }
                 if (park_slot >= 0 && rsv::park_enabled()) {
                     uint32_t w0 = rsv::park_word(park_slot);
                     int64_t limit = -1;
@@ -303,12 +314,6 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
                 } else {
                     lk.unlock();
                     waiting.store(1, std::memory_order_relaxed);
-                    if (!job_mode && ctx.pc < 0x4000 && (jsedge::spu_idle(slot) || (ctx.pc < 0xa00 && jobsys::spu_idle_donate(slot)))) {
-                        waiting.store(0, std::memory_order_relaxed);
-                        lk.lock();
-                        collect_events();
-                        continue;
-                    }
                     rsv::wait_lost(line, rt, snap, 1000);
                     waiting.store(0, std::memory_order_relaxed);
                     lk.lock();
