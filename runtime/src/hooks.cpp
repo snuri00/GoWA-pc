@@ -3,8 +3,11 @@
 #include "runtime/hooks.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
+#include "runtime/jobsys.h"
+#include "jobsys/jobs_graph.h"
 #include "runtime/reservation.h"
 #include "runtime/trace.h"
+#include "jobsys/edge_consumer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -567,6 +570,45 @@ void install_patches() {
     }
 }
 
+void add_guard(uint32_t addr, bool (*guard)(ppu::Context&)) {
+    Hook*& h = g_hooks[addr];
+    if (!h) {
+        h = new Hook;
+        h->addr = addr;
+        h->quiet = true;
+    }
+    if (h->guard) LOG_WARN("hook", "guard at 0x%08x replaced by jobsys", addr);
+    h->guard = guard;
+    ppu::hook_flags[addr >> 2] = 1;
+}
+
+void install_ppujobs() {
+    jobsys::wws::install(add_guard);
+    wj::install(add_guard);
+}
+
+void install_jobsys_edge() {
+    if (!jsedge::enabled()) return;
+    jsedge::init();
+    Hook*& h = g_hooks[0x41cbdc];
+    if (!h) {
+        h = new Hook;
+        h->addr = 0x41cbdc;
+        h->quiet = true;
+    }
+    jsedge::set_prev_guard(h->guard);
+    h->guard = jsedge::on_wait_previous;
+    ppu::hook_flags[0x41cbdc >> 2] = 1;
+    Hook*& sp = g_hooks[0x49cd6c];
+    if (!sp) {
+        sp = new Hook;
+        sp->addr = 0x49cd6c;
+        sp->quiet = true;
+    }
+    sp->guard = jsedge::on_set_priorities;
+    ppu::hook_flags[0x49cd6c >> 2] = 1;
+}
+
 void hog_thread(int lp, int on_ms, int off_ms, double from) {
     SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << lp);
     SetThreadDescription(GetCurrentThread(), L"test hog");
@@ -608,6 +650,8 @@ void init() {
     const char* spec = combined.c_str();
     if (!*spec) {
         install_patches();
+        install_ppujobs();
+        install_jobsys_edge();
         install_critpath();
         if (!g_hooks.empty()) ppu::hook_impl = impl;
         return;
@@ -668,6 +712,8 @@ void init() {
         if (!h->ring && !h->panic) LOG_INFO("hook", "hooked %s at 0x%08x", name_of(addr).c_str(), addr);
     }
     install_patches();
+    install_ppujobs();
+    install_jobsys_edge();
     install_critpath();
     if (g_hooks.empty()) return;
     ppu::hook_impl = impl;

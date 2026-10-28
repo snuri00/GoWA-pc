@@ -21,7 +21,24 @@ OPS_NS = "renjob::opz"
 ROOTS_MACRO = "RJ_ROOTS"
 ICALLS = {}
 RECURSION_LIMIT = 0
+WHOLE = False
+WHOLE_ROOTS = (0x14cf8, 0x052c8, 0x13310, 0x14ae0, 0x14800, 0x05830)
+WHOLE_MULTI = {0x14cf8: (0x14cf8, 0x14da4)}
+PM_CALLS = {0x017b8: "pm_gettag(R, ls, ctl);", 0x017c0: "pm_releasetag(R, ls, ctl);", 0x017e0: ""}
 LOOP_BUDGET = False
+WHOLE_NS = "renjob::wh"
+WHOLE_PM = False
+WHOLE_RETCHECK = False
+WHOLE_HDR_EXTRA = ()
+WHOLE_PM_DECLS = True
+JUMP_ABS = False
+KERNEL_IMG = None
+WHOLE_ICALL_DEFAULT = "ctl.icall_miss = t; FAIL(pc);"
+PM_EA = 0x7A7B00
+PM_LS = 0xA00
+PM_SIZE = 0x2FF0
+LINK = {}
+DOPS3 = ()
 REC_EDGES = set()
 PC_COUNTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pc_counts.txt")
 
@@ -39,6 +56,12 @@ def configure(**kw):
 
 
 def word(pc):
+    if WHOLE_PM and pc < PM_LS:
+        return struct.unpack_from(">I", KERNEL_IMG, pc)[0] if KERNEL_IMG and pc + 4 <= len(KERNEL_IMG) else 0
+    if WHOLE_PM and PM_LS <= pc < IMG_LS:
+        return struct.unpack_from(">I", data, PM_EA - 0x10000 + pc - PM_LS)[0] if pc < PM_LS + PM_SIZE else 0
+    if WHOLE_PM and not (IMG_LS <= pc < IMG_LS + len(img)):
+        return 0
     return struct.unpack_from(">I", img, pc - IMG_LS)[0]
 
 
@@ -95,7 +118,7 @@ def jump_table(pc):
         v = word(base + 4 * len(out))
         if v >= 0x10000 or v & 3 or v == 0:
             break
-        out.append(base + v)
+        out.append(v if JUMP_ABS else base + v)
     return out
 
 
@@ -109,6 +132,16 @@ class Func:
         self.exits = set()
         self.multi = None
         self.has_fail = False
+
+
+def ie_idiom(pc):
+    d = decode(pc)
+    if d["op"] not in ("bi", "biz", "binz", "bihz", "bihnz") or d["ra"] == 0:
+        return False
+    a, b = decode(pc - 8), decode(pc - 4)
+    if WHOLE_PM and b["op"] == "ila" and b["rt"] == d["ra"] and (b["imm"] & 0x3FFFC) == pc + 4 and (d["rb"] >> 4) & 3 in (1, 2):
+        return True
+    return a["op"] == "brsl" and a["rt"] == d["ra"] and ((pc - 8 + a["imm"] * 4) & 0x3FFFC) == pc - 4 and b["op"] == "ai" and b["rt"] == d["ra"] and b["ra"] == d["ra"] and b["imm"] == 8
 
 
 def discover(entry, known_entries, stops=frozenset(), entries=None):
@@ -129,6 +162,9 @@ def discover(entry, known_entries, stops=frozenset(), entries=None):
             f.insns[pc] = d
             op = d["op"]
             nxt = pc + 4
+            if WHOLE and ie_idiom(pc):
+                pc = nxt
+                continue
             if op == "br":
                 t = (pc + d["imm"] * 4) & 0x3FFFC
                 if t in known_entries and t != entry:
@@ -145,6 +181,8 @@ def discover(entry, known_entries, stops=frozenset(), entries=None):
                 t = (pc + d["imm"] * 4) & 0x3FFFC
                 if t != nxt and t not in NOCALL:
                     f.calls.add(t)
+                    if WHOLE and d["rt"] != 0:
+                        LINK.setdefault(t, set()).add(d["rt"])
             if op == "bisl" and pc in ICALLS and d["rb"] & 0x30 == 0:
                 for t in ICALLS[pc]:
                     if t not in NOCALL:
@@ -156,9 +194,23 @@ def discover(entry, known_entries, stops=frozenset(), entries=None):
                     f.labels.add(t)
                     work.append(t)
                 break
+            if WHOLE_PM and op == "ila":
+                f.ila = getattr(f, "ila", {})
+                f.ila.setdefault(d["rt"], set()).add(d["imm"] & 0x3FFFC)
+            if WHOLE_PM and op == "bi" and (d["rb"] >> 4) & 3 != 3 and not ie_idiom(pc):
+                f.ibr = getattr(f, "ibr", {})
+                f.ibr[pc] = d["ra"]
             if op in ("bi", "bra", "brasl") or op in FAILOPS - {"rdch", "wrch", "rchcnt", "mfspr", "mtspr", "fscrrd", "fscrwr"}:
                 break
             pc = nxt
+        if not work and WHOLE_PM:
+            for bpc, ra in getattr(f, "ibr", {}).items():
+                for t in sorted(getattr(f, "ila", {}).get(ra, ())):
+                    if t not in f.insns and t not in work and IMG_LS > t >= PM_LS:
+                        f.labels.add(t)
+                        work.append(t)
+                    elif t in f.insns:
+                        f.labels.add(t)
     return f
 
 
@@ -170,7 +222,7 @@ def reads_of(d):
     if op in ("selb", "shufb", "fma", "fms", "fnms", "mpya"):
         rs |= {d["ra"], d["rb"], d["rc"]}
         return rs
-    if op in ("addx", "sfx", "cgx", "bgx", "iohl"):
+    if op in ("addx", "sfx", "cgx", "bgx", "iohl") or op in DOPS3:
         rs.add(d["rt"])
     if op in ("il", "ilh", "ilhu", "ila", "fsmbi", "lqr", "lqa", "stqr", "stqa", "br", "brsl", "bra", "brasl", "stop", "stopd", "lnop", "nop", "hbrr", "hbra", "rdch", "rchcnt", "iohl", "invalid"):
         return rs
@@ -391,6 +443,16 @@ def find_promotable(f):
     return res
 
 
+def ie_act(d):
+    fl = (d["rb"] >> 4) & 3
+    return "*ctl.ie = true; " if fl == 1 else "*ctl.ie = false; " if fl == 2 else ""
+
+
+def retcheck(rt, ret):
+    r = "r%s" % rt if str(rt).isdigit() else rt
+    return "if (__builtin_expect((pref(%s) & 0x3fffc) != 0x%x, 0)) { ctl.fail = true; ctl.out = true; ctl.fail_pc = pref(%s) & 0x3fffc; return; }" % (r, ret, r)
+
+
 def xf(f, pc):
     if EXITS and r0_dead(pc):
         return "EXIT(0x%05x)" % pc
@@ -484,7 +546,28 @@ def emit_func(f, out):
         s = None
         if op in SKIP:
             continue
-        if op in FAILOPS:
+        if WHOLE and ie_idiom(pc):
+            fl = (d["rb"] >> 4) & 3
+            act = "*ctl.ie = true;" if fl == 1 else "*ctl.ie = false;" if fl == 2 else ""
+            if op == "bi":
+                s = act
+            else:
+                cond = {"biz": "pref(R[%d]) == 0", "binz": "pref(R[%d]) != 0", "bihz": "hw6(R[%d]) == 0", "bihnz": "hw6(R[%d]) != 0"}[op] % rt
+                s = "if (%s) { %s }" % (cond, act) if act else ""
+            if s:
+                out.append("    %s" % re.sub(r"R\[(\d+)\]", lambda m: "r" + m.group(1), s))
+            continue
+        if WHOLE and op == "rdch":
+            s = "R[%d] = pref_only(ctl.host->rd(%d)); if (__builtin_expect(ctl.host->abort, 0)) FAIL(@PC@);" % (rt, ra)
+        elif WHOLE and op == "rchcnt":
+            s = "R[%d] = pref_only(ctl.host->cnt(%d));" % (rt, ra)
+        elif WHOLE and op == "wrch":
+            s = "ctl.host->wr(%d, pref(R[%d])); if (__builtin_expect(ctl.host->abort, 0)) FAIL(@PC@);" % (ra, rt)
+        elif WHOLE and op == "bisl" and (d["rb"] & 0x30 == 0 or WHOLE_PM and (d["rb"] >> 4) & 3 in (1, 2)) and rt != ra:
+            s = "{ uint32_t it_ = pref(R[%d]); R[%d] = pref_only(0x%x); %sicall(R, ls, ctl, it_, 0x%05x); if (ctl.out) return; }" % (ra, rt, pc + 4, ie_act(d), pc)
+            if WHOLE_RETCHECK:
+                s = s[:-1] + " " + retcheck(rt, pc + 4) + " }"
+        elif op in FAILOPS:
             s = "FAIL(@PC@);"
         elif op in HALTS:
             s = "if (" + HALTS[op] % d + ") FAIL(@PC@);"
@@ -496,7 +579,7 @@ def emit_func(f, out):
             s = "R[%d] = %s(R[%d], %d);" % (rt, cn(op), ra, imm)
         elif op in ("selb", "shufb", "fma", "fms", "fnms", "mpya"):
             s = "R[%d] = %s(R[%d], R[%d], R[%d]);" % (rt, op, ra, rb, rc)
-        elif op in ("addx", "sfx", "cgx", "bgx"):
+        elif op in ("addx", "sfx", "cgx", "bgx") or op in DOPS3:
             s = "R[%d] = %s(R[%d], R[%d], R[%d]);" % (rt, op, ra, rb, rt)
         elif op in ("cflts", "cfltu", "cuflt", "csflt"):
             s = "R[%d] = %s(R[%d], %d);" % (rt, op, ra, imm)
@@ -556,6 +639,13 @@ def emit_func(f, out):
             s = "FAIL(@PC@);"
         elif op == "bi" and pc in getattr(f, "switches", {}):
             s = "switch (pref(R[%d]) & 0x3fffc) { %s default: FAIL(@PC@); }" % (ra, " ".join("case 0x%05x: goto L_%05x;" % (t, t) for t in sorted(set(f.switches[pc]))))
+        elif WHOLE and op == "bi" and ra == 0 and (d["rb"] >> 4) & 3 in (1, 2):
+            s = "*ctl.ie = %s; @RET@" % ("true" if (d["rb"] >> 4) & 3 == 1 else "false")
+        elif op == "bi" and WHOLE_PM and (d["rb"] >> 4) & 3 != 3 and [t for t in getattr(f, "ila", {}).get(ra, ()) if t in f.insns]:
+            dflt = "@RET@" if (ra == 0 or ra in LINK.get(f.entry, ())) and d["rb"] & 0x30 == 0 else "FAIL(@PC@);"
+            s = ie_act(d) + "switch (pref(R[%d]) & 0x3fffc) { %s default: %s }" % (ra, " ".join("case 0x%05x: goto L_%05x;" % (t, t) for t in sorted(t for t in f.ila[ra] if t in f.insns)), dflt)
+        elif op == "bi" and WHOLE and ra != 0 and d["rb"] & 0x30 == 0 and ra in LINK.get(f.entry, ()):
+            s = "@RET@"
         elif op == "bi":
             s = "@RET@" if ra == 0 and d["rb"] & 0x30 == 0 else "FAIL(@PC@);"
         elif op in ("biz", "binz", "bihz", "bihnz"):
@@ -584,7 +674,9 @@ def emit_func(f, out):
                 out.append("    }")
                 continue
         s = s.replace("@RET@", "{ " + spill + " return; }")
-        s = re.sub(r"@CALL([0-9a-f]+)@", lambda m: rec_call(f, pc, rt, m.group(1)) if (f.entry, int(m.group(1), 16)) in REC_EDGES and rt == 0 else "{ " + call_spill(int(m.group(1), 16), False) + " f_" + m.group(1) + "(R, ls, ctl); if (ctl.out) return; " + call_fill(int(m.group(1), 16)) + " }", s)
+        s = re.sub(r"@CALL([0-9a-f]+)@", lambda m: rec_call(f, pc, rt, m.group(1)) if (f.entry, int(m.group(1), 16)) in REC_EDGES and rt == 0 else "{ " + call_spill(int(m.group(1), 16), False) + " f_" + m.group(1) + "(R, ls, ctl); if (ctl.out) return; " + call_fill(int(m.group(1), 16)) + (" " + retcheck("@RT@", pc + 4) if WHOLE_RETCHECK and op in ("brsl", "bisl") else "") + " }", s)
+        if "@RT@" in s:
+            s = s.replace("@RT@", "r%d" % rt)
         s = re.sub(r"@TAIL([0-9a-f]+)@", lambda m: "{ " + call_spill(int(m.group(1), 16), True) + " f_" + m.group(1) + "(R, ls, ctl); return; }", s)
         out.append("    %s" % s)
     for x in sorted(f.exits):
@@ -669,7 +761,67 @@ def ops_mode(outp, hdr):
     print(len(funcs), "ops")
 
 
+def whole_main(outp, hdr):
+    global WHOLE, EXITS
+    WHOLE = True
+    EXITS = False
+    ns = WHOLE_NS
+    LINK.clear()
+    funcs = {}
+    known = set(WHOLE_ROOTS)
+    changed = True
+    while changed:
+        changed = False
+        for e in sorted(known):
+            if e in funcs:
+                continue
+            funcs[e] = discover(e, known, frozenset(), WHOLE_MULTI.get(e))
+            for c in funcs[e].calls | funcs[e].tails:
+                if c not in known:
+                    known.add(c)
+                    changed = True
+    base = os.path.basename(hdr)
+    out = ['#include "%s"' % base, "", "namespace %s {" % ns, "", "#define FAIL(pc) do { ctl.fail = true; ctl.out = true; ctl.fail_pc = pc; return; } while (0)", ""]
+    inline_max = int(os.environ.get("RJ_INLINE_MAX", "120"))
+    for e in sorted(funcs):
+        if e not in WHOLE_ROOTS and len(funcs[e].insns) <= inline_max and not (funcs[e].calls & set(funcs)) - set(INLINE_EXCEPT):
+            SPEC[e] = "static inline __attribute__((always_inline)) "
+    out.append("void icall(V* R, uint8_t* ls, Ctl& ctl, uint32_t t, uint32_t pc);")
+    for e in sorted(funcs):
+        out.append("%svoid f_%05x(V* R, uint8_t* ls, Ctl& ctl%s);" % (SPEC.get(e, ""), e, ", uint32_t entry" if e in WHOLE_MULTI else ""))
+    out.append("")
+    closure(funcs)
+    for e in sorted(funcs):
+        emit_func(funcs[e], out)
+    cases = " ".join("case 0x%05x: f_%05x(R, ls, ctl%s); return;" % (e, e, ", 0x%05x" % e if e in WHOLE_MULTI else "") for e in sorted(funcs) if e not in SPEC and e not in PM_CALLS)
+    cases += " " + " ".join("case 0x%05x: %s return;" % (t, c) for t, c in sorted(PM_CALLS.items()))
+    if KERNEL_IMG:
+        kp = sorted({(pc, d["w"]) for f in funcs.values() for pc, d in f.insns.items() if pc < PM_LS})
+        out.append("static const uint32_t kKern[%d][2] = {%s};" % (max(len(kp), 1), ", ".join("{0x%05x, 0x%08xu}" % x for x in kp) or "{0, 0}"))
+        out.append("static bool kernel_ok(const uint8_t* ls) { thread_local const uint8_t* ok = nullptr; if (ok == ls) return true; for (const auto& k : kKern) { uint32_t w; std::memcpy(&w, ls + k[0], 4); if (__builtin_bswap32(w) != k[1]) return false; } ok = ls; return true; }")
+    out.append("void icall(V* R, uint8_t* ls, Ctl& ctl, uint32_t t, uint32_t pc) { switch (t & 0x3fffc) { %s default: %s } }" % (cases, WHOLE_ICALL_DEFAULT))
+    out = [re.sub(r"(?<![A-Za-z0-9_])st\(ls,", "stp(ls,", l) for l in out]
+    out = [re.sub(r"(?<![A-Za-z0-9_])st32\(ls,", "st32p(ls,", l) for l in out]
+    out = [abi(l) for l in out]
+    out += ["#undef FAIL", "", "}"]
+    open(outp, "w", newline="\n").write("\n".join(out) + "\n")
+    h = ["#pragma once", "", '#include "%s"' % OPS_INCLUDE] + list(WHOLE_HDR_EXTRA) + ["", "namespace %s {" % ns, "", "using namespace %s;" % BASE_NS, ""]
+    if WHOLE_PM_DECLS:
+        h.append("void pm_gettag(V* R, uint8_t* ls, Ctl& ctl);")
+        h.append("void pm_releasetag(V* R, uint8_t* ls, Ctl& ctl);")
+    for e in WHOLE_ROOTS:
+        h.append("void f_%05x(V* R, uint8_t* ls, Ctl& ctl%s);" % (e, ", uint32_t entry" if e in WHOLE_MULTI else ""))
+    h.append("inline constexpr uint32_t kWholeFuncs = %d;" % len(funcs))
+    h += ["", "}"]
+    h = [abi(l) for l in h]
+    open(hdr, "w", newline="\n").write("\n".join(h) + "\n")
+    print("whole: %d functions, %d insns, %d with fail" % (len(funcs), sum(len(f.insns) for f in funcs.values()), sum(1 for f in funcs.values() if f.has_fail)))
+
+
 def main():
+    if sys.argv[1] == "whole":
+        whole_main(sys.argv[2], sys.argv[3])
+        return
     if sys.argv[1] == "ops":
         ops_mode(sys.argv[2], sys.argv[3])
         return

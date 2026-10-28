@@ -68,12 +68,29 @@ struct Cursor {
 
 Group& group_of(Entry& e) { return *reinterpret_cast<Group*>(reinterpret_cast<uintptr_t>(&e) & ~uintptr_t(63)); }
 
+thread_local bool t_hard_relax = false;
+
+void spin_wait(uint32_t& n) {
+    n++;
+    if (n < 256) {
+        _mm_pause();
+    } else if (!t_hard_relax || n < 1024) {
+        if ((n & 7) == 0) SwitchToThread();
+        else _mm_pause();
+    } else {
+        if (n == 1024) g_hard_waits.fetch_add(1, std::memory_order_relaxed);
+        Sleep(1);
+    }
+}
+
 void lock_group(Group& g) {
     uint32_t spins = 0;
     for (;;) {
         uint64_t z = 0;
         if (g.lock.load(std::memory_order_relaxed) == 0 && g.lock.compare_exchange_weak(z, 1, std::memory_order_acquire, std::memory_order_relaxed)) return;
-        if (++spins < 2000) {
+        if (t_hard_relax) {
+            spin_wait(spins);
+        } else if (++spins < 2000) {
             _mm_pause();
         } else {
             spins = 0;
@@ -107,12 +124,17 @@ const bool g_logged = std::getenv("GOWA_RSV_LOG") != nullptr;
 
 std::atomic<uint64_t>& version(uint32_t addr) { return entry(addr).ver; }
 
+std::atomic<uint64_t> g_hard_waits{0};
+
+void set_hard_relax(bool on) { t_hard_relax = on; }
+
 uint64_t snapshot(uint32_t line, uint8_t* out) {
+    uint32_t spins = 0;
     Entry& e = entry(line);
     for (;;) {
         uint64_t v1 = e.ver.load(std::memory_order_acquire);
         if (v1 & 64) {
-            _mm_pause();
+            spin_wait(spins);
             continue;
         }
         std::memcpy(out, vm::ptr(line), 128);
@@ -266,13 +288,14 @@ void wake(uint32_t addr) {
 }
 
 bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size) {
+    uint32_t spins = 0;
     Entry& e = entry(addr & ~127u);
     const uint8_t* src = vm::ptr(addr);
     bool changed = false;
     for (;;) {
         uint64_t v1 = e.ver.load(std::memory_order_acquire);
         if (v1 & 64) {
-            _mm_pause();
+            spin_wait(spins);
             continue;
         }
         uint32_t i = 0;
@@ -304,6 +327,7 @@ bool copy_if_changed(uint32_t addr, uint8_t* dst, uint32_t size) {
 }
 
 bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi) {
+    uint32_t spins = 0;
     const uint8_t* src = vm::ptr(addr);
     bool any = false;
     uint32_t done = 0;
@@ -315,7 +339,7 @@ bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t&
         for (;;) {
             uint64_t v1 = e.ver.load(std::memory_order_acquire);
             if (v1 & 64) {
-                _mm_pause();
+                spin_wait(spins);
                 continue;
             }
             bool changed = false;
@@ -352,6 +376,7 @@ bool copy_range_if_changed(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t&
 }
 
 bool copy_range_prefetch(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& dirty_lo, uint32_t& dirty_hi) {
+    uint32_t spins = 0;
     for (uint32_t a = (addr & ~127u) + 128; a < addr + size && a < (addr & ~127u) + 128 * 9; a += 128) _mm_prefetch(reinterpret_cast<const char*>(&entry(a).ver), _MM_HINT_T0);
     const uint8_t* src = vm::ptr(addr);
     bool any = false;
@@ -369,7 +394,7 @@ bool copy_range_prefetch(uint32_t addr, uint8_t* dst, uint32_t size, uint32_t& d
         for (;;) {
             uint64_t v1 = e.ver.load(std::memory_order_acquire);
             if (v1 & 64) {
-                _mm_pause();
+                spin_wait(spins);
                 continue;
             }
             uint32_t diff = 0;

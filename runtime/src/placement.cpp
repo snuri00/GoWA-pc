@@ -204,4 +204,19 @@ void apply(const std::string& role) {
     if (!ok) LOG_WARN("place", "%s placement failed (%lu)", role.c_str(), GetLastError());
 }
 
+std::vector<int> role_lps(const std::string& role) {
+    const Config& c = config();
+    auto it = c.rules.find(role);
+    if (it == c.rules.end()) return {};
+    return it->second.lps;
+}
+
+int logical_cpus() {
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return 0;
+    int n = 0;
+    for (DWORD_PTR m = proc; m; m &= m - 1) n++;
+    return n;
+}
+
 }
