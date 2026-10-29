@@ -10,8 +10,11 @@ extern std::atomic<uint32_t> g_watch_line;
 extern std::atomic<uint32_t> g_watch_word;
 extern std::atomic<uint32_t> g_watch_sleepers;
 void watch_kick();
+void kick_parked_all();
 inline void watch_note(uint32_t line) {
-    if ((line & ~127u) == g_watch_line.load(std::memory_order_relaxed) && g_watch_sleepers.load(std::memory_order_seq_cst)) watch_kick();
+    if ((line & ~127u) != g_watch_line.load(std::memory_order_relaxed)) return;
+    if (g_watch_sleepers.load(std::memory_order_seq_cst)) watch_kick();
+    kick_parked_all();
 }
 
 std::atomic<uint64_t>& version(uint32_t addr);

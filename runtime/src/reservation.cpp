@@ -606,6 +606,15 @@ void park_kick(int slot) {
     WakeByAddressSingle(&g_park_word[slot].w);
 }
 
+void kick_parked_all() {
+    for (int i = 0; i < PARK_SLOTS; i++) {
+        if (g_park_line[i].load(std::memory_order_relaxed)) {
+            g_park_word[i].w.fetch_add(1, std::memory_order_seq_cst);
+            WakeByAddressSingle(&g_park_word[i].w);
+        }
+    }
+}
+
 namespace {
 int wait_parked_impl(uint32_t line, uint64_t rtime, const uint8_t* rdata, int slot, uint32_t w0, int64_t limit_us, const std::atomic<bool>& stop);
 }
