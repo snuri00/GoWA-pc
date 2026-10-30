@@ -1,4 +1,5 @@
 #include "runtime/log.h"
+#include "runtime/host.h"
 
 #include <atomic>
 #include <chrono>
@@ -6,8 +7,10 @@
 #include <cstdlib>
 #include <mutex>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 namespace logging {
 
@@ -46,7 +49,7 @@ void write(Level level, const char* channel, const char* fmt, ...) {
     std::lock_guard lk(g_lock);
     if (!g_file) g_file = std::fopen("gowa.log", "w");
     char line[2300];
-    int n = std::snprintf(line, sizeof line, "%s %10.6f [%5lu] %s: %s\n", tag(level), t, GetCurrentThreadId(), channel, msg);
+    int n = std::snprintf(line, sizeof line, "%s %10.6f [%5u] %s: %s\n", tag(level), t, host::tid(), channel, msg);
     if (g_file) {
         std::fwrite(line, 1, n, g_file);
         if (level >= Level::Info) std::fflush(g_file);

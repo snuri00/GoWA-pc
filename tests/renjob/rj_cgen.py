@@ -428,6 +428,8 @@ def find_promotable(f):
                 ok = False
         if f.multi and any(h < e <= hi for e in f.multi):
             ok = False
+        if h < f.entry <= hi or any(h < t <= hi for ts in getattr(f, "ila", {}).values() for t in ts):
+            ok = False
         if any(h < x <= hi for x in f.exits):
             ok = False
         if not ok:

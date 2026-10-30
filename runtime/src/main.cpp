@@ -1,4 +1,5 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
 #include "runtime/image.h"
 #include "runtime/loader.h"
 #include "runtime/log.h"
@@ -9,10 +10,16 @@
 #include "gpu/presenter.h"
 #include "runtime/thread.h"
 
+#include "runtime/vfs.h"
+
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <timeapi.h>
-#include "runtime/vfs.h"
+#include <tlhelp32.h>
+#else
+#include <dirent.h>
+#include <unistd.h>
+#endif
 
 namespace spu {
 void status_dump();
@@ -33,7 +40,8 @@ uint64_t rsx_flip_count();
 #include <vector>
 #include <map>
 #include <algorithm>
-#include <tlhelp32.h>
+#include <filesystem>
+#include <fstream>
 
 namespace {
 
@@ -64,6 +72,24 @@ void rearm_watch();
 
 namespace {
 
+struct CensusRow {
+    double user, kernel;
+    std::string name;
+    unsigned long tid;
+};
+
+void census_log(std::vector<CensusRow>& rows, double total, int period) {
+    std::sort(rows.begin(), rows.end(), [](const CensusRow& a, const CensusRow& b) { return a.user + a.kernel > b.user + b.kernel; });
+    std::string line;
+    char b[160];
+    for (const CensusRow& r : rows) {
+        std::snprintf(b, sizeof b, " [%s#%lu %.0f%%u %.0f%%k]", r.name.empty() ? "?" : r.name.c_str(), r.tid, r.user, r.kernel);
+        line += b;
+    }
+    LOG_INFO("census", "process cpu %.0f%% of one core over %ds:%s", total, period, line.c_str());
+}
+
+#ifdef _WIN32
 void thread_census(int period) {
     static std::map<DWORD, std::pair<uint64_t, uint64_t>> prev;
     static auto prev_wall = std::chrono::steady_clock::now();
@@ -74,11 +100,7 @@ void thread_census(int period) {
     if (snap == INVALID_HANDLE_VALUE) return;
     THREADENTRY32 te{sizeof te};
     DWORD pid = GetCurrentProcessId();
-    struct Row {
-        double user, kernel;
-        std::string name;
-        DWORD tid;
-    };
+    using Row = CensusRow;
     std::vector<Row> rows;
     std::map<DWORD, std::pair<uint64_t, uint64_t>> cur;
     double total = 0;
@@ -111,15 +133,49 @@ void thread_census(int period) {
     }
     CloseHandle(snap);
     prev.swap(cur);
-    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.user + a.kernel > b.user + b.kernel; });
-    std::string line;
-    char b[160];
-    for (const Row& r : rows) {
-        std::snprintf(b, sizeof b, " [%s#%lu %.0f%%u %.0f%%k]", r.name.empty() ? "?" : r.name.c_str(), static_cast<unsigned long>(r.tid), r.user, r.kernel);
-        line += b;
-    }
-    LOG_INFO("census", "process cpu %.0f%% of one core over %ds:%s", total, period, line.c_str());
+    census_log(rows, total, period);
 }
+#else
+void thread_census(int period) {
+    static std::map<unsigned long, std::pair<uint64_t, uint64_t>> prev;
+    static auto prev_wall = std::chrono::steady_clock::now();
+    static const double hz = static_cast<double>(sysconf(_SC_CLK_TCK));
+    auto now = std::chrono::steady_clock::now();
+    double wall = std::chrono::duration<double>(now - prev_wall).count();
+    prev_wall = now;
+    std::vector<CensusRow> rows;
+    std::map<unsigned long, std::pair<uint64_t, uint64_t>> cur;
+    double total = 0;
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return;
+    while (dirent* e = readdir(d)) {
+        if (e->d_name[0] == '.') continue;
+        unsigned long tid = std::strtoul(e->d_name, nullptr, 10);
+        std::string base = std::string("/proc/self/task/") + e->d_name;
+        std::ifstream sf(base + "/stat");
+        std::string st;
+        std::getline(sf, st);
+        size_t rp = st.rfind(')');
+        if (rp == std::string::npos) continue;
+        unsigned long long uu = 0, ku = 0;
+        if (std::sscanf(st.c_str() + rp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &uu, &ku) != 2) continue;
+        cur[tid] = {uu, ku};
+        auto it = prev.find(tid);
+        if (it == prev.end() || wall <= 0) continue;
+        CensusRow r;
+        r.user = (uu - it->second.first) / hz / wall * 100.0;
+        r.kernel = (ku - it->second.second) / hz / wall * 100.0;
+        r.tid = tid;
+        std::ifstream cf(base + "/comm");
+        std::getline(cf, r.name);
+        total += r.user + r.kernel;
+        if (r.user + r.kernel >= 1.0) rows.push_back(r);
+    }
+    closedir(d);
+    prev.swap(cur);
+    census_log(rows, total, period);
+}
+#endif
 
 }
 
@@ -128,7 +184,7 @@ int main(int argc, char** argv) {
     trace::init();
     critpath::init();
     hooks::init();
-    timeBeginPeriod(1);
+    host::init_timers();
     gpu::init();
     if (const char* root = std::getenv("GOWA_ROOT")) loader::g_root = root;
     if (const char* lvl = std::getenv("GOWA_LOG")) {
@@ -190,7 +246,7 @@ int main(int argc, char** argv) {
     guest::start(main_thread);
     bool status = std::getenv("GOWA_STATUS") != nullptr;
     int memdump_at = std::getenv("GOWA_MEMDUMP_AT") ? std::atoi(std::getenv("GOWA_MEMDUMP_AT")) : -1;
-    SetThreadDescription(GetCurrentThread(), L"Host main");
+    host::set_thread_name("Host main");
     placement::apply("host");
     static const int census = std::getenv("GOWA_THREAD_CPU") ? std::atoi(std::getenv("GOWA_THREAD_CPU")) : 0;
     std::vector<uint32_t> peeks;
@@ -217,8 +273,8 @@ int main(int argc, char** argv) {
         if (watch_delay && tick == watch_delay) crash::arm_watch();
         else if (tick > watch_delay) crash::rearm_watch();
         if (tick == memdump_at) trace::dump_memory("memdump.bin");
-        if (GetFileAttributesA("blackbox.req") != INVALID_FILE_ATTRIBUTES) {
-            DeleteFileA("blackbox.req");
+        if (std::error_code ec; std::filesystem::exists("blackbox.req", ec)) {
+            std::filesystem::remove("blackbox.req", ec);
             hooks::capture("external request");
             if (FILE* f = std::fopen("blackbox.done", "w")) std::fclose(f);
         }

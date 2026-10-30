@@ -1,4 +1,5 @@
 #include "edge_exec.h"
+#include "runtime/host.h"
 
 #include "../spu/hle.h"
 #include "../spu/thread.h"
@@ -9,7 +10,9 @@
 
 #include <cstring>
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <immintrin.h>
 
@@ -48,7 +51,7 @@ struct FastHost final : spu::Host {
         switch (ch) {
         case 8:
             hc.dec_reads++;
-            if ((++dec_run & 127) == 0) SwitchToThread();
+            if ((++dec_run & 127) == 0) host::yield();
             return 0u - static_cast<uint32_t>(__rdtsc() >> 5);
         case 13: return t.ctx.interrupts_enabled ? 1 : 0;
         case 24:

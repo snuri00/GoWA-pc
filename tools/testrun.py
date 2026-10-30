@@ -11,7 +11,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN_DIR = os.path.join(ROOT, "run")
 RUNS = os.path.join(ROOT, "out", "runs")
-EXE = os.environ.get("GOWA_TESTRUN_EXE") or os.path.join(ROOT, "build", "gowa.exe")
+EXE = os.environ.get("GOWA_TESTRUN_EXE") or (os.path.join(ROOT, "build", "God of War Ascension.exe") if sys.platform == "win32" else os.path.join(ROOT, "build-linux", "God of War Ascension"))
 KEEP = 15
 
 
@@ -107,7 +107,10 @@ def supervise(env, duration):
             open(os.path.join(RUN_DIR, "blackbox.req"), "w").close()
             print("no flips for %.0fs, requesting blackbox capture" % (now - flip))
     proc.kill()
-    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        proc.wait()
     return 124
 
 
@@ -192,6 +195,8 @@ def cmd_run(args):
     os.makedirs(out, exist_ok=True)
     env = dict(os.environ)
     env["GOWA_ROOT"] = ROOT
+    if "GOWA_RPCS3_DIR" not in env and os.path.isdir(os.path.join(RUN_DIR, "rpcs3")):
+        env["GOWA_RPCS3_DIR"] = os.path.join(RUN_DIR, "rpcs3")
     env["GOWA_SNAP_EVERY"] = str(snap_every)
     env["GOWA_SNAP_FROM"] = str(snap_from)
     env["GOWA_SNAP_DIR"] = out

@@ -1,10 +1,13 @@
 #include "core.h"
+#include "runtime/host.h"
 
 #include "runtime/log.h"
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -344,15 +347,15 @@ void set_relax_hard(bool on) {
 void relax_spin(uint32_t& n) {
     n++;
     if (n < 64) _mm_pause();
-    else if (n < 512) SwitchToThread();
+    else if (n < 512) host::yield();
     else if (t_donor_prio) {
         if (n == 512) stats().relax_sleeps.fetch_add(1, std::memory_order_relaxed);
-        Sleep(1);
+        host::sleep_ms(1);
     } else if (n < 4096) {
-        SwitchToThread();
+        host::yield();
     } else {
         if (n == 4096) stats().relax_sleeps.fetch_add(1, std::memory_order_relaxed);
-        Sleep(1);
+        host::sleep_ms(1);
     }
 }
 

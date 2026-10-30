@@ -1,4 +1,5 @@
 #include "core.h"
+#include "runtime/host.h"
 #include "mfc.h"
 
 #include "spu/renjob/renjob_chan.h"
@@ -8,7 +9,9 @@
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -166,7 +169,7 @@ void checker() {
     double hz = tsc_hz();
     uint64_t last_report = __rdtsc();
     for (;;) {
-        Sleep(1);
+        host::sleep_ms(1);
         std::lock_guard lk(g_m);
         while (!g_pending.empty()) {
             Pending& p = g_pending.front();

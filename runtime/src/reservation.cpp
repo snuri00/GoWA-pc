@@ -1,4 +1,5 @@
 #include "runtime/reservation.h"
+#include "runtime/host.h"
 #include "runtime/memory.h"
 
 #include "runtime/log.h"
@@ -15,9 +16,11 @@
 #include <mutex>
 #include <thread>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 #pragma comment(lib, "Synchronization.lib")
 
 namespace rsv {
@@ -28,7 +31,7 @@ std::atomic<uint32_t> g_watch_sleepers{0};
 
 void watch_kick() {
     g_watch_word.fetch_add(1, std::memory_order_seq_cst);
-    WakeByAddressAll(&g_watch_word);
+    host::wake_all(&g_watch_word);
 }
 
 namespace {
@@ -75,11 +78,11 @@ void spin_wait(uint32_t& n) {
     if (n < 256) {
         _mm_pause();
     } else if (!t_hard_relax || n < 1024) {
-        if ((n & 7) == 0) SwitchToThread();
+        if ((n & 7) == 0) host::yield();
         else _mm_pause();
     } else {
         if (n == 1024) g_hard_waits.fetch_add(1, std::memory_order_relaxed);
-        Sleep(1);
+        host::sleep_ms(1);
     }
 }
 
@@ -449,16 +452,8 @@ struct WaitStat {
 std::mutex g_wait_lock;
 std::map<uint32_t, WaitStat> g_wait_stats;
 const bool g_wait_stats_on = std::getenv("GOWA_SPU_OCC") != nullptr;
-uint64_t g_qpf = [] {
-    LARGE_INTEGER f;
-    QueryPerformanceFrequency(&f);
-    return static_cast<uint64_t>(f.QuadPart);
-}();
-uint64_t qpc() {
-    LARGE_INTEGER c;
-    QueryPerformanceCounter(&c);
-    return static_cast<uint64_t>(c.QuadPart);
-}
+uint64_t g_qpf = host::qpf();
+uint64_t qpc() { return host::qpc(); }
 void note_wait(uint32_t line, uint64_t t0, uint64_t rtime, const uint8_t* rdata, int outcome) {
     uint64_t us = (qpc() - t0) * 1000000ull / g_qpf;
     bool ver_changed = entry(line).ver.load(std::memory_order_relaxed) != rtime;
@@ -536,8 +531,8 @@ bool wait_lost_impl(uint32_t line, uint64_t rtime, const uint8_t* rdata, uint32_
         if (left <= 0) return false;
         static const long sleep_after = std::getenv("GOWA_RSV_SLEEP_US") ? std::atol(std::getenv("GOWA_RSV_SLEEP_US")) : -1;
         static const long yield_after = std::getenv("GOWA_RSV_YIELD_US") ? std::atol(std::getenv("GOWA_RSV_YIELD_US")) : 30;
-        if (sleep_after >= 0 && micros - left >= sleep_after) WaitOnAddress(&e.ver, &v, sizeof v, static_cast<DWORD>((left + 999) / 1000));
-        else if (yield_after >= 0 && micros - left >= yield_after) SwitchToThread();
+        if (sleep_after >= 0 && micros - left >= sleep_after) host::wait_on(&e.ver, &v, sizeof v, static_cast<uint32_t>((left + 999) / 1000));
+        else if (yield_after >= 0 && micros - left >= yield_after) host::yield();
         else _mm_pause();
     }
 }
@@ -570,7 +565,7 @@ void kick_line(uint32_t line) {
     for (int i = 0; i < PARK_SLOTS; i++) {
         if (g_park_line[i].load(std::memory_order_relaxed) == line) {
             g_park_word[i].w.fetch_add(1, std::memory_order_seq_cst);
-            WakeByAddressSingle(&g_park_word[i].w);
+            host::wake_one(&g_park_word[i].w);
         }
     }
 }
@@ -603,14 +598,14 @@ uint32_t park_word(int slot) { return g_park_word[slot].w.load(std::memory_order
 void park_kick(int slot) {
     if (slot < 0 || !g_park_on) return;
     g_park_word[slot].w.fetch_add(1, std::memory_order_seq_cst);
-    WakeByAddressSingle(&g_park_word[slot].w);
+    host::wake_one(&g_park_word[slot].w);
 }
 
 void kick_parked_all() {
     for (int i = 0; i < PARK_SLOTS; i++) {
         if (g_park_line[i].load(std::memory_order_relaxed)) {
             g_park_word[i].w.fetch_add(1, std::memory_order_seq_cst);
-            WakeByAddressSingle(&g_park_word[i].w);
+            host::wake_one(&g_park_word[i].w);
         }
     }
 }
@@ -653,7 +648,7 @@ int wait_parked_impl(uint32_t line, uint64_t rtime, const uint8_t* rdata, int sl
                 if ((r = poll_once(line, rtime, rdata, slot, w0, stop))) break;
                 int64_t t = elapsed_us();
                 if (t >= limit) break;
-                if ((qpc() - s0) * 1000000ull / g_qpf >= 30) SwitchToThread();
+                if ((qpc() - s0) * 1000000ull / g_qpf >= 30) host::yield();
                 else _mm_pause();
             }
             role.line.exchange(0, std::memory_order_seq_cst);
@@ -665,7 +660,7 @@ int wait_parked_impl(uint32_t line, uint64_t rtime, const uint8_t* rdata, int sl
                 if (int r = poll_once(line, rtime, rdata, slot, w0, stop)) return r;
                 int64_t t = elapsed_us();
                 if (t >= limit || t >= 1000) return 0;
-                SwitchToThread();
+                host::yield();
             }
         }
         int64_t left = limit - elapsed_us();
@@ -673,7 +668,7 @@ int wait_parked_impl(uint32_t line, uint64_t rtime, const uint8_t* rdata, int sl
             for (;;) {
                 if (int r = poll_once(line, rtime, rdata, slot, w0, stop)) return r;
                 if (elapsed_us() >= limit) return 0;
-                SwitchToThread();
+                host::yield();
             }
         }
         g_park_line[slot].exchange(line, std::memory_order_seq_cst);
@@ -687,7 +682,7 @@ int wait_parked_impl(uint32_t line, uint64_t rtime, const uint8_t* rdata, int sl
         }
         int64_t wait_us = (std::min<int64_t>)(left - 500, g_park_timeout_us);
         uint32_t expect = w0;
-        WaitOnAddress(&g_park_word[slot].w, &expect, sizeof expect, static_cast<DWORD>((std::max<int64_t>)(wait_us / 1000, 1)));
+        host::wait_on(&g_park_word[slot].w, &expect, sizeof expect, static_cast<uint32_t>((std::max<int64_t>)(wait_us / 1000, 1)));
         g_park_line[slot].store(0, std::memory_order_relaxed);
         if (int r = poll_once(line, rtime, rdata, slot, w0, stop)) return r;
         if (elapsed_us() >= limit) return 0;

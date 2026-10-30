@@ -11,7 +11,7 @@ from threadmon import ThreadMon
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN_DIR = os.path.join(ROOT, "run")
-EXE = os.path.join(ROOT, "build", "gowa.exe")
+EXE = os.path.join(ROOT, "build", "God of War Ascension.exe") if sys.platform == "win32" else os.path.join(ROOT, "build-linux", "God of War Ascension")
 SAVE_DIR = os.path.join(RUN_DIR, "vfs", "dev_hdd0", "home", "00000001", "savedata")
 PLAY_SAVE = os.path.join(ROOT, "out", "play_save")
 SESSIONS = os.path.join(ROOT, "out", "play")
@@ -27,8 +27,10 @@ def copy_saves(src, dst):
 
 
 def running():
-    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq gowa.exe"], capture_output=True, text=True).stdout
-    return "gowa.exe" in out
+    if sys.platform != "win32":
+        return subprocess.run(["pgrep", "-f", EXE], capture_output=True).returncode == 0
+    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq God of War Ascension.exe"], capture_output=True, text=True).stdout
+    return "God of War Ascension.exe" in out
 
 
 def last_flip(log_path, state):
@@ -76,7 +78,7 @@ def main():
     ap.add_argument("--critpath", action="store_true", help="record PPU waits and SPU jobs (critpath.bin + critpath.txt report)")
     args = ap.parse_args()
     if running():
-        print("gowa.exe is already running; close it first")
+        print("the game is already running; close it first")
         return 1
     if os.path.isdir(PLAY_SAVE) and not args.fresh_save:
         copy_saves(PLAY_SAVE, SAVE_DIR)
@@ -86,6 +88,8 @@ def main():
     os.makedirs(out, exist_ok=True)
     env = dict(os.environ)
     env["GOWA_ROOT"] = ROOT
+    if "GOWA_RPCS3_DIR" not in env and os.path.isdir(os.path.join(RUN_DIR, "rpcs3")):
+        env["GOWA_RPCS3_DIR"] = os.path.join(RUN_DIR, "rpcs3")
     for k in ("GOWA_AUTOPAD", "GOWA_SNAP_EVERY", "GOWA_SNAP_FROM", "GOWA_SNAP_DIR"):
         env.pop(k, None)
     if args.lowfps_capture != "0":

@@ -1,4 +1,5 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
 #include "gpu/presenter.h"
 #include "gpu/rsx.h"
 #include "vk_context.h"
@@ -9,6 +10,7 @@
 #include "runtime/memory.h"
 #include "runtime/hooks.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <condition_variable>
@@ -17,6 +19,11 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#endif
 
 namespace gpu {
 
@@ -32,7 +39,12 @@ struct DisplayBuffer {
 };
 
 struct State {
+#ifdef _WIN32
     HWND hwnd = nullptr;
+#else
+    SDL_Window* window = nullptr;
+    bool window_failed = false;
+#endif
     VkInstance instance = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
@@ -70,6 +82,7 @@ struct State {
 State g;
 std::atomic<bool> g_enabled{false};
 
+#ifdef _WIN32
 LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CLOSE:
@@ -82,6 +95,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(h, msg, wp, lp);
     }
 }
+#endif
 
 uint32_t find_memory_impl(uint32_t bits, VkMemoryPropertyFlags flags) {
     VkPhysicalDeviceMemoryProperties props;
@@ -95,6 +109,14 @@ uint32_t find_memory_impl(uint32_t bits, VkMemoryPropertyFlags flags) {
 bool create_swapchain() {
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps);
+#ifndef _WIN32
+    if (caps.currentExtent.width == UINT32_MAX) {
+        int w = 0, h = 0;
+        SDL_GetWindowSizeInPixels(g.window, &w, &h);
+        caps.currentExtent.width = std::clamp(static_cast<uint32_t>(w), caps.minImageExtent.width, caps.maxImageExtent.width);
+        caps.currentExtent.height = std::clamp(static_cast<uint32_t>(h), caps.minImageExtent.height, caps.maxImageExtent.height);
+    }
+#endif
     if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) return false;
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.phys, g.surface, &n, nullptr);
@@ -135,7 +157,10 @@ bool create_swapchain() {
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = g.swapchain;
     VkSwapchainKHR sc;
-    if (vkCreateSwapchainKHR(g.device, &ci, nullptr, &sc) != VK_SUCCESS) return false;
+    if (VkResult r = vkCreateSwapchainKHR(g.device, &ci, nullptr, &sc); r != VK_SUCCESS) {
+        LOG_ERROR("gpu", "vkCreateSwapchainKHR %ux%u failed %d", g.swap_extent.width, g.swap_extent.height, int(r));
+        return false;
+    }
     if (g.swapchain) vkDestroySwapchainKHR(g.device, g.swapchain, nullptr);
     g.swapchain = sc;
     vkGetSwapchainImagesKHR(g.device, g.swapchain, &n, nullptr);
@@ -194,7 +219,7 @@ uint64_t g_frame_serial = 0;
 struct PresentSnap {
     double every = 0.0;
     double next = 0.0;
-    LARGE_INTEGER freq{}, start{};
+    uint64_t freq = 0, start = 0;
     VkBuffer buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     void* ptr = nullptr;
@@ -229,17 +254,17 @@ void snap_write() {
 }
 
 bool snap_due() {
-    if (!g_snap.freq.QuadPart) {
-        QueryPerformanceFrequency(&g_snap.freq);
-        QueryPerformanceCounter(&g_snap.start);
+    if (!g_snap.freq) {
+        g_snap.freq = host::qpf();
+        g_snap.start = host::qpc();
         const char* e = std::getenv("GOWA_PRESENT_SNAP");
         g_snap.every = e ? std::atof(e) : 0.0;
         g_snap.next = g_snap.every;
     }
     if (g_snap.every <= 0.0) return false;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    double t = double(now.QuadPart - g_snap.start.QuadPart) / double(g_snap.freq.QuadPart);
+    uint64_t now;
+    now = host::qpc();
+    double t = double(now - g_snap.start) / double(g_snap.freq);
     if (t < g_snap.next) return false;
     while (g_snap.next <= t) g_snap.next += g_snap.every;
     const char* d = std::getenv("GOWA_SNAP_DIR");
@@ -280,18 +305,18 @@ void snap_record(VkImage img) {
 
 void begin_frame() {
     if (g.recording) return;
-    LARGE_INTEGER a, b, f;
-    QueryPerformanceCounter(&a);
+    uint64_t a, b, f;
+    a = host::qpc();
     if (VkResult wr = vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX); wr != VK_SUCCESS) {
         static int reported = 0;
         if (reported++ < 5) LOG_ERROR("gpu", "vkWaitForFences failed %d", int(wr));
     }
-    QueryPerformanceCounter(&b);
+    b = host::qpc();
     snap_write();
-    QueryPerformanceFrequency(&f);
+    f = host::qpf();
     static double total = 0;
     static uint64_t n = 0;
-    total += double(b.QuadPart - a.QuadPart) * 1000.0 / double(f.QuadPart);
+    total += double(b - a) * 1000.0 / double(f);
     if (++n % 60 == 0) {
         LOG_INFO("gpu", "fence wait %.2f ms per frame", total / 60.0);
         total = 0;
@@ -326,7 +351,7 @@ void convert(const DisplayBuffer& d) {
         for (uint32_t x = 0; x < d.width; x++) {
             uint32_t v;
             std::memcpy(&v, row + x * 4, 4);
-            out[x] = _byteswap_ulong(v) | 0xFF000000u;
+            out[x] = __builtin_bswap32(v) | 0xFF000000u;
         }
     }
 }
@@ -334,6 +359,10 @@ void convert(const DisplayBuffer& d) {
 }
 
 bool enabled() { return g_enabled; }
+
+#ifndef _WIN32
+void* native_window() { return g.window; }
+#endif
 
 bool init() {
     if (std::getenv("GOWA_HEADLESS")) return false;
@@ -343,8 +372,9 @@ bool init() {
     }
     std::mutex wm;
     std::condition_variable wcv;
+#ifdef _WIN32
     std::thread([&] {
-        SetThreadDescription(GetCurrentThread(), L"Window");
+        host::set_thread_name("Window");
         placement::apply("window");
         WNDCLASSW wc{};
         wc.lpfnWndProc = wnd_proc;
@@ -378,20 +408,77 @@ bool init() {
         std::unique_lock lk(wm);
         wcv.wait(lk, [] { return g.hwnd != nullptr; });
     }
+    std::vector<const char*> exts = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+#else
+    std::thread([&] {
+        host::set_thread_name("Window");
+        placement::apply("window");
+        SDL_Window* w = nullptr;
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+            int ws = dlssnr::mode() == 2 ? 2 : 1;
+            w = SDL_CreateWindow("God of War: Ascension", 1280 * ws, 720 * ws, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+        }
+        if (!w) LOG_ERROR("gpu", "SDL window creation failed: %s", SDL_GetError());
+        {
+            std::lock_guard lk(wm);
+            g.window = w;
+            g.window_failed = !w;
+        }
+        wcv.notify_all();
+        if (!w) return;
+        for (;;) {
+            SDL_Event e;
+            if (!SDL_WaitEventTimeout(&e, 100)) continue;
+            switch (e.type) {
+            case SDL_EVENT_QUIT:
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                LOG_INFO("gpu", "window closed, exiting");
+                std::fflush(nullptr);
+                std::_Exit(0);
+            case SDL_EVENT_WINDOW_RESIZED:
+            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                g.resized = true;
+                break;
+            case SDL_EVENT_GAMEPAD_ADDED:
+                if (SDL_Gamepad* p = SDL_OpenGamepad(e.gdevice.which)) LOG_INFO("input", "gamepad connected: %s", SDL_GetGamepadName(p));
+                break;
+            default:
+                break;
+            }
+        }
+    }).detach();
+    {
+        std::unique_lock lk(wm);
+        wcv.wait(lk, [] { return g.window != nullptr || g.window_failed; });
+    }
+    if (!g.window) return false;
+    std::vector<const char*> exts;
+    Uint32 sdl_n = 0;
+    if (const char* const* se = SDL_Vulkan_GetInstanceExtensions(&sdl_n)) exts.assign(se, se + sdl_n);
+#endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "gowa";
     app.apiVersion = VK_API_VERSION_1_3;
-    const char* exts[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = 2;
-    ici.ppEnabledExtensionNames = exts;
-    if (vkCreateInstance(&ici, nullptr, &g.instance) != VK_SUCCESS) return false;
+    ici.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+    ici.ppEnabledExtensionNames = exts.data();
+    if (VkResult r = vkCreateInstance(&ici, nullptr, &g.instance); r != VK_SUCCESS) {
+        LOG_ERROR("gpu", "vkCreateInstance failed %d", int(r));
+        return false;
+    }
     volkLoadInstance(g.instance);
+#ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     sci.hinstance = GetModuleHandleW(nullptr);
     sci.hwnd = g.hwnd;
     if (vkCreateWin32SurfaceKHR(g.instance, &sci, nullptr, &g.surface) != VK_SUCCESS) return false;
+#else
+    if (!SDL_Vulkan_CreateSurface(g.window, g.instance, nullptr, &g.surface)) {
+        LOG_ERROR("gpu", "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+        return false;
+    }
+#endif
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(g.instance, &n, nullptr);
     std::vector<VkPhysicalDevice> devs(n);
@@ -415,7 +502,10 @@ bool init() {
             }
         }
     }
-    if (!g.phys) return false;
+    if (!g.phys) {
+        LOG_ERROR("gpu", "no Vulkan device with graphics+present support (%u devices)", n);
+        return false;
+    }
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(g.phys, &props);
     float prio = 1.0f;
@@ -474,13 +564,19 @@ bool init() {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = static_cast<uint32_t>(dexts.size());
     dci.ppEnabledExtensionNames = dexts.data();
-    if (vkCreateDevice(g.phys, &dci, nullptr, &g.device) != VK_SUCCESS) return false;
+    if (VkResult r = vkCreateDevice(g.phys, &dci, nullptr, &g.device); r != VK_SUCCESS) {
+        LOG_ERROR("gpu", "vkCreateDevice failed %d", int(r));
+        return false;
+    }
     volkLoadDevice(g.device);
     vkGetDeviceQueue(g.device, g.queue_family, 0, &g.queue);
     dlssg::device_ready(g.phys, g.device);
     dlssnr::device_ready(g.instance, g.phys, g.device);
     g.ctx = {g.phys, g.device, g.queue, g.queue_family, g.features, a13.pipelineCreationCacheControl == VK_TRUE};
-    if (!create_swapchain()) return false;
+    if (!create_swapchain()) {
+        LOG_ERROR("gpu", "swapchain creation failed");
+        return false;
+    }
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = g.queue_family;

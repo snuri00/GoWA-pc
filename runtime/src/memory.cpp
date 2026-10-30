@@ -10,8 +10,12 @@
 #include <cstdlib>
 #include <string>
 
+#include "runtime/host.h"
+
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 namespace vm {
 
@@ -60,7 +64,7 @@ uint32_t g_used[static_cast<size_t>(Region::Count)] = {};
 
 bool commit(uint32_t addr, uint32_t size) {
     watch_reset(addr, size);
-    return VirtualAlloc(g_base + addr, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    return host::vm_commit(g_base + addr, size);
 }
 
 bool overlaps(uint32_t addr, uint32_t size) {
@@ -80,9 +84,9 @@ namespace {
 
 std::atomic<uint32_t> g_page_epoch[0x100000];
 std::atomic<uint8_t> g_page_watched[0x100000];
-SRWLOCK g_watch_locks[4096] = {};
+std::mutex g_watch_locks[4096];
 
-SRWLOCK& watch_lock(uint32_t page) { return g_watch_locks[page & 4095]; }
+std::mutex& watch_lock(uint32_t page) { return g_watch_locks[page & 4095]; }
 std::atomic<uint64_t> g_watch_faults{0};
 std::atomic<uint64_t> g_stale_repairs{0};
 std::atomic<uint16_t> g_fault_pages[0x100000];
@@ -119,16 +123,15 @@ bool watch_enabled() {
 void watch_reset(uint32_t addr, uint64_t size) {
     for (uint64_t a = addr & ~0xFFFull; a < uint64_t(addr) + size && a < 0x100000000ull; a += 0x1000) {
         uint32_t page = uint32_t(a >> 12);
-        AcquireSRWLockExclusive(&watch_lock(page));
+        watch_lock(page).lock();
         if (g_page_watched[page].load(std::memory_order_relaxed)) {
-            DWORD old;
-            VirtualProtect(g_base + a, 0x1000, PAGE_READWRITE, &old);
+            host::vm_protect(g_base + a, 0x1000, host::Prot::ReadWrite);
             g_page_watched[page].store(0, std::memory_order_relaxed);
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1) < 4) LOG_WARN("vm", "remapped watched page 0x%08llx", static_cast<unsigned long long>(a));
         }
         g_page_epoch[page].fetch_add(1, std::memory_order_acq_rel);
-        ReleaseSRWLockExclusive(&watch_lock(page));
+        watch_lock(page).unlock();
     }
 }
 
@@ -143,17 +146,16 @@ uint64_t watch_range(uint32_t addr, uint32_t size, bool& ok) {
         }
         uint32_t run = page;
         while (run < last && run - page < 1024 && !g_page_watched[run].load(std::memory_order_acquire)) run++;
-        for (uint32_t q = page; q < run; q++) AcquireSRWLockExclusive(&watch_lock(q));
-        DWORD old;
-        if (VirtualProtect(g_base + (uint64_t(page) << 12), uint64_t(run - page) << 12, PAGE_READONLY, &old)) {
+        for (uint32_t q = page; q < run; q++) watch_lock(q).lock();
+        if (host::vm_protect(g_base + (uint64_t(page) << 12), uint64_t(run - page) << 12, host::Prot::Read)) {
             for (uint32_t q = page; q < run; q++) g_page_watched[q].store(1, std::memory_order_release);
         } else {
             for (uint32_t q = page; q < run; q++) {
-                if (VirtualProtect(g_base + (uint64_t(q) << 12), 0x1000, PAGE_READONLY, &old)) g_page_watched[q].store(1, std::memory_order_release);
+                if (host::vm_protect(g_base + (uint64_t(q) << 12), 0x1000, host::Prot::Read)) g_page_watched[q].store(1, std::memory_order_release);
                 else ok = false;
             }
         }
-        for (uint32_t q = page; q < run; q++) ReleaseSRWLockExclusive(&watch_lock(q));
+        for (uint32_t q = page; q < run; q++) watch_lock(q).unlock();
         page = run;
     }
     uint64_t sum = 0;
@@ -169,17 +171,17 @@ uint64_t range_epoch(uint32_t addr, uint32_t size) {
 
 bool watch_fault(uint32_t addr, bool repair_stale) {
     uint32_t page = addr >> 12;
-    AcquireSRWLockExclusive(&watch_lock(page));
+    watch_lock(page).lock();
     bool handled = false;
     if (g_page_watched[page].load(std::memory_order_relaxed)) {
-        DWORD old;
-        VirtualProtect(g_base + (uint64_t(page) << 12), 0x1000, PAGE_READWRITE, &old);
+        host::vm_protect(g_base + (uint64_t(page) << 12), 0x1000, host::Prot::ReadWrite);
         g_page_watched[page].store(0, std::memory_order_release);
         g_page_epoch[page].fetch_add(1, std::memory_order_acq_rel);
         handled = true;
         g_watch_faults.fetch_add(1, std::memory_order_relaxed);
         g_fault_pages[page].fetch_add(1, std::memory_order_relaxed);
     } else {
+#ifdef _WIN32
         MEMORY_BASIC_INFORMATION mi;
         if (VirtualQuery(g_base + (uint64_t(page) << 12), &mi, sizeof mi) && mi.State == MEM_COMMIT) {
             if (mi.Protect == PAGE_READWRITE) {
@@ -192,8 +194,15 @@ bool watch_fault(uint32_t addr, bool repair_stale) {
                 handled = true;
             }
         }
+#else
+        if (repair_stale && is_mapped(addr)) {
+            host::vm_protect(g_base + (uint64_t(page) << 12), 0x1000, host::Prot::ReadWrite);
+            g_page_epoch[page].fetch_add(1, std::memory_order_acq_rel);
+            handled = true;
+        }
+#endif
     }
-    ReleaseSRWLockExclusive(&watch_lock(page));
+    watch_lock(page).unlock();
     return handled;
 }
 
@@ -201,14 +210,13 @@ void host_write(uint32_t addr, uint64_t size) {
     for (uint64_t a = addr & ~0xFFFull; a < uint64_t(addr) + size && a < 0x100000000ull; a += 0x1000) {
         uint32_t page = uint32_t(a >> 12);
         if (!g_page_watched[page].load(std::memory_order_acquire)) continue;
-        AcquireSRWLockExclusive(&watch_lock(page));
+        watch_lock(page).lock();
         if (g_page_watched[page].load(std::memory_order_relaxed)) {
-            DWORD old;
-            VirtualProtect(g_base + a, 0x1000, PAGE_READWRITE, &old);
+            host::vm_protect(g_base + a, 0x1000, host::Prot::ReadWrite);
             g_page_watched[page].store(0, std::memory_order_release);
             g_page_epoch[page].fetch_add(1, std::memory_order_acq_rel);
         }
-        ReleaseSRWLockExclusive(&watch_lock(page));
+        watch_lock(page).unlock();
     }
 }
 
@@ -226,7 +234,7 @@ void refresh_pages_locked(uint32_t addr, uint64_t size) {
 }
 
 bool init() {
-    void* p = VirtualAlloc(nullptr, 0x200000000ull, MEM_RESERVE, PAGE_NOACCESS);
+    void* p = host::vm_reserve(0x200000000ull);
     if (!p) {
         LOG_ERROR("vm", "failed to reserve guest address space");
         return false;
@@ -298,7 +306,7 @@ bool dealloc(uint32_t addr) {
         }
     }
     watch_reset(addr, it->second);
-    VirtualFree(g_base + addr, it->second, MEM_DECOMMIT);
+    host::vm_decommit(g_base + addr, it->second);
     uint32_t freed = it->second;
     g_blocks.erase(it);
     refresh_pages_locked(addr, freed);

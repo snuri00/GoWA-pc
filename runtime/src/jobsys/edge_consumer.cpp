@@ -1,4 +1,5 @@
 #include "edge_consumer.h"
+#include "runtime/host.h"
 #include "edge_exec.h"
 
 #include "../spu/hle.h"
@@ -10,7 +11,9 @@
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -147,9 +150,7 @@ std::atomic<uint64_t> g_spu_water[64];
 std::atomic<bool> g_started{false};
 
 uint64_t thread_cycles() {
-    ULONG64 c = 0;
-    QueryThreadCycleTime(GetCurrentThread(), &c);
-    return c;
+    return host::thread_cycles();
 }
 
 void kick() { rsv::watch_kick(); }
@@ -304,8 +305,8 @@ void run_ab(List& L, const Claimed& c) {
         rsv::snapshot(L.hdr, line);
         if (list_min(line) >= c.ref.index) break;
         if (i < 64) _mm_pause();
-        else if (i < 4096) SwitchToThread();
-        else Sleep(0);
+        else if (i < 4096) host::yield();
+        else host::sleep_ms(0);
     }
     g_st.ab_wait.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
     if (c.kind.ab_counter) dep_decrement(c.kind.ab_counter);
@@ -523,22 +524,18 @@ bool any_ready() {
 void park(uint32_t ms) {
     uint32_t w0 = rsv::g_watch_word.load(std::memory_order_seq_cst);
     rsv::g_watch_sleepers.fetch_add(1, std::memory_order_seq_cst);
-    if (!any_ready()) WaitOnAddress(&rsv::g_watch_word, &w0, sizeof w0, ms);
+    if (!any_ready()) host::wait_on(&rsv::g_watch_word, &w0, sizeof w0, ms);
     rsv::g_watch_sleepers.fetch_sub(1, std::memory_order_seq_cst);
 }
 
 void worker_main(int k) {
-    wchar_t w[64];
-    swprintf(w, 64, L"SPU edge worker %d", k);
-    SetThreadDescription(GetCurrentThread(), w);
-    if (k < static_cast<int>(cfg().cpus.size()) && cfg().cpus[k] >= 0 && cfg().cpus[k] < 64) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << cfg().cpus[k]);
-    if (cfg().prio_set) SetThreadPriority(GetCurrentThread(), cfg().prio);
+    host::set_thread_name("SPU edge worker " + std::to_string(k));
+    if (k < static_cast<int>(cfg().cpus.size()) && cfg().cpus[k] >= 0 && cfg().cpus[k] < 64) host::set_affinity({cfg().cpus[k]});
+    if (cfg().prio_set) host::set_priority(cfg().prio);
     _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
     spu::hle::install_builtin();
     if (k == 0 && std::getenv("GOWA_JOBSYS_EDGE_PROFILE")) {
-        HANDLE h = nullptr;
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
-        crash::profile_thread(h, "edge worker 0");
+        crash::profile_thread(host::current_native(), "edge worker 0");
     }
     for (uint32_t idle = 0;;) {
         if (work_once()) {
@@ -700,7 +697,7 @@ void stats_line() {
 }
 
 void manager_main() {
-    SetThreadDescription(GetCurrentThread(), L"edge consumer manager");
+    host::set_thread_name("edge consumer manager");
     if (rsv::g_watch_line.load() == 0xFFFFFFFFu) rsv::g_watch_line.store(kSpurs);
     auto next = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     for (;;) {
@@ -1036,7 +1033,7 @@ bool on_wait_previous(ppu::Context& ctx) {
             continue;
         }
         if (i < 64) _mm_pause();
-        else if (i < 2048) SwitchToThread();
+        else if (i < 2048) host::yield();
         else break;
     }
     _mm_setcsr(saved);

@@ -1,12 +1,15 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
 #include "event.h"
 #include "ppu/ops.h"
 
 #include <thread>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 namespace lv2 {
 
@@ -30,7 +33,7 @@ bool g_thread_started = false;
 uint64_t now_us() { return ppu::timebase() / 80; }
 
 void timer_thread() {
-    SetThreadDescription(GetCurrentThread(), L"LV2 Timer");
+    host::set_thread_name("LV2 Timer");
     placement::apply("timer");
     std::unique_lock lk(g_lock);
     for (;;) {

@@ -62,7 +62,17 @@ def bridge_labels(lines):
             continue
         out.append(body[0])
         out.append("    const uint32_t jw_ret_ = pref(R[0]) & 0x3fffc;")
-        cases = " ".join("case 0x%05x: goto L_%05x;" % (l, l) for l in labels)
+        top = []
+        depth = 0
+        for l in body[1:]:
+            if l == "    {":
+                depth += 1
+            elif l == "    }":
+                depth -= 1
+            x = LABEL_RE.match(l)
+            if x and depth == 0:
+                top.append(int(x.group(1), 16))
+        cases = " ".join("case 0x%05x: goto L_%05x;" % (l, l) for l in top)
         for l in body[1:]:
             out.append(l)
             x = LABEL_RE.match(l)

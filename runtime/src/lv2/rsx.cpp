@@ -1,4 +1,5 @@
 #include "runtime/critpath.h"
+#include "runtime/host.h"
 #include "runtime/placement.h"
 #include "runtime/hostsleep.h"
 #include "event.h"
@@ -17,8 +18,10 @@
 #include <string>
 #include <thread>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 namespace crash {
 std::string sample_stack(void* native, int depth);
@@ -70,7 +73,7 @@ void send_event(uint64_t bits) {
     if (!(bits >> 32) && !(handlers & bits)) return;
     auto q = get<EventQueue>(g_rsx.queue_id);
     if (!q) return;
-    for (int i = 0; i < 100 && push_event(q, {(uint64_t(1) << 32) | g_rsx.port_id, 0, bits, 0}) == CELL_EBUSY; i++) Sleep(1);
+    for (int i = 0; i < 100 && push_event(q, {(uint64_t(1) << 32) | g_rsx.port_id, 0, bits, 0}) == CELL_EBUSY; i++) host::sleep_ms(1);
 }
 
 uint32_t io_to_ea(uint32_t io) {
@@ -154,7 +157,7 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
             return CELL_OK;
         }
         g_rsx.pending_flip = buffer;
-        while (g_rsx.pending_flip >= 0 && g_rsx.running) Sleep(0);
+        while (g_rsx.pending_flip >= 0 && g_rsx.running) host::sleep_ms(0);
         return CELL_OK;
     }
     case 0x103: {
@@ -208,7 +211,7 @@ void semaphore_wait(uint32_t addr, uint32_t value) {
             std::this_thread::yield();
             continue;
         }
-        Sleep(0);
+        host::sleep_ms(0);
         if (tdr_us && (spins & 255) == 0) {
             auto waited = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
             if (static_cast<uint64_t>(waited) > tdr_us) {
@@ -302,7 +305,7 @@ void execute(uint32_t reg, uint32_t arg) {
     }
 }
 
-HANDLE g_fifo_handle = nullptr;
+void* g_fifo_handle = nullptr;
 
 struct LineReader {
     uint32_t line = ~0u;
@@ -320,9 +323,9 @@ struct LineReader {
 };
 
 void fifo_thread() {
-    SetThreadDescription(GetCurrentThread(), L"RSX FIFO");
+    host::set_thread_name("RSX FIFO");
     placement::apply("fifo");
-    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_fifo_handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    g_fifo_handle = host::current_native();
     if (std::getenv("GOWA_PROFILE_FIFO")) crash::profile_thread(g_fifo_handle, "rsx fifo");
     LOG_INFO("rsx", "null RSX FIFO thread started");
     uint32_t ctrl = g_rsx.dma_control;
@@ -332,7 +335,7 @@ void fifo_thread() {
         uint32_t get = vm::read32(ctrl + 0x44);
         if (get == put) {
             if (++idle < 256) std::this_thread::yield();
-            else Sleep(1);
+            else host::sleep_ms(1);
             continue;
         }
         idle = 0;
@@ -360,7 +363,7 @@ void fifo_thread() {
                 }
             }
             LOG_ERROR("rsx", "FIFO get 0x%08x not IO-mapped (put 0x%08x)", get, put);
-            Sleep(10);
+            host::sleep_ms(10);
             continue;
         }
         LineReader reader;
@@ -377,7 +380,7 @@ void fifo_thread() {
             uint32_t target = (cmd & 3) == 1 ? cmd & 0xFFFFFFFC : cmd & 0x1FFFFFFC;
             if (target == get) {
                 if (++idle < 20000) std::this_thread::yield();
-                else Sleep(1);
+                else host::sleep_ms(1);
                 continue;
             }
             static const uint32_t delay_us = std::getenv("GOWA_FIFO_DELAY_US") ? std::atoi(std::getenv("GOWA_FIFO_DELAY_US")) : 0;
@@ -439,7 +442,7 @@ void fifo_thread() {
 }
 
 void vblank_thread() {
-    SetThreadDescription(GetCurrentThread(), L"RSX VBlank");
+    host::set_thread_name("RSX VBlank");
     placement::apply("vblank");
     auto next = std::chrono::steady_clock::now();
     while (g_rsx.running) {

@@ -1,4 +1,5 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
 #include "runtime/log.h"
 
 #include <algorithm>
@@ -9,8 +10,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 namespace placement {
 
@@ -28,36 +31,20 @@ struct Config {
     Mode mode = Mode::OFF;
     std::vector<std::vector<int>> cores;
     std::map<std::string, Rule> rules;
-    std::map<int, ULONG> cpuset_ids;
+    std::map<int, uint32_t> cpuset_ids;
 };
 
 std::vector<std::vector<int>> read_cores() {
-    std::vector<std::pair<int, std::vector<int>>> found;
-    DWORD len = 0;
-    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-    std::vector<uint8_t> buf(len);
-    auto* p = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+    std::vector<host::Core> found = host::cpu_cores();
+    std::stable_sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.efficiency > b.efficiency; });
     std::vector<std::vector<int>> cores;
-    if (!len || !GetLogicalProcessorInformationEx(RelationProcessorCore, p, &len)) return cores;
-    for (DWORD off = 0; off < len;) {
-        auto* e = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
-        if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount >= 1 && e->Processor.GroupMask[0].Group == 0) {
-            std::vector<int> lps;
-            KAFFINITY m = e->Processor.GroupMask[0].Mask;
-            for (int i = 0; i < 64; i++) {
-                if (m & (KAFFINITY(1) << i)) lps.push_back(i);
-            }
-            if (!lps.empty()) found.push_back({e->Processor.EfficiencyClass, lps});
-        }
-        off += e->Size;
-    }
-    std::stable_sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    for (auto& f : found) cores.push_back(f.second);
+    for (auto& f : found) cores.push_back(f.lps);
     return cores;
 }
 
-std::map<int, ULONG> read_cpuset_ids() {
-    std::map<int, ULONG> ids;
+#ifdef _WIN32
+std::map<int, uint32_t> read_cpuset_ids() {
+    std::map<int, uint32_t> ids;
     ULONG len = 0;
     GetSystemCpuSetInformation(nullptr, 0, &len, GetCurrentProcess(), 0);
     std::vector<uint8_t> buf(len);
@@ -69,6 +56,7 @@ std::map<int, ULONG> read_cpuset_ids() {
     }
     return ids;
 }
+#endif
 
 void add_token(const Config& c, const std::string& t, std::vector<int>& out) {
     if (t.empty()) return;
@@ -129,7 +117,9 @@ const Config& config() {
     static const Config c = [] {
         Config c;
         c.cores = read_cores();
+#ifdef _WIN32
         c.cpuset_ids = read_cpuset_ids();
+#endif
         const char* e = std::getenv("GOWA_PLACE");
         std::string spec = e ? e : default_spec(c);
         if (spec.empty() || spec == "0" || spec == "off") return c;
@@ -177,9 +167,10 @@ void apply(const std::string& role) {
     if (it == c.rules.end()) it = c.rules.find(role.substr(0, role.find(':')));
     if (it == c.rules.end()) return;
     const Rule& r = it->second;
-    HANDLE h = GetCurrentThread();
     bool ok = true;
     if (!r.lps.empty()) {
+#ifdef _WIN32
+        HANDLE h = GetCurrentThread();
         if (c.mode == Mode::IDEAL) {
             PROCESSOR_NUMBER pn{};
             pn.Number = static_cast<BYTE>(r.lps[0]);
@@ -192,16 +183,17 @@ void apply(const std::string& role) {
             }
             ok = !ids.empty() && SetThreadSelectedCpuSets(h, ids.data(), static_cast<ULONG>(ids.size()));
         } else if (c.mode == Mode::MASK) {
-            DWORD_PTR m = 0;
-            for (int lp : r.lps) m |= DWORD_PTR(1) << lp;
-            ok = SetThreadAffinityMask(h, m) != 0;
+            ok = host::set_affinity(r.lps);
         }
+#else
+        if (c.mode != Mode::OFF) ok = host::set_affinity(r.lps);
+#endif
     }
-    if (r.has_prio) ok = SetThreadPriority(h, r.prio) && ok;
+    if (r.has_prio) ok = host::set_priority(r.prio) && ok;
     std::string lps;
     for (int lp : r.lps) lps += " " + std::to_string(lp);
     LOG_INFO("place", "%s ->%s%s%s", role.c_str(), lps.c_str(), r.has_prio ? " prio " : "", r.has_prio ? std::to_string(r.prio).c_str() : "");
-    if (!ok) LOG_WARN("place", "%s placement failed (%lu)", role.c_str(), GetLastError());
+    if (!ok) LOG_WARN("place", "%s placement failed (%d)", role.c_str(), host::last_error());
 }
 
 std::vector<int> role_lps(const std::string& role) {
@@ -211,12 +203,6 @@ std::vector<int> role_lps(const std::string& role) {
     return it->second.lps;
 }
 
-int logical_cpus() {
-    DWORD_PTR proc = 0, sys = 0;
-    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return 0;
-    int n = 0;
-    for (DWORD_PTR m = proc; m; m &= m - 1) n++;
-    return n;
-}
+int logical_cpus() { return host::logical_cpus(); }
 
 }

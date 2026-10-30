@@ -1,4 +1,5 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
 #include "runtime/jobsys.h"
 #include "../jobsys/edge_consumer.h"
 #include "spu/aot.h"
@@ -15,9 +16,11 @@
 #include "runtime/trace.h"
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <thread>
@@ -26,13 +29,16 @@
 #include <unordered_map>
 #include <string>
 #include <chrono>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
 #include <malloc.h>
-
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
+#include "runtime/compat.h"
 
 namespace crash {
 void profile_thread(void* native, const char* name);
@@ -1102,7 +1108,7 @@ bool SpuThread::stop_and_signal(uint32_t code) {
     switch (code) {
     case 0x001: {
         const uint64_t cp0 = critpath::g_on ? __rdtsc() : 0;
-        Sleep(1);
+        host::sleep_ms(1);
         if (cp0) critpath::spu_waited(cp, cp0, critpath::SW_BLOCK);
         return true;
     }
@@ -1388,7 +1394,7 @@ std::mutex g_cap_dir_lock;
 std::string g_cap_dir;
 
 void write_capture(SpuThread& t, const Context& start, const std::vector<uint8_t>& ls0, CaptureHost& cap, uint32_t insns, const std::string& dir) {
-    CreateDirectoryA(dir.c_str(), nullptr);
+    { std::error_code mkdir_ec; std::filesystem::create_directory(dir, mkdir_ec); }
     std::string path = dir + "/cap_" + std::to_string(t.slot) + ".bin";
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) return;
@@ -1411,29 +1417,24 @@ void write_capture(SpuThread& t, const Context& start, const std::vector<uint8_t
 }
 
 void SpuThread::run() {
-    wchar_t w[64];
-    swprintf(w, 64, L"SPU %u %hs", slot, name.c_str());
-    SetThreadDescription(GetCurrentThread(), w);
-    if (std::getenv("GOWA_SPU_LOW_PRIO")) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    host::set_thread_name("SPU " + std::to_string(slot) + " " + name);
+    if (std::getenv("GOWA_SPU_LOW_PRIO")) host::set_priority(-1);
     if (const char* aff = std::getenv("GOWA_SPU_AFFINITY")) {
         int stride = std::atoi(aff);
-        if (stride > 0) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << ((slot * stride) % 12));
+        if (stride > 0) host::set_affinity({static_cast<int>((slot * stride) % 12)});
     }
     placement::apply("spu" + std::to_string(slot));
     _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
     LOG_INFO("spu", "thread 0x%x '%s' start pc 0x%05x args 0x%llx 0x%llx", id, name.c_str(), ctx.pc,
              static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));
     if (!native) {
-        HANDLE hh = nullptr;
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &hh, 0, FALSE, DUPLICATE_SAME_ACCESS);
-        native = hh;
+        native = host::current_native();
     }
     hle::install_builtin();
     register_thread(this);
     if (const char* e = std::getenv("GOWA_PROFILE_SPU")) {
         if (std::string(e) == "all" || static_cast<uint32_t>(std::atoi(e)) == slot) {
-            HANDLE h = nullptr;
-            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            void* h = host::current_native();
             static std::string labels[8];
             std::string& label = labels[slot & 7];
             label = "spu " + std::to_string(slot);
@@ -1718,8 +1719,8 @@ void SpuThread::exec() {
                             while (__rdtsc() < until) _mm_pause();
                         }
                         if (job_log && (n & ~0xFFFFu) != ((n - ran) & ~0xFFFFu)) {
-                            ULONG64 cyc = 0;
-                            QueryThreadCycleTime(GetCurrentThread(), &cyc);
+                            uint64_t cyc = 0;
+                            cyc = host::thread_cycles();
                             if (cyc_mark) {
                                 g_cyc_cycles.fetch_add(cyc - cyc_mark, std::memory_order_relaxed);
                                 g_cyc_insns.fetch_add(uint32_t(n - cyc_insn_mark), std::memory_order_relaxed);
@@ -1831,8 +1832,8 @@ void occupancy_sampler(double period_s, int periods, std::string out_path) {
     {
         std::lock_guard lk(g_reg_lock);
         for (SpuThread* t : g_reg) {
-            ULONG64 cyc = 0;
-            if (t->native) QueryThreadCycleTime(static_cast<HANDLE>(t->native), &cyc);
+            uint64_t cyc = 0;
+            if (t->native) cyc = host::thread_cycles(t->native);
             prev_cpu[t] = {cyc, t->insns.load()};
         }
     }
@@ -1898,8 +1899,8 @@ void occupancy_sampler(double period_s, int periods, std::string out_path) {
             std::string u;
             std::lock_guard lk(g_reg_lock);
             for (SpuThread* t : g_reg) {
-                ULONG64 cyc = 0;
-                if (t->native) QueryThreadCycleTime(static_cast<HANDLE>(t->native), &cyc);
+                uint64_t cyc = 0;
+                if (t->native) cyc = host::thread_cycles(t->native);
                 uint64_t ins = t->insns.load();
                 auto& pv = prev_cpu[t];
                 char b[96];
@@ -1963,11 +1964,11 @@ void lowfps_tick(uint64_t flips) {
     last_trigger = now;
     low_since = -1;
     taken++;
-    CreateDirectoryA(cfg.dir.c_str(), nullptr);
+    { std::error_code mkdir_ec; std::filesystem::create_directory(cfg.dir, mkdir_ec); }
     char name[96];
     std::snprintf(name, sizeof name, "/low%d_t%.0f_fps%.1f", taken, now, fps);
     std::string dir = cfg.dir + name;
-    CreateDirectoryA(dir.c_str(), nullptr);
+    { std::error_code mkdir_ec; std::filesystem::create_directory(dir, mkdir_ec); }
     LOG_INFO("spucap", "low fps %.1f for %.0f s: capturing SPU state and occupancy to %s", fps, cfg.secs, dir.c_str());
     request_capture(dir);
     std::thread(occupancy_sampler, cfg.occ_secs, 1, dir + "/occ.txt").detach();

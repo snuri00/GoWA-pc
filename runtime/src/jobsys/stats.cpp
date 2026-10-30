@@ -1,10 +1,13 @@
 #include "core.h"
+#include "runtime/host.h"
 #include "verify.h"
 
 #include "runtime/log.h"
 #include "runtime/reservation.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <chrono>
 #include <cstdio>
@@ -25,7 +28,7 @@ double tsc_hz() {
     static const double hz = [] {
         auto c0 = std::chrono::steady_clock::now();
         uint64_t t0 = __rdtsc();
-        Sleep(30);
+        host::sleep_ms(30);
         return double(__rdtsc() - t0) / std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
     }();
     return hz;

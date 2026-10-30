@@ -1,4 +1,5 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
 #include <immintrin.h>
 #include "gpu/presenter.h"
 #include "motion_vectors.h"
@@ -408,9 +409,9 @@ struct Stats {
 } g_stats;
 
 uint64_t ticks() {
-    LARGE_INTEGER v;
-    QueryPerformanceCounter(&v);
-    return static_cast<uint64_t>(v.QuadPart);
+    uint64_t v;
+    v = host::qpc();
+    return static_cast<uint64_t>(v);
 }
 
 uint32_t R(uint32_t method) { return g_regs[(method >> 2) & 0x3FFF]; }
@@ -496,7 +497,7 @@ public:
 
 private:
     void run() {
-        SetThreadDescription(GetCurrentThread(), L"Shader compiler");
+        host::set_thread_name("Shader compiler");
         placement::apply("shader");
         for (;;) {
             std::function<void()> job;
@@ -3541,9 +3542,9 @@ bool present(uint32_t buffer_id) {
     if (g_trace) g_trace_serial++;
     if (g_trace) g_trace_draws = 0;
     if (presents % 60 == 0) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        double ms = 1000.0 / double(f.QuadPart) / 60.0;
+        uint64_t f;
+        f = host::qpf();
+        double ms = 1000.0 / double(f) / 60.0;
         LOG_INFO("rsx", "renderer per frame: draw %.2f ms (textures %.2f ms), present %.2f ms", g_stats.draw_ticks * ms, g_stats.tex_ticks * ms, g_stats.present_ticks * ms);
         LOG_INFO("rsx", "  phases: programs %.2f indices %.2f textures+ubo %.2f (bind %.2f) vertices %.2f misc %.2f pipeline %.2f record %.2f", g_stats.phase[0] * ms, g_stats.phase[1] * ms, g_stats.phase[2] * ms,
                  g_stats.phase[7] * ms, g_stats.phase[3] * ms, g_stats.phase[4] * ms, g_stats.phase[5] * ms, g_stats.phase[6] * ms);

@@ -1,4 +1,5 @@
 #include "core.h"
+#include "runtime/host.h"
 #include "verify.h"
 
 #include "runtime/critpath.h"
@@ -6,7 +7,9 @@
 #include "runtime/memory.h"
 #include "runtime/placement.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -81,7 +84,7 @@ void complete(Completion* c) {
     if (!c) return;
     if (c->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         c->wake.fetch_add(1, std::memory_order_release);
-        WakeByAddressAll(&c->wake);
+        host::wake_all(&c->wake);
     }
 }
 
@@ -118,7 +121,7 @@ void run_item(Executor& x, Item& it) {
     complete(it.c);
     if (g_qn.load(std::memory_order_relaxed) && g_parked.load(std::memory_order_relaxed)) {
         g_wake.fetch_add(1, std::memory_order_release);
-        WakeByAddressAll(&g_wake);
+        host::wake_all(&g_wake);
     }
 }
 
@@ -139,9 +142,7 @@ bool consumers_busy() {
 }
 
 void worker_main(int k) {
-    wchar_t w[64];
-    swprintf(w, 64, L"jobsys worker %d", k);
-    SetThreadDescription(GetCurrentThread(), w);
+    host::set_thread_name("jobsys worker " + std::to_string(k));
     const Config& c = cfg();
     int lp = -1;
     if (k < static_cast<int>(c.cpus.size())) {
@@ -150,13 +151,11 @@ void worker_main(int k) {
         std::vector<int> l = placement::role_lps("spu" + std::to_string(5 - (k % 6)));
         if (l.size() == 1) lp = l[0];
     }
-    if (lp >= 0 && lp < 64) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << lp);
-    if (c.prio) SetThreadPriority(GetCurrentThread(), c.prio);
+    if (lp >= 0 && lp < 64) host::set_affinity({lp});
+    if (c.prio) host::set_priority(c.prio);
     set_relax_hard(c.prio > 0);
     if (k == 0 && std::getenv("GOWA_PROFILE_JOBSYS")) {
-        HANDLE h = nullptr;
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
-        crash::profile_thread(h, "jobsys 0");
+        crash::profile_thread(host::current_native(), "jobsys 0");
     }
     LOG_INFO("jobsys", "worker %d on lp %d prio %d", k, lp, c.prio);
     Executor& x = thread_executor(static_cast<uint32_t>(k));
@@ -188,9 +187,9 @@ void worker_main(int k) {
             continue;
         }
         if (p == Pop::Blocked || consumers_busy()) {
-            WaitOnAddress(&g_wake, &seen, sizeof seen, 1);
+            host::wait_on(&g_wake, &seen, sizeof seen, 1);
         } else if (!g_qn.load(std::memory_order_acquire)) {
-            WaitOnAddress(&g_wake, &seen, sizeof seen, 4);
+            host::wait_on(&g_wake, &seen, sizeof seen, 4);
         }
         g_parked.fetch_sub(1, std::memory_order_acq_rel);
         stats().park_n.fetch_add(1, std::memory_order_relaxed);
@@ -235,12 +234,12 @@ void submit(JobDesc* const* jobs, uint32_t n, Completion* done) {
         g_qn.fetch_add(n, std::memory_order_acq_rel);
     }
     g_wake.fetch_add(1, std::memory_order_release);
-    if (g_parked.load(std::memory_order_acquire)) WakeByAddressAll(&g_wake);
+    if (g_parked.load(std::memory_order_acquire)) host::wake_all(&g_wake);
 }
 
 void notify() {
     g_wake.fetch_add(1, std::memory_order_release);
-    if (g_parked.load(std::memory_order_acquire)) WakeByAddressAll(&g_wake);
+    if (g_parked.load(std::memory_order_acquire)) host::wake_all(&g_wake);
 }
 
 void add_consumer(Consumer* c) {
@@ -294,9 +293,9 @@ void help_until_list(const Completion& c, uint32_t list) {
         if (++spins < 64) {
             _mm_pause();
         } else if (spins < 160) {
-            SwitchToThread();
+            host::yield();
         } else {
-            WaitOnAddress(const_cast<std::atomic<uint32_t>*>(&c.wake), &seen, sizeof seen, 1);
+            host::wait_on(const_cast<std::atomic<uint32_t>*>(&c.wake), &seen, sizeof seen, 1);
         }
     }
     uint64_t dt = now() - t0;
@@ -317,7 +316,7 @@ void wait_idle(const Completion& c) {
         uint32_t seen = c.wake.load(std::memory_order_acquire);
         if (c.pending.load(std::memory_order_acquire) <= 0) break;
         if (++spins < 64) _mm_pause();
-        else WaitOnAddress(const_cast<std::atomic<uint32_t>*>(&c.wake), &seen, sizeof seen, 1);
+        else host::wait_on(const_cast<std::atomic<uint32_t>*>(&c.wake), &seen, sizeof seen, 1);
     }
 }
 
