@@ -87,6 +87,7 @@ struct State {
 State g;
 std::atomic<bool> g_enabled{false};
 double g_last_fence_ms = 0.0;
+uint64_t g_cmd_generation = 0;
 
 float window_scale() {
     float s = dlssnr::mode() == 2 ? 2.0f : 1.0f;
@@ -392,6 +393,7 @@ void begin_frame() {
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g.cmd, &begin);
+    g_cmd_generation++;
     if (g.gpu_time) {
         vkCmdResetQueryPool(g.cmd, g.gpu_time, 0, 2);
         vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.gpu_time, 0);
@@ -430,6 +432,8 @@ void convert(const DisplayBuffer& d) {
 bool enabled() { return g_enabled; }
 
 double last_fence_wait_ms() { return g_last_fence_ms; }
+
+uint64_t cmd_generation() { return g_cmd_generation; }
 
 #ifndef _WIN32
 void* native_window() { return g.window; }
@@ -891,6 +895,7 @@ void submit_partial() {
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g.cmd, &begin);
+    g_cmd_generation++;
 }
 
 void present_image(VkImage img, VkImageLayout& layout, uint32_t w, uint32_t h) {

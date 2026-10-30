@@ -1101,6 +1101,7 @@ uint32_t g_draws_since_submit = 0;
 
 struct DynState {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+    uint64_t generation = 0;
     bool set = false;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkBuffer vb[16] = {};
@@ -2751,9 +2752,10 @@ bool draw() {
     cmd = frame_cmd();
     g_draws_since_submit++;
     DynState& ds = g_dyn;
-    if (ds.cmd != cmd || g_no_state_cache) {
+    if (ds.cmd != cmd || ds.generation != cmd_generation() || g_no_state_cache) {
         ds = DynState{};
         ds.cmd = cmd;
+        ds.generation = cmd_generation();
     }
     if (ds.pipeline != pipe) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
