@@ -88,7 +88,42 @@ State g;
 std::atomic<bool> g_enabled{false};
 double g_last_fence_ms = 0.0;
 
+float window_scale() {
+    float s = dlssnr::mode() == 2 ? 2.0f : 1.0f;
+    if (const char* e = std::getenv("GOWA_RES_SCALE")) s = std::max(s, std::clamp(static_cast<float>(std::atof(e)), 1.0f, 4.0f));
+    return s;
+}
+
+bool want_fullscreen() {
+    const char* e = std::getenv("GOWA_FULLSCREEN");
+    return e && std::atoi(e) != 0;
+}
+
+void fit_window(int& w, int& h, int max_w, int max_h) {
+    if (max_w <= 0 || max_h <= 0 || (w <= max_w && h <= max_h)) return;
+    double k = std::min(double(max_w) / w, double(max_h) / h);
+    w = static_cast<int>(w * k);
+    h = static_cast<int>(h * k);
+}
+
 #ifdef _WIN32
+WINDOWPLACEMENT g_placement{sizeof(WINDOWPLACEMENT)};
+
+void toggle_fullscreen(HWND h) {
+    LONG style = GetWindowLongW(h, GWL_STYLE);
+    if (style & WS_OVERLAPPEDWINDOW) {
+        MONITORINFO mi{sizeof mi};
+        if (GetWindowPlacement(h, &g_placement) && GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            SetWindowLongW(h, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+            SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        }
+    } else {
+        SetWindowLongW(h, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(h, &g_placement);
+        SetWindowPos(h, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+}
+
 LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CLOSE:
@@ -97,6 +132,18 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         g.resized = true;
         return 0;
+    case WM_SYSKEYDOWN:
+        if (wp == VK_RETURN && (lp & (1 << 29))) {
+            toggle_fullscreen(h);
+            return 0;
+        }
+        return DefWindowProcW(h, msg, wp, lp);
+    case WM_KEYDOWN:
+        if (wp == VK_F11) {
+            toggle_fullscreen(h);
+            return 0;
+        }
+        return DefWindowProcW(h, msg, wp, lp);
     default:
         return DefWindowProcW(h, msg, wp, lp);
     }
@@ -406,11 +453,18 @@ bool init() {
         wc.lpszClassName = L"GOWA";
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         RegisterClassW(&wc);
-        LONG ws = dlssnr::mode() == 2 ? 2 : 1;
-        RECT r{0, 0, 1280 * ws, 720 * ws};
+        float ws = window_scale();
+        int cw = static_cast<int>(1280 * ws), ch = static_cast<int>(720 * ws);
+        RECT work{};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+        RECT frame{0, 0, 0, 0};
+        AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+        fit_window(cw, ch, (work.right - work.left) - (frame.right - frame.left), (work.bottom - work.top) - (frame.bottom - frame.top));
+        RECT r{0, 0, cw, ch};
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
         HWND h = CreateWindowExW(0, L"GOWA", L"God of War: Ascension", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
                                  r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+        if (h && want_fullscreen()) toggle_fullscreen(h);
         {
             std::lock_guard lk(wm);
             g.hwnd = h;
@@ -439,8 +493,11 @@ bool init() {
         placement::apply("window");
         SDL_Window* w = nullptr;
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
-            int ws = dlssnr::mode() == 2 ? 2 : 1;
-            w = SDL_CreateWindow("God of War: Ascension", 1280 * ws, 720 * ws, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+            float ws = window_scale();
+            int cw = static_cast<int>(1280 * ws), ch = static_cast<int>(720 * ws);
+            SDL_Rect usable{};
+            if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable)) fit_window(cw, ch, usable.w, usable.h - 40);
+            w = SDL_CreateWindow("God of War: Ascension", cw, ch, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (want_fullscreen() ? SDL_WINDOW_FULLSCREEN : 0));
         }
         if (!w) LOG_ERROR("gpu", "SDL window creation failed: %s", SDL_GetError());
         {
@@ -450,6 +507,14 @@ bool init() {
         }
         wcv.notify_all();
         if (!w) return;
+        int npads = 0;
+        if (SDL_JoystickID* ids = SDL_GetGamepads(&npads)) {
+            for (int i = 0; i < npads; i++) {
+                if (SDL_GetGamepadFromID(ids[i])) continue;
+                if (SDL_Gamepad* p = SDL_OpenGamepad(ids[i])) LOG_INFO("input", "gamepad connected: %s", SDL_GetGamepadName(p));
+            }
+            SDL_free(ids);
+        }
         for (;;) {
             SDL_Event e;
             if (!SDL_WaitEventTimeout(&e, 100)) continue;
@@ -463,7 +528,11 @@ bool init() {
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
                 g.resized = true;
                 break;
+            case SDL_EVENT_KEY_DOWN:
+                if (!e.key.repeat && (e.key.key == SDLK_F11 || (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)))) SDL_SetWindowFullscreen(w, !(SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN));
+                break;
             case SDL_EVENT_GAMEPAD_ADDED:
+                if (SDL_GetGamepadFromID(e.gdevice.which)) break;
                 if (SDL_Gamepad* p = SDL_OpenGamepad(e.gdevice.which)) LOG_INFO("input", "gamepad connected: %s", SDL_GetGamepadName(p));
                 break;
             default:

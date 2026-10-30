@@ -65,6 +65,7 @@ const std::vector<Option>& options() {
         {"game", "flash_dir", "GOWA_FLASH_DIR", Kind::Path, "", "dev_flash folder", "Optional: a PS3 dev_flash copy (fonts, system files).", nullptr},
         {"graphics", "resolution_scale", "GOWA_RES_SCALE", Kind::Choice, "1", "Internal resolution", "Render targets are scaled by this factor.",
          "1=720p (native)|1.5=1080p|2=1440p|3=2160p"},
+        {"graphics", "fullscreen", "GOWA_FULLSCREEN", Kind::Bool, "0", "Fullscreen", "Borderless fullscreen; F11 or Alt+Enter switches while playing.", nullptr},
         {"graphics", "fps_limit", "GOWA_FPS_UNLOCK", Kind::Choice, "1", "Frame rate", "Unlocked modes keep game speed correct between 15 and the target.",
          "0=Original (game pacing)|1=Match display|30=30 FPS|60=60 FPS|120=120 FPS|144=144 FPS"},
         {"graphics", "show_fps", "GOWA_FPS_OSD", Kind::Bool, "1", "Show FPS counter", "Small frame rate overlay in the corner.", nullptr},
