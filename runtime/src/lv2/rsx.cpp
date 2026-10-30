@@ -330,13 +330,35 @@ void fifo_thread() {
     LOG_INFO("rsx", "null RSX FIFO thread started");
     uint32_t ctrl = g_rsx.dma_control;
     uint32_t idle = 0;
+    static const uint64_t idle_us = std::getenv("GOWA_FIFO_IDLE_US") ? std::strtoull(std::getenv("GOWA_FIFO_IDLE_US"), nullptr, 0) : 1000;
+    uint64_t idle_since = 0, idle_ticks = 0, sleeps = 0, window_start = host::qpc();
+    auto idle_wait = [&](uint32_t spins) {
+        if (!idle_since) idle_since = host::qpc();
+        if (++idle < spins) {
+            std::this_thread::yield();
+        } else {
+            sleeps++;
+            host::sleep_us(idle_us);
+        }
+    };
+    uint32_t loops = 0;
     while (g_rsx.running) {
+        uint64_t now = (++loops & 4095) == 0 ? host::qpc() : window_start;
+        if (now - window_start >= 5 * host::qpf()) {
+            double span = double(now - window_start);
+            LOG_INFO("rsx", "fifo 5s: busy %.1f%%, idle %.1f%%, %.0f idle sleeps/s", 100.0 * (span - idle_ticks) / span, 100.0 * idle_ticks / span, sleeps * double(host::qpf()) / span);
+            window_start = now;
+            idle_ticks = sleeps = 0;
+        }
         uint32_t put = vm::read32(ctrl + 0x40);
         uint32_t get = vm::read32(ctrl + 0x44);
         if (get == put) {
-            if (++idle < 256) std::this_thread::yield();
-            else host::sleep_ms(1);
+            idle_wait(256);
             continue;
+        }
+        if (idle_since) {
+            idle_ticks += host::qpc() - idle_since;
+            idle_since = 0;
         }
         idle = 0;
         static uint32_t hist_get[64], hist_cmd[64], hist_put[64];
@@ -379,8 +401,7 @@ void fifo_thread() {
         if ((cmd & 0xE0000003) == 0x20000000 || (cmd & 0xE0000003) == 0x00000001) {
             uint32_t target = (cmd & 3) == 1 ? cmd & 0xFFFFFFFC : cmd & 0x1FFFFFFC;
             if (target == get) {
-                if (++idle < 20000) std::this_thread::yield();
-                else host::sleep_ms(1);
+                idle_wait(20000);
                 continue;
             }
             static const uint32_t delay_us = std::getenv("GOWA_FIFO_DELAY_US") ? std::atoi(std::getenv("GOWA_FIFO_DELAY_US")) : 0;
