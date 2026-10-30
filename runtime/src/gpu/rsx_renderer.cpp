@@ -1097,6 +1097,24 @@ void transition(Surface* s, VkImageLayout to) {
 void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w, uint32_t h);
 uint32_t g_draws_since_submit = 0;
 
+struct DynState {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    bool set = false;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkBuffer vb[16] = {};
+    VkDeviceSize vo[16] = {}, vs[16] = {};
+    VkBuffer ib = VK_NULL_HANDLE;
+    VkDeviceSize ibo = 0;
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    float line = 0.0f;
+    uint32_t bias_on = 0;
+    uint32_t bias[2] = {};
+    uint32_t blend = 0;
+    uint32_t stencil[2][7] = {};
+} g_dyn;
+const bool g_no_state_cache = std::getenv("GOWA_NO_STATE_CACHE") != nullptr;
+
 void clear(uint32_t mask) {
     if (g_trace) LOG_INFO("rsx", "trace clear 0x%x color 0x%x zeta 0x%x clip %ux%u target 0x%x scissor 0x%x 0x%x", mask, R(SURFACE_COLOR_AOFFSET), R(SURFACE_ZETA_OFFSET), clip_w(), clip_h(), R(SURFACE_COLOR_TARGET),
                       R(SCISSOR_HORIZONTAL), R(SCISSOR_VERTICAL));
@@ -1599,6 +1617,7 @@ void redirect_pass(Surface* s, TempImage* t, uint32_t w, uint32_t h) {
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
     vkCmdBeginRendering(cmd, &ri);
+    g_dyn = DynState{};
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_redirect_pipeline);
     VkDescriptorImageInfo ii{g_point_sampler, depth_view(s), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii, nullptr, nullptr};
@@ -2340,6 +2359,7 @@ void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w,
 
 std::map<int, uint64_t> g_skip_lines;
 
+
 bool skip(int line) {
     g_skip_lines[line]++;
     if (g_trace) LOG_INFO("rsx", "  draw skipped at line %d", line);
@@ -2728,36 +2748,78 @@ bool draw() {
     begin_pass(colors, depth, w, h);
     cmd = frame_cmd();
     g_draws_since_submit++;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    DynState& ds = g_dyn;
+    if (ds.cmd != cmd || g_no_state_cache) {
+        ds = DynState{};
+        ds.cmd = cmd;
+    }
+    if (ds.pipeline != pipe) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        ds.pipeline = pipe;
+    }
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
     for (uint32_t i = 0; i < 16; i++) {
-        if (vp->inputs & (1u << i)) vkCmdBindVertexBuffers2(cmd, i, 1, &vbufs[i], &voffs[i], nullptr, &vstrides[i]);
+        if (!(vp->inputs & (1u << i)) || (ds.vb[i] == vbufs[i] && ds.vo[i] == voffs[i] && ds.vs[i] == vstrides[i])) continue;
+        vkCmdBindVertexBuffers2(cmd, i, 1, &vbufs[i], &voffs[i], nullptr, &vstrides[i]);
+        ds.vb[i] = vbufs[i];
+        ds.vo[i] = voffs[i];
+        ds.vs[i] = vstrides[i];
     }
-    vkCmdBindIndexBuffer(cmd, ib.buffer, ib.offset, VK_INDEX_TYPE_UINT32);
+    if (ds.ib != ib.buffer || ds.ibo != ib.offset) {
+        vkCmdBindIndexBuffer(cmd, ib.buffer, ib.offset, VK_INDEX_TYPE_UINT32);
+        ds.ib = ib.buffer;
+        ds.ibo = ib.offset;
+    }
     float ps = colors.empty() ? (depth ? depth->scale : 1.0f) : colors[0]->scale;
     VkViewport viewport{0, 0, float(w) * ps, float(h) * ps, 0.0f, 1.0f};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    if (!ds.set || std::memcmp(&ds.viewport, &viewport, sizeof viewport) != 0) {
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        ds.viewport = viewport;
+    }
     uint32_t scx0 = x0 ? up(x0, ps) : 0, scy0 = y0 ? up(y0, ps) : 0;
     VkRect2D scissor{{int32_t(scx0), int32_t(scy0)}, {up(x1, ps) - scx0, up(y1, ps) - scy0}};
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    if (!ds.set || std::memcmp(&ds.scissor, &scissor, sizeof scissor) != 0) {
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        ds.scissor = scissor;
+    }
     uint32_t lw = R(LINE_WIDTH);
-    vkCmdSetLineWidth(cmd, vk().features.wideLines ? std::max(1.0f, (lw >> 3) + (lw & 7) / 8.0f) : 1.0f);
-    vkCmdSetDepthBiasEnable(cmd, R(POLY_OFFSET_FILL) ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthBias(cmd, RF(POLY_OFFSET_BIAS), 0.0f, RF(POLY_OFFSET_SCALE));
+    float line = vk().features.wideLines ? std::max(1.0f, (lw >> 3) + (lw & 7) / 8.0f) : 1.0f;
+    if (!ds.set || ds.line != line) {
+        vkCmdSetLineWidth(cmd, line);
+        ds.line = line;
+    }
+    uint32_t bias_on = R(POLY_OFFSET_FILL) ? 1 : 0;
+    if (!ds.set || ds.bias_on != bias_on) {
+        vkCmdSetDepthBiasEnable(cmd, bias_on ? VK_TRUE : VK_FALSE);
+        ds.bias_on = bias_on;
+    }
+    uint32_t bias[2] = {R(POLY_OFFSET_BIAS), R(POLY_OFFSET_SCALE)};
+    if (!ds.set || ds.bias[0] != bias[0] || ds.bias[1] != bias[1]) {
+        vkCmdSetDepthBias(cmd, RF(POLY_OFFSET_BIAS), 0.0f, RF(POLY_OFFSET_SCALE));
+        ds.bias[0] = bias[0];
+        ds.bias[1] = bias[1];
+    }
     uint32_t bc = R(BLEND_COLOR);
-    float blend[4] = {((bc >> 16) & 0xFF) / 255.0f, ((bc >> 8) & 0xFF) / 255.0f, (bc & 0xFF) / 255.0f, ((bc >> 24) & 0xFF) / 255.0f};
-    vkCmdSetBlendConstants(cmd, blend);
+    if (!ds.set || ds.blend != bc) {
+        float blend[4] = {((bc >> 16) & 0xFF) / 255.0f, ((bc >> 8) & 0xFF) / 255.0f, (bc & 0xFF) / 255.0f, ((bc >> 24) & 0xFF) / 255.0f};
+        vkCmdSetBlendConstants(cmd, blend);
+        ds.blend = bc;
+    }
     bool two_sided = R(TWO_SIDED_STENCIL) != 0;
     uint32_t fb[2][4] = {{STENCIL_MASK, STENCIL_FUNC, STENCIL_REF, STENCIL_FUNC_MASK}, {BACK_STENCIL_MASK, BACK_STENCIL_FUNC, BACK_STENCIL_REF, BACK_STENCIL_FUNC_MASK}};
     uint32_t ops[2] = {STENCIL_OP_FAIL, BACK_STENCIL_OP_FAIL};
     for (uint32_t face = 0; face < 2; face++) {
         uint32_t s = two_sided ? face : 0;
+        uint32_t st[7] = {R(fb[s][0]) & 0xFF, R(fb[s][2]) & 0xFF, R(fb[s][3]) & 0xFF, R(ops[s]), R(ops[s] + 8), R(ops[s] + 4), R(fb[s][1])};
+        if (ds.set && std::memcmp(ds.stencil[face], st, sizeof st) == 0) continue;
         VkStencilFaceFlags ff = face ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
-        vkCmdSetStencilWriteMask(cmd, ff, R(fb[s][0]) & 0xFF);
-        vkCmdSetStencilReference(cmd, ff, R(fb[s][2]) & 0xFF);
-        vkCmdSetStencilCompareMask(cmd, ff, R(fb[s][3]) & 0xFF);
-        vkCmdSetStencilOp(cmd, ff, stencil_op(R(ops[s])), stencil_op(R(ops[s] + 8)), stencil_op(R(ops[s] + 4)), compare_op(R(fb[s][1])));
+        vkCmdSetStencilWriteMask(cmd, ff, st[0]);
+        vkCmdSetStencilReference(cmd, ff, st[1]);
+        vkCmdSetStencilCompareMask(cmd, ff, st[2]);
+        vkCmdSetStencilOp(cmd, ff, stencil_op(st[3]), stencil_op(st[4]), stencil_op(st[5]), compare_op(st[6]));
+        std::memcpy(ds.stencil[face], st, sizeof st);
     }
+    ds.set = true;
     bool has_stencil = depth && depth->format == VK_FORMAT_D24_UNORM_S8_UINT;
     vkCmdSetStencilTestEnable(cmd, has_stencil && R(STENCIL_TEST_ENABLE) ? VK_TRUE : VK_FALSE);
     bool dtest = depth && R(DEPTH_TEST_ENABLE);
