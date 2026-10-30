@@ -43,7 +43,8 @@ std::string symbol_of(uintptr_t addr) {
     }
     if (info.dli_fname) {
         const char* base = std::strrchr(info.dli_fname, '/');
-        std::snprintf(out, sizeof out, "%s+0x%llx", base ? base + 1 : info.dli_fname, static_cast<unsigned long long>(addr - reinterpret_cast<uintptr_t>(info.dli_fbase)));
+        bool exe = base && std::strcmp(base + 1, program_invocation_short_name) == 0;
+        std::snprintf(out, sizeof out, "%s+0x%llx", exe ? "exe" : base ? base + 1 : info.dli_fname, static_cast<unsigned long long>(addr - reinterpret_cast<uintptr_t>(info.dli_fbase)));
         return out;
     }
     return "?";
@@ -269,7 +270,7 @@ void profile_thread(void* native, const char* name) {
             for (int i = 0; i < n; i++) {
                 std::string sym = symbol_of(reinterpret_cast<uintptr_t>(pcs[i]));
                 size_t plus = sym.rfind('+');
-                if (plus != std::string::npos && sym.compare(0, plus, "gowa") != 0) sym.resize(plus);
+                if (plus != std::string::npos && sym.compare(0, plus, "exe") != 0) sym.resize(plus);
                 key += (i ? " <- " : "") + sym;
             }
             counts[key]++;
