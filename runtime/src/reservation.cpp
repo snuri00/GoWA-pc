@@ -557,7 +557,6 @@ long env_long(const char* name, long def) {
     return e ? std::atol(e) : def;
 }
 
-const bool g_park_on = env_long("GOWA_SPU_PARK", 0) != 0;
 const long g_park_spin_us = env_long("GOWA_SPU_PARK_SPIN_US", 30);
 const long g_park_timeout_us = env_long("GOWA_SPU_PARK_TIMEOUT_US", 2000);
 
@@ -578,7 +577,10 @@ int poll_once(uint32_t line, uint64_t rtime, const uint8_t* rdata, int slot, uin
 }
 }
 
-bool park_enabled() { return g_park_on; }
+bool park_enabled() {
+    static const bool on = env_long("GOWA_SPU_PARK", 0) != 0;
+    return on;
+}
 
 int park_alloc() {
     uint64_t used = g_park_used.load();
@@ -596,7 +598,7 @@ void park_free(int slot) {
 uint32_t park_word(int slot) { return g_park_word[slot].w.load(std::memory_order_acquire); }
 
 void park_kick(int slot) {
-    if (slot < 0 || !g_park_on) return;
+    if (slot < 0 || !park_enabled()) return;
     g_park_word[slot].w.fetch_add(1, std::memory_order_seq_cst);
     host::wake_one(&g_park_word[slot].w);
 }

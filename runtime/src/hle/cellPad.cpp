@@ -28,7 +28,7 @@ uint32_t g_max = 7;
 uint32_t g_setting = 0;
 std::once_flag g_script_once;
 std::vector<Press> g_script;
-uint64_t g_start = ppu::timebase();
+uint64_t g_start = 0;
 
 bool axis_of(const std::string& name, uint32_t& offset, uint16_t& value) {
     if (name.size() != 3 || (name[2] != '+' && name[2] != '-')) return false;

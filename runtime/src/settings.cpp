@@ -62,6 +62,8 @@ const std::vector<Option>& options() {
         {"game", "data_root", "GOWA_ROOT", Kind::Path, "", "Generated data folder", "Folder that contains bin/ and fw/ produced by tools/setup.py.", nullptr},
         {"game", "disc_dir", "GOWA_DISC_DIR", Kind::Path, "", "Game disc folder", "Extracted disc, the folder that contains PS3_GAME.", nullptr},
         {"game", "patch_dir", "GOWA_PATCH_DIR", Kind::Path, "", "Update folder", "Installed update BCES01741 (PARAM.SFO + USRDIR).", nullptr},
+        {"game", "fast_startup", "GOWA_TURBO", Kind::Choice, "3@15", "Fast startup", "Runs the logo and legal screens three times faster during the first 15 seconds (no sound meanwhile).",
+         "1=Off|3@15=On"},
         {"game", "flash_dir", "GOWA_FLASH_DIR", Kind::Path, "", "dev_flash folder", "Optional: a PS3 dev_flash copy (fonts, system files).", nullptr},
         {"graphics", "resolution_scale", "GOWA_RES_SCALE", Kind::Choice, "1", "Internal resolution", "Render targets are scaled by this factor.",
          "1=720p (native)|1.5=1080p|2=1440p|3=2160p"},
@@ -159,13 +161,16 @@ void set(const Option& o, const std::string& value) {
 
 void apply_env() {
     std::lock_guard lk(g_lock);
+    std::string applied;
     for (const Option& o : options()) {
         if (!o.env || g_external.count(o.env)) continue;
         auto it = g_values.find(id(o));
-        if (it == g_values.end() || it->second == o.def) continue;
-        if (o.kind == Kind::Path && it->second.empty()) continue;
-        set_env(o.env, it->second);
+        const std::string& v = it != g_values.end() ? it->second : std::string(o.def);
+        if (v.empty()) continue;
+        set_env(o.env, v);
+        applied += std::string(" ") + o.env + "=" + v;
     }
+    LOG_INFO("settings", "applied:%s", applied.c_str());
     if (!g_external.empty()) {
         std::string list;
         for (const std::string& e : g_external) list += " " + e;
