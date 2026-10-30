@@ -406,6 +406,8 @@ struct Stats {
     uint64_t watch_skips = 0;
     uint64_t blit_fast = 0;
     uint64_t blit_slow = 0;
+    uint64_t complete_ticks = 0;
+    uint64_t copy_ticks = 0;
 } g_stats;
 Stats g_slow_prev;
 
@@ -3401,7 +3403,15 @@ uint32_t zpass_value(uint32_t ea) {
     return it != g_zpass_cache.end() ? it->second : big;
 }
 
+void frame_complete_body();
+
 void frame_complete() {
+    uint64_t complete_start = ticks();
+    frame_complete_body();
+    g_stats.complete_ticks += ticks() - complete_start;
+}
+
+void frame_complete_body() {
     g_frame_draw = 0;
     double compile_ms = std::chrono::duration<double, std::milli>(g_compile_frame.time).count();
     if (compile_ms > 4.0) {
@@ -3479,7 +3489,12 @@ void method(uint32_t reg, uint32_t arg) {
         g_counter_queries.clear();
     }
     if (reg == BEGIN_END && !(arg & 0xFF) && g_in_begin && R(0x17CC)) g_zpass_draws.fetch_add(1, std::memory_order_relaxed);
-    if (copy_engine(reg, arg)) return;
+    if (reg == 0x2328 || reg == 0xC40C || (reg >= 0xA400 && reg < 0xC000)) {
+        uint64_t ct = ticks();
+        bool handled = copy_engine(reg, arg);
+        g_stats.copy_ticks += ticks() - ct;
+        if (handled) return;
+    }
     if (immediate_method(reg, arg)) return;
     if (!enabled()) return;
     switch (reg) {
@@ -3641,7 +3656,9 @@ bool present(uint32_t buffer_id) {
         uint64_t f;
         f = host::qpf();
         double ms = 1000.0 / double(f) / 60.0;
-        LOG_INFO("rsx", "renderer per frame: draw %.2f ms (textures %.2f ms), present %.2f ms", g_stats.draw_ticks * ms, g_stats.tex_ticks * ms, g_stats.present_ticks * ms);
+        LOG_INFO("rsx", "renderer per frame: draw %.2f ms (textures %.2f ms), present %.2f ms, frame complete %.2f ms, copy engine %.2f ms", g_stats.draw_ticks * ms, g_stats.tex_ticks * ms,
+                 g_stats.present_ticks * ms, g_stats.complete_ticks * ms, g_stats.copy_ticks * ms);
+        g_stats.complete_ticks = g_stats.copy_ticks = 0;
         LOG_INFO("rsx", "  phases: programs %.2f indices %.2f textures+ubo %.2f (bind %.2f) vertices %.2f misc %.2f pipeline %.2f record %.2f", g_stats.phase[0] * ms, g_stats.phase[1] * ms, g_stats.phase[2] * ms,
                  g_stats.phase[7] * ms, g_stats.phase[3] * ms, g_stats.phase[4] * ms, g_stats.phase[5] * ms, g_stats.phase[6] * ms);
         std::memset(g_stats.phase, 0, sizeof g_stats.phase);
