@@ -42,6 +42,7 @@
 
 namespace crash {
 void profile_thread(void* native, const char* name);
+std::string sample_stack(void* native, int depth);
 }
 
 namespace spu {
@@ -1992,6 +1993,13 @@ std::string brief() {
         out += b;
     }
     return out;
+}
+
+void stack_dump() {
+    std::lock_guard lk(g_reg_lock);
+    for (SpuThread* t : g_reg) {
+        if (t->native) LOG_INFO("hitch", "spu %u '%s' pc 0x%05x:%s", t->slot, t->name.c_str(), t->ctx.pc, crash::sample_stack(t->native, 10).c_str());
+    }
 }
 
 void status_dump() {

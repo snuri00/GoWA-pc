@@ -407,6 +407,7 @@ struct Stats {
     uint64_t blit_fast = 0;
     uint64_t blit_slow = 0;
 } g_stats;
+Stats g_slow_prev;
 
 uint64_t ticks() {
     uint64_t v;
@@ -3087,13 +3088,13 @@ void schedule_image_snapshot(VkImage image, uint32_t w, uint32_t h, const std::s
     g_dumps.push_back({a.ptr, 0, w, h, VK_FORMAT_R8G8B8A8_UNORM, false, name});
 }
 
-void complete_dumps() {
-    for (const Dump& d : g_dumps) {
+void write_dump(const Dump& d) {
+    {
         char fn[512];
         if (!d.name.empty()) std::snprintf(fn, sizeof fn, "%s", d.name.c_str());
         else std::snprintf(fn, sizeof fn, "surface_%s_%08x_%ux%u_f%d.ppm", d.main ? "main" : (d.format == VK_FORMAT_D24_UNORM_S8_UINT ? "depth" : "local"), d.offset, d.width, d.height, int(d.format));
         FILE* f = std::fopen(fn, "wb");
-        if (!f) continue;
+        if (!f) return;
         std::fprintf(f, "P6\n%u %u\n255\n", d.width, d.height);
         std::vector<uint8_t> row(d.width * 3);
         float zmin = 1e30f, zmax = -1e30f;
@@ -3141,6 +3142,15 @@ void complete_dumps() {
             }
         }
         if (d.name.empty()) LOG_INFO("rsx", "dumped %s z %f..%f", fn, zmin, zmax);
+    }
+}
+
+void complete_dumps() {
+    for (const Dump& d : g_dumps) {
+        auto copy = std::make_shared<std::vector<uint8_t>>(d.data, d.data + uint64_t(d.width) * d.height * 4);
+        Dump owned = d;
+        owned.data = copy->data();
+        std::thread([owned, copy] { write_dump(owned); }).detach();
     }
     g_dumps.clear();
 }
@@ -3519,6 +3529,22 @@ bool present(uint32_t buffer_id) {
     end_pass();
     schedule_writebacks();
     static uint64_t presents = 0;
+    static const double slow_ms = std::getenv("GOWA_SLOW_FRAME_MS") ? std::atof(std::getenv("GOWA_SLOW_FRAME_MS")) : 0.0;
+    if (slow_ms > 0.0) {
+        static uint64_t last = 0;
+        Stats& prev = g_slow_prev;
+        uint64_t now = ticks();
+        double ms = 1000.0 / double(host::qpf());
+        if (last && double(now - last) * ms >= slow_ms) {
+            const Stats& s = g_stats;
+            LOG_INFO("slowframe", "present gap %.1f ms: draw %.1f (tex %.1f, hash %.1f), present %.1f, fence %.1f, draws %llu, pipelines %llu, uploads %llu (%.1f MB), copies %llu",
+                     double(now - last) * ms, double(s.draw_ticks - prev.draw_ticks) * ms, double(s.tex_ticks - prev.tex_ticks) * ms, double(s.hash_ticks - prev.hash_ticks) * ms,
+                     double(s.present_ticks - prev.present_ticks) * ms, last_fence_wait_ms(), (unsigned long long)(s.draws - prev.draws), (unsigned long long)(s.pipelines - prev.pipelines),
+                     (unsigned long long)(s.upload_frame - prev.upload_frame), double(s.upload_bytes - prev.upload_bytes) / 1048576.0, (unsigned long long)(s.copies - prev.copies));
+        }
+        last = now;
+        prev = g_stats;
+    }
     static uint64_t trace_frame = std::getenv("GOWA_TRACE_FRAME") ? std::strtoull(std::getenv("GOWA_TRACE_FRAME"), nullptr, 0) : 0;
     ++presents;
     if (g_trace) {
@@ -3570,6 +3596,7 @@ bool present(uint32_t buffer_id) {
         }
         g_stats.image_allocs = g_stats.pool_hits = g_stats.textures_freed = 0;
         g_stats.draw_ticks = g_stats.tex_ticks = g_stats.present_ticks = 0;
+        g_slow_prev = g_stats;
     }
     if (presents % 300 == 0 && g_stats.pipelines != g_pipelines_saved) {
         g_pipelines_saved = g_stats.pipelines;

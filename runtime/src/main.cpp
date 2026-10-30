@@ -23,6 +23,7 @@
 
 namespace spu {
 void status_dump();
+void stack_dump();
 void lowfps_tick(uint64_t flips);
 }
 
@@ -246,6 +247,32 @@ int main(int argc, char** argv) {
     guest::start(main_thread);
     bool status = std::getenv("GOWA_STATUS") != nullptr;
     int memdump_at = std::getenv("GOWA_MEMDUMP_AT") ? std::atoi(std::getenv("GOWA_MEMDUMP_AT")) : -1;
+    if (const char* e = std::getenv("GOWA_HITCH_DUMP_MS")) {
+        int limit = std::atoi(e);
+        std::thread([limit] {
+            host::set_thread_name("hitch watchdog");
+            uint64_t last = lv2::rsx_flip_count();
+            auto since = std::chrono::steady_clock::now();
+            bool dumped = false;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                uint64_t f = lv2::rsx_flip_count();
+                auto now = std::chrono::steady_clock::now();
+                if (f != last) {
+                    last = f;
+                    since = now;
+                    dumped = false;
+                    continue;
+                }
+                if (dumped || f < 60 || now - since < std::chrono::milliseconds(limit)) continue;
+                dumped = true;
+                LOG_INFO("hitch", "no flip for %d ms after flip %llu", limit, static_cast<unsigned long long>(f));
+                guest::status_dump();
+                spu::stack_dump();
+                lv2::rsx_status();
+            }
+        }).detach();
+    }
     host::set_thread_name("Host main");
     placement::apply("host");
     static const int census = std::getenv("GOWA_THREAD_CPU") ? std::atoi(std::getenv("GOWA_THREAD_CPU")) : 0;

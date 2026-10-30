@@ -81,6 +81,7 @@ struct State {
 
 State g;
 std::atomic<bool> g_enabled{false};
+double g_last_fence_ms = 0.0;
 
 #ifdef _WIN32
 LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -316,7 +317,8 @@ void begin_frame() {
     f = host::qpf();
     static double total = 0;
     static uint64_t n = 0;
-    total += double(b - a) * 1000.0 / double(f);
+    g_last_fence_ms = double(b - a) * 1000.0 / double(f);
+    total += g_last_fence_ms;
     if (++n % 60 == 0) {
         LOG_INFO("gpu", "fence wait %.2f ms per frame", total / 60.0);
         total = 0;
@@ -359,6 +361,8 @@ void convert(const DisplayBuffer& d) {
 }
 
 bool enabled() { return g_enabled; }
+
+double last_fence_wait_ms() { return g_last_fence_ms; }
 
 #ifndef _WIN32
 void* native_window() { return g.window; }
