@@ -3756,7 +3756,7 @@ bool present(uint32_t buffer_id) {
             }
             if (snap) schedule_snapshot(s.get(), width, height, snap_dir + name);
             uint64_t pt = ticks();
-            present_image(s->image, s->layout, width, height);
+            present_image(s->image, s->layout, std::min(s->iw, up(width, s->scale)), std::min(s->ih, up(height, s->scale)));
             g_stats.present_ticks += ticks() - pt;
             dlssnr::end_frame();
             return true;
