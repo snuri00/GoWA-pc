@@ -200,6 +200,7 @@ def cmd_run(args):
     os.makedirs(out, exist_ok=True)
     env = dict(os.environ)
     env["GOWA_ROOT"] = ROOT
+    env.setdefault("GOWA_NO_LAUNCHER", "1")
     if "GOWA_RPCS3_DIR" not in env and os.path.isdir(os.path.join(RUN_DIR, "rpcs3")):
         env["GOWA_RPCS3_DIR"] = os.path.join(RUN_DIR, "rpcs3")
     env["GOWA_SNAP_EVERY"] = str(snap_every if snap_every > 0 else 1e9)

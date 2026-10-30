@@ -11,6 +11,10 @@
 #include "runtime/thread.h"
 
 #include "runtime/vfs.h"
+#include "runtime/settings.h"
+#ifdef GOWA_HAVE_LAUNCHER
+#include "runtime/launcher.h"
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -181,6 +185,11 @@ void thread_census(int period) {
 }
 
 int main(int argc, char** argv) {
+    settings::load();
+#ifdef GOWA_HAVE_LAUNCHER
+    if (launcher::wanted(argc, argv) && launcher::run() == launcher::Result::Quit) return 0;
+#endif
+    settings::apply_env();
     crash::install();
     trace::init();
     critpath::init();
