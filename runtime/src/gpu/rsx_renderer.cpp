@@ -1095,6 +1095,7 @@ void transition(Surface* s, VkImageLayout to) {
 }
 
 void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w, uint32_t h);
+uint32_t g_draws_since_submit = 0;
 
 void clear(uint32_t mask) {
     if (g_trace) LOG_INFO("rsx", "trace clear 0x%x color 0x%x zeta 0x%x clip %ux%u target 0x%x scissor 0x%x 0x%x", mask, R(SURFACE_COLOR_AOFFSET), R(SURFACE_ZETA_OFFSET), clip_w(), clip_h(), R(SURFACE_COLOR_TARGET),
@@ -2291,6 +2292,11 @@ void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w,
     for (uint32_t i = 0; same && i < colors.size(); i++) same = g_pass.colors[i] == colors[i];
     if (same) return;
     end_pass();
+    static const uint32_t submit_draws = std::getenv("GOWA_SUBMIT_DRAWS") ? static_cast<uint32_t>(std::atoi(std::getenv("GOWA_SUBMIT_DRAWS"))) : 150;
+    if (submit_draws && g_draws_since_submit >= submit_draws) {
+        g_draws_since_submit = 0;
+        submit_partial();
+    }
     for (Surface* s : colors) {
         transition(s, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         s->generation++;
@@ -2720,6 +2726,8 @@ bool draw() {
     }
     if (mv::enabled()) mv_draw(colors, w, h, fp->hash, vp->hash, vcount);
     begin_pass(colors, depth, w, h);
+    cmd = frame_cmd();
+    g_draws_since_submit++;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
     for (uint32_t i = 0; i < 16; i++) {

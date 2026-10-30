@@ -59,7 +59,12 @@ struct State {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkCommandBuffer pre = VK_NULL_HANDLE;
     bool pre_recording = false;
+    std::vector<VkCommandBuffer> spare_cmds;
+    std::vector<VkCommandBuffer> inflight_cmds;
     VkFence fence = VK_NULL_HANDLE;
+    VkQueryPool gpu_time = VK_NULL_HANDLE;
+    float ts_period = 1.0f;
+    bool gpu_time_valid = false;
     VkSemaphore acquired = VK_NULL_HANDLE;
     VkSemaphore rendered = VK_NULL_HANDLE;
     VkBuffer staging = VK_NULL_HANDLE;
@@ -319,16 +324,31 @@ void begin_frame() {
     static uint64_t n = 0;
     g_last_fence_ms = double(b - a) * 1000.0 / double(f);
     total += g_last_fence_ms;
-    if (++n % 60 == 0) {
-        LOG_INFO("gpu", "fence wait %.2f ms per frame", total / 60.0);
-        total = 0;
+    static double gpu_total = 0;
+    if (g.gpu_time && g.gpu_time_valid) {
+        uint64_t ts[2] = {};
+        if (vkGetQueryPoolResults(g.device, g.gpu_time, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0]) gpu_total += double(ts[1] - ts[0]) * g.ts_period * 1e-6;
     }
+    if (++n % 60 == 0) {
+        LOG_INFO("gpu", "fence wait %.2f ms, gpu %.2f ms per frame", total / 60.0, gpu_total / 60.0);
+        total = 0;
+        gpu_total = 0;
+    }
+    for (VkCommandBuffer c : g.inflight_cmds) {
+        vkResetCommandBuffer(c, 0);
+        g.spare_cmds.push_back(c);
+    }
+    g.inflight_cmds.clear();
     gpu::rsx::frame_complete();
     g_frame_serial++;
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g.cmd, &begin);
+    if (g.gpu_time) {
+        vkCmdResetQueryPool(g.cmd, g.gpu_time, 0, 2);
+        vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.gpu_time, 0);
+    }
     g.recording = true;
 }
 
@@ -594,6 +614,13 @@ bool init() {
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     vkCreateFence(g.device, &fci, nullptr, &g.fence);
+    if (props.limits.timestampComputeAndGraphics) {
+        VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qci.queryCount = 2;
+        if (vkCreateQueryPool(g.device, &qci, nullptr, &g.gpu_time) != VK_SUCCESS) g.gpu_time = VK_NULL_HANDLE;
+        g.ts_period = props.limits.timestampPeriod;
+    }
     VkSemaphoreCreateInfo sei{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     vkCreateSemaphore(g.device, &sei, nullptr, &g.acquired);
     vkCreateSemaphore(g.device, &sei, nullptr, &g.rendered);
@@ -671,8 +698,25 @@ uint32_t gather_cmds(VkCommandBuffer out[2]) {
     return n;
 }
 
+VkCommandBuffer spare_cmd() {
+    if (!g.spare_cmds.empty()) {
+        VkCommandBuffer c = g.spare_cmds.back();
+        g.spare_cmds.pop_back();
+        return c;
+    }
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = g.pool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer c = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(g.device, &cai, &c);
+    return c;
+}
+
 void submit_and_present(uint32_t index) {
     dlssg::pre_submit(g.cmd, g.swap_extent.width, g.swap_extent.height);
+    if (g.gpu_time) vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.gpu_time, 1);
+    g.gpu_time_valid = g.gpu_time != VK_NULL_HANDLE;
     vkEndCommandBuffer(g.cmd);
     g.recording = false;
     vkResetFences(g.device, 1, &g.fence);
@@ -705,6 +749,8 @@ void submit_and_present(uint32_t index) {
 
 void flush_without_present() {
     if (!g.recording) return;
+    if (g.gpu_time) vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.gpu_time, 1);
+    g.gpu_time_valid = g.gpu_time != VK_NULL_HANDLE;
     vkEndCommandBuffer(g.cmd);
     g.recording = false;
     vkResetFences(g.device, 1, &g.fence);
@@ -756,6 +802,26 @@ void blit_to_swapchain(VkImage src, uint32_t w, uint32_t h, uint32_t index) {
     barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
 }
 
+}
+
+void submit_partial() {
+    if (!g_enabled || !g.recording) return;
+    vkEndCommandBuffer(g.cmd);
+    VkCommandBuffer cmds[2];
+    bool had_pre = g.pre_recording;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = gather_cmds(cmds);
+    si.pCommandBuffers = cmds;
+    if (VkResult sr = vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE); sr != VK_SUCCESS) {
+        static int reported = 0;
+        if (reported++ < 5) LOG_ERROR("gpu", "partial vkQueueSubmit failed %d", int(sr));
+    }
+    for (uint32_t i = 0; i < si.commandBufferCount; i++) g.inflight_cmds.push_back(cmds[i]);
+    if (had_pre) g.pre = spare_cmd();
+    g.cmd = spare_cmd();
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(g.cmd, &begin);
 }
 
 void present_image(VkImage img, VkImageLayout& layout, uint32_t w, uint32_t h) {
