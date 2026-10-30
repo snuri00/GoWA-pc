@@ -29,7 +29,6 @@ public:
         ctx_ = avcodec_alloc_context3(c);
         if (!ctx_) return false;
         ctx_->thread_count = 0;
-        ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
         if (avcodec_open2(ctx_, c, nullptr) < 0) {
             LOG_WARN("media", "%s: avcodec_open2 failed", name_.c_str());
             return false;
