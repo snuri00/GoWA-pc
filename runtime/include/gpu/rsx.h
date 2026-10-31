@@ -9,5 +9,6 @@ bool present(uint32_t buffer_id);
 uint32_t reg(uint32_t method);
 void frame_complete();
 uint32_t zpass_value(uint32_t ea);
+void sync_decodes();
 
 }

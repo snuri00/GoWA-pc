@@ -238,6 +238,14 @@ void execute(uint32_t reg, uint32_t arg) {
     }
     if (reg < 0xE000) gpu::rsx::method(reg, arg);
     switch (reg) {
+    case 0x50: case 0x68: case 0x6C: case 0x1D70: case 0x1D74: case 0x1800:
+        gpu::rsx::sync_decodes();
+        break;
+    default:
+        if (reg >= 0xE000) gpu::rsx::sync_decodes();
+        break;
+    }
+    switch (reg) {
     case 0x50: vm::write32(g_rsx.dma_control + 0x48, arg); break;
     case 0x60: g_rsx.sema_ctx_406e = arg; break;
     case 0x64: g_rsx.sema_off_406e = arg; break;

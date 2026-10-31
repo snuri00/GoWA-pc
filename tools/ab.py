@@ -81,8 +81,10 @@ def critpath(run_dir, lo, hi):
     return out
 
 
-def run_one(scenario, name, env, secs, crit, census):
+def run_one(scenario, name, env, secs, crit, census, save):
     cmd = [sys.executable, os.path.join(ROOT, "tools", "testrun.py"), "run", scenario, "--name", name, "--secs", str(secs), "--snap-every", "0"]
+    if save:
+        cmd += ["--save", save]
     envs = list(env)
     if crit:
         envs.append("GOWA_CRITPATH=1")
@@ -109,13 +111,14 @@ def main():
     ap.add_argument("--critpath", action="store_true", help="record and summarize the PPU critical path")
     ap.add_argument("--census", action="store_true", help="log per-thread CPU (RSX FIFO load)")
     ap.add_argument("--tag", default="ab")
+    ap.add_argument("--save", help="savedata dir restored before every run")
     args = ap.parse_args()
     lo, hi = (float(x) for x in args.window.split(":"))
     cfgs = [parse_cfg(c) for c in args.cfg]
     results = {name: [] for name, _ in cfgs}
     for rep in range(args.reps):
         for name, env in cfgs:
-            d = run_one(args.scenario, "%s-%s-%d" % (args.tag, name, rep), env, args.secs, args.critpath, args.census)
+            d = run_one(args.scenario, "%s-%s-%d" % (args.tag, name, rep), env, args.secs, args.critpath, args.census, args.save)
             if not d or not os.path.exists(os.path.join(d, "gowa.log")):
                 print("%-12s rep %d: run failed" % (name, rep), flush=True)
                 continue

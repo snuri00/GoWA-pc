@@ -787,6 +787,7 @@ VkCommandBuffer spare_cmd() {
 }
 
 void submit_and_present(uint32_t index) {
+    gpu::rsx::sync_decodes();
     dlssg::pre_submit(g.cmd, g.swap_extent.width, g.swap_extent.height);
     if (g.gpu_time) vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.gpu_time, 1);
     g.gpu_time_valid = g.gpu_time != VK_NULL_HANDLE;
@@ -822,6 +823,7 @@ void submit_and_present(uint32_t index) {
 
 void flush_without_present() {
     if (!g.recording) return;
+    gpu::rsx::sync_decodes();
     if (g.gpu_time) vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.gpu_time, 1);
     g.gpu_time_valid = g.gpu_time != VK_NULL_HANDLE;
     vkEndCommandBuffer(g.cmd);
@@ -879,6 +881,7 @@ void blit_to_swapchain(VkImage src, uint32_t w, uint32_t h, uint32_t index) {
 
 void submit_partial() {
     if (!g_enabled || !g.recording) return;
+    gpu::rsx::sync_decodes();
     vkEndCommandBuffer(g.cmd);
     VkCommandBuffer cmds[2];
     bool had_pre = g.pre_recording;

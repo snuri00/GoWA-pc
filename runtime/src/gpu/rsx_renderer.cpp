@@ -1361,6 +1361,75 @@ TextureRegs texture_regs(uint32_t unit) {
     return t;
 }
 
+class TextureDecodePool {
+public:
+    void start(int n) {
+        for (int k = 0; k < n; k++) {
+            std::thread([this, k] {
+                host::set_thread_name("RSX texture " + std::to_string(k));
+                for (;;) {
+                    std::function<void()> job;
+                    {
+                        std::unique_lock lk(m_);
+                        cv_.wait(lk, [this] { return !q_.empty(); });
+                        job = std::move(q_.front());
+                        q_.pop_front();
+                    }
+                    job();
+                    pending_.fetch_sub(1, std::memory_order_release);
+                }
+            }).detach();
+        }
+        threads_ = n;
+    }
+    int threads() const { return threads_; }
+    void submit(std::function<void()> job) {
+        pending_.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard lk(m_);
+            q_.push_back(std::move(job));
+        }
+        cv_.notify_one();
+    }
+    void sync() {
+        while (pending_.load(std::memory_order_acquire)) {
+            std::function<void()> job;
+            {
+                std::lock_guard lk(m_);
+                if (!q_.empty()) {
+                    job = std::move(q_.back());
+                    q_.pop_back();
+                }
+            }
+            if (job) {
+                job();
+                pending_.fetch_sub(1, std::memory_order_release);
+            } else {
+                _mm_pause();
+            }
+        }
+    }
+
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> q_;
+    std::atomic<uint32_t> pending_{0};
+    int threads_ = 0;
+};
+
+TextureDecodePool g_texture_pool;
+
+TextureDecodePool& texture_pool() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char* e = std::getenv("GOWA_TEXTURE_THREADS");
+        int n = e ? std::atoi(e) : 3;
+        if (n > 0) g_texture_pool.start(std::min(n, 8));
+    });
+    return g_texture_pool;
+}
+
 Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
     auto key = std::make_tuple(ea, t.format, t.rect, t.control1, t.control3, t.address & 0x00F00000);
     auto it = g_textures.find(key);
@@ -1424,7 +1493,11 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
     }
     RingAlloc staging;
     if (!ring_alloc(tex->layout.decoded_size, 16, staging)) return nullptr;
-    decode_texture(src, t, tex->layout, staging.ptr);
+    if (texture_pool().threads() && tex->layout.decoded_size >= 65536 && !g_trace) {
+        texture_pool().submit([src, t, layout = tex->layout, dst = staging.ptr] { decode_texture(src, t, layout, dst); });
+    } else {
+        decode_texture(src, t, tex->layout, staging.ptr);
+    }
     end_pass();
     VkCommandBuffer cmd = frame_cmd();
     VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -2922,6 +2995,7 @@ uint16_t argb_to_565(uint32_t c) {
 }
 
 void nv308a_color(uint32_t index, uint32_t arg) {
+    g_texture_pool.sync();
     if (index >= (R(0xA308) & 0xFFFF)) return;
     uint32_t point = R(0xA304);
     uint32_t x = (point & 0xFFFF) + index, y = point >> 16;
@@ -2936,6 +3010,7 @@ void nv308a_color(uint32_t index, uint32_t arg) {
 }
 
 void nv0039_transfer() {
+    g_texture_pool.sync();
     if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv0039 in 0x%x dma 0x%x out 0x%x dma 0x%x pitch %d/%d len %u lines %u fmt 0x%x", R(0x230C), R(0x2184), R(0x2310), R(0x2188), int32_t(R(0x2314)),
                                                  int32_t(R(0x2318)), R(0x231C), R(0x2320), R(0x2324));
     if (g_trace) LOG_INFO("rsx", "trace nv0039 in 0x%x dma 0x%x out 0x%x dma 0x%x pitch %d/%d len %u lines %u fmt 0x%x", R(0x230C), R(0x2184), R(0x2310), R(0x2188), int32_t(R(0x2314)), int32_t(R(0x2318)), R(0x231C), R(0x2320), R(0x2324));
@@ -2963,6 +3038,7 @@ void nv0039_transfer() {
 }
 
 void nv3089_transfer(uint32_t arg) {
+    g_texture_pool.sync();
     if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x clip 0x%x/0x%x dst 0x%x dma 0x%x pitch 0x%x surf 0x%x cfmt 0x%x/0x%x dsdx 0x%x/0x%x arg 0x%x", R(0xC408), R(0xC184),
                                                  R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC308), R(0xC30C), R(0x630C), R(0x6188), R(0x6304), R(0xC198), R(0xC300), R(0x6300), R(0xC318), R(0xC31C), arg);
     if (g_trace) LOG_INFO("rsx", "trace nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x size 0x%x dst 0x%x dma 0x%x surf 0x%x dsdx 0x%x", R(0xC408), R(0xC184), R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC30C), R(0x630C), R(0x6188), R(0xC198), R(0xC318));
@@ -3423,7 +3499,10 @@ uint32_t zpass_value(uint32_t ea) {
 
 void frame_complete_body();
 
+void sync_decodes() { g_texture_pool.sync(); }
+
 void frame_complete() {
+    g_texture_pool.sync();
     uint64_t complete_start = ticks();
     frame_complete_body();
     g_stats.complete_ticks += ticks() - complete_start;
