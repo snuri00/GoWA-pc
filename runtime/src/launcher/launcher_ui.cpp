@@ -110,7 +110,7 @@ std::string disc_dir() {
     std::error_code ec;
     if (fs::exists("rpcs3/games/BCES01741", ec)) return "rpcs3/games/BCES01741";
 #ifdef _WIN32
-    return "D:/Games/rpcs3/games/BCES01741";
+    return "rpcs3/games/BCES01741";
 #else
     const char* home = std::getenv("HOME");
     return std::string(home ? home : ".") + "/.config/rpcs3/games/BCES01741";

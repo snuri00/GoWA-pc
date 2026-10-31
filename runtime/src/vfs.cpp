@@ -69,7 +69,7 @@ std::string fold_case(const std::string& root, const std::string& rest) {
 void init() {
     std::call_once(g_once, [] {
 #ifdef _WIN32
-        std::string rpcs3 = env_or("GOWA_RPCS3_DIR", "D:/Games/rpcs3");
+        std::string rpcs3 = env_or("GOWA_RPCS3_DIR", "rpcs3");
 #else
         std::string rpcs3 = env_or("GOWA_RPCS3_DIR", (env_or("HOME", ".") + "/.config/rpcs3").c_str());
 #endif
