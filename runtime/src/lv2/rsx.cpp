@@ -12,10 +12,12 @@
 #include "runtime/hostsleep.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
 
@@ -362,6 +364,15 @@ void fifo_thread() {
             host::sleep_us(idle_us);
         }
     };
+    static const auto special = [] {
+        std::array<uint8_t, 0x4000> t{};
+        std::memcpy(t.data(), gpu::rsx::special_methods(), t.size());
+        for (uint32_t r : {0x50u, 0x60u, 0x64u, 0x68u, 0x6Cu, 0x1A4u, 0x1A8u, 0x1D6Cu, 0x1D70u, 0x1D74u, 0x1800u}) t[r >> 2] = 1;
+        for (uint32_t r = 0xE000; r < 0x10000; r += 4) t[r >> 2] = 1;
+        return t;
+    }();
+    uint32_t* regs = gpu::rsx::registers();
+    static const bool full_dispatch = std::getenv("GOWA_RSX_TRACE") || std::getenv("GOWA_RSX_STATS");
     uint32_t loops = 0;
     while (g_rsx.running) {
         uint64_t now = (++loops & 4095) == 0 ? host::qpc() : window_start;
@@ -504,7 +515,13 @@ void fifo_thread() {
             }
         } else if (!noninc || method != 0x0100) {
             for (uint32_t i = 0; i < count; i++) {
-                execute(noninc ? method : method + i * 4, reader.read(ea + 4 + i * 4));
+                uint32_t reg = noninc ? method : method + i * 4;
+                uint32_t arg = reader.read(ea + 4 + i * 4);
+                if (!full_dispatch && !special[reg >> 2]) {
+                    regs[reg >> 2] = arg;
+                    continue;
+                }
+                execute(reg, arg);
             }
         }
         uint64_t dx = __rdtsc() - x0;
