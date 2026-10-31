@@ -1128,6 +1128,11 @@ struct DynState {
     uint32_t bias[2] = {};
     uint32_t blend = 0;
     uint32_t stencil[2][7] = {};
+    uint32_t fixed[11] = {};
+    uint32_t push_textures = 0;
+    uint32_t push_images = 0;
+    VkDescriptorImageInfo images[20] = {};
+    VkDescriptorBufferInfo ubo[4] = {};
 } g_dyn;
 const bool g_no_state_cache = std::getenv("GOWA_NO_STATE_CACHE") != nullptr;
 
@@ -2410,6 +2415,26 @@ bool upload_uniform(const void* data, size_t size, VkDescriptorBufferInfo& out) 
     return true;
 }
 
+bool upload_uniform_cached(uint32_t slot, const void* data, size_t size, VkDescriptorBufferInfo& out) {
+    struct Cached {
+        uint64_t serial = ~0ull;
+        std::vector<uint8_t> data;
+        VkDescriptorBufferInfo info{};
+    };
+    static Cached cache[4];
+    Cached& c = cache[slot];
+    uint64_t serial = frame_serial();
+    if (c.serial == serial && c.data.size() == size && std::memcmp(c.data.data(), data, size) == 0) {
+        out = c.info;
+        return true;
+    }
+    if (!upload_uniform(data, size, out)) return false;
+    c.serial = serial;
+    c.data.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+    c.info = out;
+    return true;
+}
+
 void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w, uint32_t h) {
     bool same = g_pass.active && g_pass.color_count == colors.size() && g_pass.depth == depth && g_pass.width == w && g_pass.height == h;
     for (uint32_t i = 0; same && i < colors.size(); i++) same = g_pass.colors[i] == colors[i];
@@ -2540,9 +2565,9 @@ bool draw() {
         ni++;
     }
     g_stats.phase[7] += ticks() - bind_start;
+    static const VkSampler dummy_sampler = sampler(TextureRegs{}, 1, false);
     for (uint32_t t = 0; t < 4; t++) {
-        TextureRegs dummy_regs;
-        images[ni] = {sampler(dummy_regs, 1, false), g_dummy[1].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        images[ni] = {dummy_sampler, g_dummy[1].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         writes[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 16 + t, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &images[ni], nullptr, nullptr};
         nw++;
         ni++;
@@ -2575,8 +2600,9 @@ bool draw() {
     vs.flags[1] = R(TWO_SIDE_LIGHT) ? 1 : 0;
     vs.flags[2] = R(POINT_SIZE);
     vs.flags[3] = R(BRANCH_BITS);
-    if (!upload_uniform(&vs, sizeof vs, ubo[1])) return skip(__LINE__);
-    std::vector<float> lits(std::max<size_t>(1, fp->literal_slots.size()) * 4, 0.0f);
+    if (!upload_uniform_cached(1, &vs, sizeof vs, ubo[1])) return skip(__LINE__);
+    static std::vector<float> lits;
+    lits.assign(std::max<size_t>(1, fp->literal_slots.size()) * 4, 0.0f);
     for (size_t i = 0; i < fp->literal_slots.size(); i++) {
         uint32_t a = fp_ea + (fp->start_slot + fp->literal_slots[i]) * 16;
         for (uint32_t k = 0; k < 4; k++) {
@@ -2585,7 +2611,7 @@ bool draw() {
             std::memcpy(&lits[i * 4 + k], &v, 4);
         }
     }
-    if (!upload_uniform(lits.data(), lits.size() * 4, ubo[2])) return skip(__LINE__);
+    if (!upload_uniform_cached(2, lits.data(), lits.size() * 4, ubo[2])) return skip(__LINE__);
     if (mv::enabled() && fp->hash == mv::kCameraVelocityFp && !colors.empty()) mv::set_camera(lits.data(), lits.size() / 4, colors[0]->offset, texture_regs(1).offset);
     struct FragmentState {
         float window[4];
@@ -2614,7 +2640,7 @@ bool draw() {
     fs.flags[2] = R(ALPHA_FUNC) & 7;
     static uint32_t fp_debug = std::getenv("GOWA_FP_DEBUG") ? std::atoi(std::getenv("GOWA_FP_DEBUG")) : 0;
     fs.flags[3] = fp_debug;
-    if (!upload_uniform(&fs, sizeof fs, ubo[3])) return skip(__LINE__);
+    if (!upload_uniform_cached(3, &fs, sizeof fs, ubo[3])) return skip(__LINE__);
     for (uint32_t i = 0; i < 4; i++) {
         writes[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, i, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &ubo[i], nullptr};
         nw++;
@@ -2862,7 +2888,13 @@ bool draw() {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         ds.pipeline = pipe;
     }
-    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
+    if (!ds.set || ds.push_textures != fp->textures || ds.push_images != ni || std::memcmp(ds.images, images, ni * sizeof images[0]) != 0 || std::memcmp(ds.ubo, ubo, sizeof ubo) != 0) {
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
+        ds.push_textures = fp->textures;
+        ds.push_images = ni;
+        std::memcpy(ds.images, images, ni * sizeof images[0]);
+        std::memcpy(ds.ubo, ubo, sizeof ubo);
+    }
     for (uint32_t i = 0; i < 16; i++) {
         if (!(vp->inputs & (1u << i)) || (ds.vb[i] == vbufs[i] && ds.vo[i] == voffs[i] && ds.vs[i] == vstrides[i])) continue;
         vkCmdBindVertexBuffers2(cmd, i, 1, &vbufs[i], &voffs[i], nullptr, &vstrides[i]);
@@ -2924,31 +2956,36 @@ bool draw() {
         vkCmdSetStencilOp(cmd, ff, stencil_op(st[3]), stencil_op(st[4]), stencil_op(st[5]), compare_op(st[6]));
         std::memcpy(ds.stencil[face], st, sizeof st);
     }
-    ds.set = true;
     bool has_stencil = depth && depth->format == VK_FORMAT_D24_UNORM_S8_UINT;
-    vkCmdSetStencilTestEnable(cmd, has_stencil && R(STENCIL_TEST_ENABLE) ? VK_TRUE : VK_FALSE);
     bool dtest = depth && R(DEPTH_TEST_ENABLE);
-    vkCmdSetDepthTestEnable(cmd, dtest ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthWriteEnable(cmd, dtest && R(DEPTH_MASK) ? VK_TRUE : VK_FALSE);
     VkCompareOp depth_op = compare_op(R(DEPTH_FUNC));
     if (depth_op == VK_COMPARE_OP_EQUAL && !R(DEPTH_MASK)) depth_op = (g_experiment & 64) ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_LESS_OR_EQUAL;
-    vkCmdSetDepthCompareOp(cmd, depth_op);
-    if (vk().features.depthBounds) {
-        vkCmdSetDepthBoundsTestEnable(cmd, depth && R(DEPTH_BOUNDS_ENABLE) ? VK_TRUE : VK_FALSE);
-        vkCmdSetDepthBounds(cmd, std::clamp(RF(DEPTH_BOUNDS_MIN), 0.0f, 1.0f), std::clamp(RF(DEPTH_BOUNDS_MAX), 0.0f, 1.0f));
-    }
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
     if (R(CULL_FACE_ENABLE)) {
         uint32_t cf = R(CULL_FACE);
         cull = cf == 0x404 ? VK_CULL_MODE_FRONT_BIT : cf == 0x408 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_BACK_BIT;
     }
     if (g_experiment & 16) cull = VK_CULL_MODE_NONE;
-    vkCmdSetCullMode(cmd, cull);
     bool cw = R(FRONT_FACE) == 0x900;
     if (g_experiment & 32) cw = !cw;
-    vkCmdSetFrontFace(cmd, cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
-    vkCmdSetPrimitiveTopology(cmd, topo);
-    vkCmdSetPrimitiveRestartEnable(cmd, restart ? VK_TRUE : VK_FALSE);
+    float bounds[2] = {std::clamp(RF(DEPTH_BOUNDS_MIN), 0.0f, 1.0f), std::clamp(RF(DEPTH_BOUNDS_MAX), 0.0f, 1.0f)};
+    uint32_t fixed[11] = {has_stencil && R(STENCIL_TEST_ENABLE) ? 1u : 0u, dtest ? 1u : 0u, dtest && R(DEPTH_MASK) ? 1u : 0u, uint32_t(depth_op), depth && R(DEPTH_BOUNDS_ENABLE) ? 1u : 0u, 0, 0,
+                          uint32_t(cull), cw ? 1u : 0u, uint32_t(topo), restart ? 1u : 0u};
+    std::memcpy(&fixed[5], bounds, sizeof bounds);
+    if (!ds.set || fixed[0] != ds.fixed[0]) vkCmdSetStencilTestEnable(cmd, fixed[0] ? VK_TRUE : VK_FALSE);
+    if (!ds.set || fixed[1] != ds.fixed[1]) vkCmdSetDepthTestEnable(cmd, fixed[1] ? VK_TRUE : VK_FALSE);
+    if (!ds.set || fixed[2] != ds.fixed[2]) vkCmdSetDepthWriteEnable(cmd, fixed[2] ? VK_TRUE : VK_FALSE);
+    if (!ds.set || fixed[3] != ds.fixed[3]) vkCmdSetDepthCompareOp(cmd, depth_op);
+    if (vk().features.depthBounds) {
+        if (!ds.set || fixed[4] != ds.fixed[4]) vkCmdSetDepthBoundsTestEnable(cmd, fixed[4] ? VK_TRUE : VK_FALSE);
+        if (!ds.set || fixed[5] != ds.fixed[5] || fixed[6] != ds.fixed[6]) vkCmdSetDepthBounds(cmd, bounds[0], bounds[1]);
+    }
+    if (!ds.set || fixed[7] != ds.fixed[7]) vkCmdSetCullMode(cmd, cull);
+    if (!ds.set || fixed[8] != ds.fixed[8]) vkCmdSetFrontFace(cmd, cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    if (!ds.set || fixed[9] != ds.fixed[9]) vkCmdSetPrimitiveTopology(cmd, topo);
+    if (!ds.set || fixed[10] != ds.fixed[10]) vkCmdSetPrimitiveRestartEnable(cmd, restart ? VK_TRUE : VK_FALSE);
+    std::memcpy(ds.fixed, fixed, sizeof fixed);
+    ds.set = true;
     bool query = zcount && g_qpool && !g_qreset_needed && g_qused < QMAX;
     uint32_t qidx = 0;
     if (query) {
