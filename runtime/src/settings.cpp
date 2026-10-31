@@ -62,8 +62,8 @@ const std::vector<Option>& options() {
         {"game", "data_root", "GOWA_ROOT", Kind::Path, "", "Generated data folder", "Folder that contains bin/ and fw/ produced by tools/setup.py.", nullptr},
         {"game", "disc_dir", "GOWA_DISC_DIR", Kind::Path, "", "Game disc folder", "Extracted disc, the folder that contains PS3_GAME.", nullptr},
         {"game", "patch_dir", "GOWA_PATCH_DIR", Kind::Path, "", "Update folder", "Installed update BCES01741 (PARAM.SFO + USRDIR).", nullptr},
-        {"game", "fast_startup", "GOWA_TURBO", Kind::Choice, "3@15", "Fast startup", "Runs the logo and legal screens three times faster during the first 15 seconds (no sound meanwhile).",
-         "1=Off|3@15=On"},
+        {"game", "fast_startup", "GOWA_TURBO", Kind::Choice, "3@9", "Fast startup", "Runs the logo and legal screens three times faster during the first 9 seconds (no sound meanwhile).",
+         "1=Off|3@9=On"},
         {"game", "flash_dir", "GOWA_FLASH_DIR", Kind::Path, "", "dev_flash folder", "Optional: a PS3 dev_flash copy (fonts, system files).", nullptr},
         {"graphics", "resolution_scale", "GOWA_RES_SCALE", Kind::Choice, "1", "Internal resolution", "Render targets are scaled by this factor.",
          "1=720p (native)|1.5=1080p|2=1440p|3=2160p"},
@@ -117,6 +117,8 @@ bool load() {
         if (eq == std::string::npos) continue;
         g_values[section + "." + trim(line.substr(0, eq))] = trim(line.substr(eq + 1));
     }
+    auto turbo = g_values.find("game.fast_startup");
+    if (turbo != g_values.end() && turbo->second == "3@15") turbo->second = "3@9";
     return true;
 }
 

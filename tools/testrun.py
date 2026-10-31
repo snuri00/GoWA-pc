@@ -57,7 +57,7 @@ SCENARIOS = {
 }
 
 SCENARIO_ENV = {
-    "fight": {"GOWA_TURBO": "3@20"},
+    "fight": {"GOWA_TURBO": "3@9"},
 }
 
 
