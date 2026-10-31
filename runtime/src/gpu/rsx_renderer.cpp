@@ -1302,7 +1302,24 @@ VkCompareOp reversed_compare(uint32_t v) {
     }
 }
 
+VkSampler sampler_slow(const TextureRegs& t, uint32_t levels, bool shadow);
+
 VkSampler sampler(const TextureRegs& t, uint32_t levels, bool shadow) {
+    struct Memo {
+        uint32_t k[5];
+        VkSampler s;
+    };
+    static Memo memo[256];
+    uint32_t extra = levels | (shadow ? 0x100 : 0);
+    uint32_t h = (t.address * 0x9E3779B1u) ^ (t.control0 * 0x85EBCA77u) ^ (t.filter * 0xC2B2AE3Du) ^ (t.border * 0x27D4EB2Fu) ^ (extra * 0x165667B1u);
+    Memo& m = memo[(h ^ (h >> 16)) & 255];
+    if (m.s && m.k[0] == t.address && m.k[1] == t.control0 && m.k[2] == t.filter && m.k[3] == t.border && m.k[4] == extra) return m.s;
+    VkSampler s = sampler_slow(t, levels, shadow);
+    if (s) m = {{t.address, t.control0, t.filter, t.border, extra}, s};
+    return s;
+}
+
+VkSampler sampler_slow(const TextureRegs& t, uint32_t levels, bool shadow) {
     uint64_t key = fnv(&t.address, 4);
     key = fnv(&t.control0, 4, key);
     key = fnv(&t.filter, 4, key);
@@ -1849,6 +1866,7 @@ void dump_texture(const TextureRegs& t, uint32_t ea) {
 Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth) {
     g_bind_kind = "dummy";
     Binding b = bind_texture_impl(unit, dim, colors, depth);
+    if (!b.sampler) b.sampler = sampler(texture_regs(unit), 1, false);
     if (trace::on(trace::TEX)) {
         TextureRegs t = texture_regs(unit);
         static const char* kinds[] = {"dummy", "memory", "depth redirect", "feedback copy", "surface region", "depth surface", "color surface"};
@@ -1869,7 +1887,6 @@ Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& c
 Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth) {
     Binding b{g_dummy[dim].view, VK_NULL_HANDLE};
     TextureRegs t = texture_regs(unit);
-    b.sampler = sampler(t, 1, false);
     if (!(t.control0 >> 31)) return b;
     uint32_t loc = (t.format & 3) - 1;
     uint32_t code = ((t.format >> 8) & 0xFF) & ~0x60u;
@@ -2334,6 +2351,65 @@ void build_indices(std::vector<uint32_t>& raw, bool& inline_draw, uint32_t& inli
     }
 }
 
+bool fast_indices(RingAlloc& ib, uint32_t& count, uint32_t& vmin, uint32_t& vmax, VkPrimitiveTopology& topo) {
+    if (g_trace || !g_inline.empty() || !g_indexed || g_ranges.size() != 1 || (g_prim != 5 && g_prim != 6)) return false;
+    uint32_t dma = R(INDEX_ARRAY_DMA);
+    if (((dma >> 4) & 0xF) != 1) return false;
+    uint32_t ea = lv2::rsx_address(R(INDEX_ARRAY_ADDRESS), dma & 0xF);
+    if (!ea) return false;
+    ea &= ~1u;
+    auto [first, n] = g_ranges[0];
+    if (!readable(ea, uint64_t(first + n) * 2)) return false;
+    if (g_prim == 5) n -= n % 3;
+    if (!n) return false;
+    bool restart = R(RESTART_INDEX_ENABLE) != 0 && R(RESTART_INDEX) <= 0xFFFF;
+    uint32_t restart_value = R(RESTART_INDEX);
+    uint32_t base = R(VERTEX_BASE_INDEX);
+    if (!ring_alloc(uint64_t(n) * 4, 16, ib)) return false;
+    const uint8_t* src = vm::ptr(ea + first * 2);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(ib.ptr);
+    const __m256i swap = _mm256_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    const __m256i vbase = _mm256_set1_epi32(int32_t(base)), mask = _mm256_set1_epi32(0xFFFFF), rv = _mm256_set1_epi32(int32_t(restart_value));
+    __m256i lo_min = _mm256_set1_epi32(-1), hi_max = _mm256_setzero_si256(), hit = _mm256_setzero_si256();
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256i x = _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i * 2)), swap);
+        __m256i a = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(x));
+        __m256i b = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(x, 1));
+        if (restart) hit = _mm256_or_si256(hit, _mm256_or_si256(_mm256_cmpeq_epi32(a, rv), _mm256_cmpeq_epi32(b, rv)));
+        a = _mm256_and_si256(_mm256_add_epi32(a, vbase), mask);
+        b = _mm256_and_si256(_mm256_add_epi32(b, vbase), mask);
+        lo_min = _mm256_min_epu32(lo_min, _mm256_min_epu32(a, b));
+        hi_max = _mm256_max_epu32(hi_max, _mm256_max_epu32(a, b));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), a);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i + 8), b);
+    }
+    if (!_mm256_testz_si256(hit, hit)) return false;
+    alignas(32) uint32_t mn[8], mx[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(mn), lo_min);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(mx), hi_max);
+    uint32_t lo = ~0u, hi = 0;
+    for (uint32_t k = 0; k < 8; k++) {
+        lo = std::min(lo, mn[k]);
+        hi = std::max(hi, mx[k]);
+    }
+    for (; i < n; i++) {
+        uint16_t w;
+        std::memcpy(&w, src + i * 2, 2);
+        uint32_t v = __builtin_bswap16(w);
+        if (restart && v == restart_value) return false;
+        v = (v + base) & 0xFFFFF;
+        dst[i] = v;
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+    }
+    count = n;
+    vmin = lo;
+    vmax = hi;
+    topo = g_prim == 5 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    return true;
+}
+
 VkPrimitiveTopology expand(uint32_t prim, const std::vector<uint32_t>& in, std::vector<uint32_t>& out, bool& restart) {
     restart = false;
     out.clear();
@@ -2519,18 +2595,21 @@ bool draw() {
         return skip(__LINE__);
     }
     static std::vector<uint32_t> raw;
-    raw.clear();
     bool inline_draw = false;
     uint32_t inline_stride = 0;
     g_stats.phase[0] += ticks() - ph;
     ph = ticks();
-    build_indices(raw, inline_draw, inline_stride);
     static std::vector<uint32_t> indices;
     bool restart = false;
-    VkPrimitiveTopology topo = expand(g_prim, raw, indices, restart);
-    if (topo == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM || indices.empty()) return skip(__LINE__);
-    uint32_t vmin = ~0u, vmax = 0;
-    {
+    VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+    uint32_t vmin = ~0u, vmax = 0, index_count = 0;
+    RingAlloc ib;
+    bool fast_ib = fast_indices(ib, index_count, vmin, vmax, topo);
+    if (!fast_ib) {
+        raw.clear();
+        build_indices(raw, inline_draw, inline_stride);
+        topo = expand(g_prim, raw, indices, restart);
+        if (topo == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM || indices.empty()) return skip(__LINE__);
         const uint32_t* ip = indices.data();
         size_t n = indices.size();
         for (size_t i = 0; i < n; i++) {
@@ -2538,6 +2617,7 @@ bool draw() {
             vmin = std::min(vmin, v);
             vmax = std::max(vmax, v == RESTART ? 0u : v);
         }
+        index_count = static_cast<uint32_t>(n);
     }
     if (vmin > vmax || vmax - vmin > (1u << 20)) return skip(__LINE__);
     uint32_t vcount = vmax - vmin + 1;
@@ -2753,20 +2833,21 @@ bool draw() {
         if (gpu_check[i] && vdata[i]) edge_compute::add_check(gpu_check[i], vdata[i], vcount, check_ea[i]);
     g_stats.phase[3] += ticks() - ph;
     ph = ticks();
-    RingAlloc ib;
-    if (!ring_alloc(indices.size() * 4, 16, ib)) return skip(__LINE__);
+    if (!fast_ib) {
+        if (!ring_alloc(indices.size() * 4, 16, ib)) return skip(__LINE__);
+        std::memcpy(ib.ptr, indices.data(), indices.size() * 4);
+    }
     uint32_t* idx_out = reinterpret_cast<uint32_t*>(ib.ptr);
-    std::memcpy(idx_out, indices.data(), indices.size() * 4);
     static const char* geom_dir = std::getenv("GOWA_DUMP_GEOM");
     if (g_trace && geom_dir && vdata[0]) {
         char fn[512];
         std::snprintf(fn, sizeof fn, "%s/geom_%04u.bin", geom_dir, g_frame_draw);
         if (FILE* f = std::fopen(fn, "wb")) {
-            uint32_t hdr[8] = {0x4D4F4547u, g_frame_draw, g_prim, vcount, static_cast<uint32_t>(indices.size()), static_cast<uint32_t>(vstrides[0]), colors.empty() ? 0u : colors[0]->offset, R(COLOR_MASK)};
+            uint32_t hdr[8] = {0x4D4F4547u, g_frame_draw, g_prim, vcount, index_count, static_cast<uint32_t>(vstrides[0]), colors.empty() ? 0u : colors[0]->offset, R(COLOR_MASK)};
             std::fwrite(hdr, 4, 8, f);
             std::fwrite(&g_vp_constants[264 * 4], 4, 16, f);
             std::fwrite(vdata[0], 4, size_t(vstrides[0] ? vcount : 1) * 4, f);
-            std::fwrite(idx_out, 4, indices.size(), f);
+            std::fwrite(idx_out, 4, index_count, f);
             std::fclose(f);
         }
     }
@@ -2803,7 +2884,7 @@ bool draw() {
             (void)dummy;
         }
         LOG_INFO("rsx", "draw #%u prim %u idx %zu verts %u [%u..%u] targets %zu c0 0x%x fmt %u depth 0x%x %ux%u scissor %u,%u-%u,%u vs %.3f %.3f %.3f off %.3f %.3f %.3f fptex 0x%x inline %d blend 0x%x mask 0x%x omask 0x%x", g_frame_draw, g_prim,
-                 indices.size(), vcount, vmin, vmax, colors.size(), colors.empty() ? 0 : colors[0]->offset, R(SURFACE_FORMAT) & 0x1F, depth ? depth->offset : 0, w, h, x0, y0, x1, y1, vs.scale[0],
+                 size_t(index_count), vcount, vmin, vmax, colors.size(), colors.empty() ? 0 : colors[0]->offset, R(SURFACE_FORMAT) & 0x1F, depth ? depth->offset : 0, w, h, x0, y0, x1, y1, vs.scale[0],
                  vs.scale[1], vs.scale[2], vs.offset[0], vs.offset[1], vs.offset[2], fp->textures, inline_draw, k.blend_mask, k.write_masks, vs.flags[0]);
         (void)p0;
         TextureRegs t0 = texture_regs(0);
@@ -2822,11 +2903,11 @@ bool draw() {
             const float* d = vdata[i];
             LOG_INFO("rsx", "  input %u fmt 0x%x off 0x%x stride %u idxbuf 0x%x v0 %g %g %g %g", i, f, R(VERTEX_ARRAY_OFFSET + i * 4), unsigned(vstrides[i]), lv2::rsx_address(R(INDEX_ARRAY_ADDRESS), R(INDEX_ARRAY_DMA) & 0xF), d ? d[0] : 0, d ? d[1] : 0, d ? d[2] : 0, d ? d[3] : 0);
         }
-        if (vdata[0] && vstrides[0] == 16 && indices.size() >= 3) {
+        if (vdata[0] && vstrides[0] == 16 && index_count >= 3) {
             const float* m = &g_vp_constants[264 * 4];
             float wx[3], wy[3], ww[3];
             for (int k = 0; k < 3; k++) {
-                const float* v = vdata[0] + (indices[k] - vmin) * 4;
+                const float* v = vdata[0] + (idx_out[k] - vmin) * 4;
                 float cx = v[0] * m[0] + v[1] * m[4] + v[2] * m[8] + v[3] * m[12];
                 float cy = v[0] * m[1] + v[1] * m[5] + v[2] * m[9] + v[3] * m[13];
                 float cw = v[0] * m[3] + v[1] * m[7] + v[2] * m[11] + v[3] * m[15];
@@ -2995,7 +3076,7 @@ bool draw() {
     uint32_t draw_index = g_frame_draw++;
     static const bool skip_color_only = std::getenv("GOWA_SKIP_COLOR_ONLY") != nullptr;
     bool skip_draw = g_skip_init && draw_index >= g_skip_lo && draw_index <= g_skip_hi && (!skip_color_only || k.write_masks != 0);
-    if (!(g_experiment & 1) && !skip_draw) vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, -static_cast<int32_t>(vmin), 0);
+    if (!(g_experiment & 1) && !skip_draw) vkCmdDrawIndexed(cmd, index_count, 1, 0, -static_cast<int32_t>(vmin), 0);
     if (query) {
         vkCmdEndQuery(cmd, g_qpool, qidx);
         g_counter_queries.push_back(qidx);
