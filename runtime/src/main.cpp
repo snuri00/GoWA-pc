@@ -12,6 +12,7 @@
 
 #include "runtime/vfs.h"
 #include "runtime/settings.h"
+#include "runtime/session.h"
 #ifdef GOWA_HAVE_LAUNCHER
 #include "runtime/launcher.h"
 #endif
@@ -190,6 +191,7 @@ int main(int argc, char** argv) {
     if (launcher::wanted(argc, argv) && launcher::run() == launcher::Result::Quit) return 0;
 #endif
     settings::apply_env();
+    session::begin();
     crash::install();
     trace::init();
     critpath::init();

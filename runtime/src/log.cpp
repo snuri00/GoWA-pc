@@ -19,6 +19,7 @@ namespace {
 std::mutex g_lock;
 std::atomic<int> g_level{static_cast<int>(Level::Info)};
 FILE* g_file = nullptr;
+FILE* g_mirror = nullptr;
 const auto g_start = std::chrono::steady_clock::now();
 
 const char* tag(Level l) {
@@ -35,6 +36,23 @@ const char* tag(Level l) {
 }
 
 void set_level(Level level) { g_level = static_cast<int>(level); }
+
+void mirror_to(const char* path) {
+    std::lock_guard lk(g_lock);
+    if (g_mirror) std::fclose(g_mirror);
+    g_mirror = std::fopen(path, "w");
+    if (!g_mirror) return;
+    if (g_file) {
+        std::fflush(g_file);
+        if (FILE* f = std::fopen("gowa.log", "r")) {
+            char buf[65536];
+            size_t n;
+            while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) std::fwrite(buf, 1, n, g_mirror);
+            std::fclose(f);
+        }
+    }
+    std::fflush(g_mirror);
+}
 
 bool enabled(Level level) { return static_cast<int>(level) >= g_level.load(std::memory_order_relaxed); }
 
@@ -54,9 +72,14 @@ void write(Level level, const char* channel, const char* fmt, ...) {
         std::fwrite(line, 1, n, g_file);
         if (level >= Level::Info) std::fflush(g_file);
     }
+    if (g_mirror) {
+        std::fwrite(line, 1, n, g_mirror);
+        if (level >= Level::Info) std::fflush(g_mirror);
+    }
     if (level >= Level::Info) std::fwrite(line, 1, n, stderr);
     if (level == Level::Fatal) {
         if (g_file) std::fflush(g_file);
+        if (g_mirror) std::fflush(g_mirror);
         std::abort();
     }
 }

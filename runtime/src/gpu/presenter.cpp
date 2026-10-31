@@ -87,6 +87,7 @@ struct State {
 State g;
 std::atomic<bool> g_enabled{false};
 double g_last_fence_ms = 0.0;
+double g_last_gpu_ms = 0.0;
 uint64_t g_cmd_generation = 0;
 
 float window_scale() {
@@ -375,7 +376,10 @@ void begin_frame() {
     static double gpu_total = 0;
     if (g.gpu_time && g.gpu_time_valid) {
         uint64_t ts[2] = {};
-        if (vkGetQueryPoolResults(g.device, g.gpu_time, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0]) gpu_total += double(ts[1] - ts[0]) * g.ts_period * 1e-6;
+        if (vkGetQueryPoolResults(g.device, g.gpu_time, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0]) {
+            g_last_gpu_ms = double(ts[1] - ts[0]) * g.ts_period * 1e-6;
+            gpu_total += g_last_gpu_ms;
+        }
     }
     if (++n % 60 == 0) {
         LOG_INFO("gpu", "fence wait %.2f ms, gpu %.2f ms per frame", total / 60.0, gpu_total / 60.0);
@@ -432,6 +436,8 @@ void convert(const DisplayBuffer& d) {
 bool enabled() { return g_enabled; }
 
 double last_fence_wait_ms() { return g_last_fence_ms; }
+
+double last_gpu_ms() { return g_last_gpu_ms; }
 
 uint64_t cmd_generation() { return g_cmd_generation; }
 

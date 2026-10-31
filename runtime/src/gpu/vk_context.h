@@ -30,6 +30,7 @@ uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags flags);
 void image_barrier(VkCommandBuffer cmd, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to);
 void present_image(VkImage img, VkImageLayout& layout, uint32_t w, uint32_t h);
 double last_fence_wait_ms();
+double last_gpu_ms();
 void submit_partial();
 uint64_t cmd_generation();
 

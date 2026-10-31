@@ -1,5 +1,6 @@
 #include "runtime/placement.h"
 #include "runtime/host.h"
+#include "runtime/session.h"
 #include <immintrin.h>
 #include "gpu/presenter.h"
 #include "motion_vectors.h"
@@ -3712,12 +3713,49 @@ bool present(uint32_t buffer_id) {
     schedule_writebacks();
     static uint64_t presents = 0;
     static const double slow_ms = std::getenv("GOWA_SLOW_FRAME_MS") ? std::atof(std::getenv("GOWA_SLOW_FRAME_MS")) : 0.0;
-    if (slow_ms > 0.0) {
+    static FILE* frames_out = [] {
+        FILE* f = session::open("frames.bin");
+        if (f) {
+            const char magic[8] = {'G', 'F', 'R', 'M', '1', 0, 0, 0};
+            std::fwrite(magic, 1, 8, f);
+        }
+        return f;
+    }();
+    if (slow_ms > 0.0 || frames_out) {
         static uint64_t last = 0;
         Stats& prev = g_slow_prev;
         uint64_t now = ticks();
         double ms = 1000.0 / double(host::qpf());
-        if (last && double(now - last) * ms >= slow_ms) {
+        if (frames_out && last) {
+            const Stats& s = g_stats;
+            struct {
+                double t;
+                float gap, draw, tex, vertices, indices, bind, record, copy, complete, present, fence, gpu;
+                uint32_t draws, skipped, uploads, upload_kb, pipelines, copies;
+            } rec{logging::uptime(),
+                  float(double(now - last) * ms),
+                  float(double(s.draw_ticks - prev.draw_ticks) * ms),
+                  float(double(s.tex_ticks - prev.tex_ticks) * ms),
+                  float(double(s.phase[3] - prev.phase[3]) * ms),
+                  float(double(s.phase[1] - prev.phase[1]) * ms),
+                  float(double(s.phase[7] - prev.phase[7]) * ms),
+                  float(double(s.phase[6] - prev.phase[6]) * ms),
+                  float(double(s.copy_ticks - prev.copy_ticks) * ms),
+                  float(double(s.complete_ticks - prev.complete_ticks) * ms),
+                  float(double(s.present_ticks - prev.present_ticks) * ms),
+                  float(last_fence_wait_ms()),
+                  float(last_gpu_ms()),
+                  uint32_t(s.draws - prev.draws),
+                  uint32_t(s.skipped - prev.skipped),
+                  uint32_t(s.upload_frame - prev.upload_frame),
+                  uint32_t((s.upload_bytes - prev.upload_bytes) >> 10),
+                  uint32_t(s.pipelines - prev.pipelines),
+                  uint32_t(s.copies - prev.copies)};
+            std::fwrite(&rec, sizeof rec, 1, frames_out);
+            static uint32_t n = 0;
+            if (++n % 120 == 0) std::fflush(frames_out);
+        }
+        if (slow_ms > 0.0 && last && double(now - last) * ms >= slow_ms) {
             const Stats& s = g_stats;
             LOG_INFO("slowframe", "present gap %.1f ms: draw %.1f (tex %.1f, hash %.1f), present %.1f, fence %.1f, draws %llu, pipelines %llu, uploads %llu (%.1f MB), copies %llu",
                      double(now - last) * ms, double(s.draw_ticks - prev.draw_ticks) * ms, double(s.tex_ticks - prev.tex_ticks) * ms, double(s.hash_ticks - prev.hash_ticks) * ms,

@@ -8,6 +8,7 @@ enum class Level { Trace, Debug, Info, Warning, Error, Fatal };
 
 void write(Level level, const char* channel, const char* fmt, ...);
 void set_level(Level level);
+void mirror_to(const char* path);
 bool enabled(Level level);
 double uptime();
 unsigned long long uptime_ns();

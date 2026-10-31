@@ -80,6 +80,8 @@ const std::vector<Option>& options() {
         {"performance", "thread_placement", "GOWA_PLACE", Kind::Choice, "", "Thread placement", "Pins game threads to CPU cores.", "=Automatic|off=Operating system"},
         {"performance", "spu_park", "GOWA_SPU_PARK", Kind::Bool, "0", "Park idle SPU threads", "Lower CPU use and heat; can cost a few FPS.", nullptr},
         {"advanced", "native_video", "GOWA_VDEC_HLE", Kind::Bool, "1", "Native video decoding", "Decode cutscene videos on the host instead of emulated SPUs.", nullptr},
+        {"advanced", "record_session", "GOWA_SESSION", Kind::Bool, "0", "Record session for analysis",
+         "Writes frame timings, job waits and CPU use to sessions/<date> (a few GB per hour, costs a few FPS).", nullptr},
         {"advanced", "log_level", "GOWA_LOG", Kind::Choice, "", "Log level", "More detail in gowa.log for bug reports.", "=Normal|debug=Debug|trace=Trace"},
         {"launcher", "show_at_start", nullptr, Kind::Bool, "1", "Show this launcher at start", "Start the game with --launcher to open it anyway.", nullptr},
     };
