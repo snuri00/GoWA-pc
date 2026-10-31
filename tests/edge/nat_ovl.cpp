@@ -4,7 +4,7 @@
 #include "unit.h"
 
 #include <immintrin.h>
-#include <intrin.h>
+#include <immintrin.h>
 
 #include <cstdio>
 #include <cstring>

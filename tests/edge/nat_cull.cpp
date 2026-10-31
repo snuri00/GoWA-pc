@@ -66,7 +66,7 @@ CommandReg cmd_reg("cunit", cmd_cunit);
 
 }
 
-#include <windows.h>
+#include <x86intrin.h>
 
 namespace {
 
@@ -94,10 +94,9 @@ int cmd_cbench(const std::vector<std::string>& args) {
             spu::Context c = h.before.regs;
             c.ls = work.data();
             edge::Outputs outs;
-            ULONG64 t0 = 0, t1 = 0;
-            QueryThreadCycleTime(GetCurrentThread(), &t0);
+            uint64_t t0 = __rdtsc();
             nat(work.data(), c, outs);
-            QueryThreadCycleTime(GetCurrentThread(), &t1);
+            uint64_t t1 = __rdtsc();
             best = std::min<uint64_t>(best, t1 - t0);
         }
         best_sum += best;

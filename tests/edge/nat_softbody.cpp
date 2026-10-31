@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include <intrin.h>
+#include <immintrin.h>
 
 namespace {
 
