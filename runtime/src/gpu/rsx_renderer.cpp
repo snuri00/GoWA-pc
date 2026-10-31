@@ -1305,9 +1305,9 @@ VkSampler sampler(const TextureRegs& t, uint32_t levels, bool shadow) {
     si.addressModeV = wrap_mode((t.address >> 8) & 0xF);
     si.addressModeW = wrap_mode((t.address >> 16) & 0xF);
     int32_t bias = static_cast<int32_t>(t.filter << 19) >> 19;
-    si.mipLodBias = bias / 256.0f;
-    float min_lod = ((t.control0 >> 19) & 0xFFF) / 256.0f;
-    float max_lod = ((t.control0 >> 7) & 0xFFF) / 256.0f;
+    si.mipLodBias = float((bias + 16) >> 5) / 8.0f;
+    float min_lod = float(((t.control0 >> 19) & 0xFFF) >> 6) / 4.0f;
+    float max_lod = float((((t.control0 >> 7) & 0xFFF) + 63) >> 6) / 4.0f;
     si.minLod = mips ? std::min(min_lod, float(levels - 1)) : 0.0f;
     si.maxLod = mips ? std::min(max_lod, float(levels - 1)) : 0.0f;
     uint32_t aniso = (t.control0 >> 4) & 7;
