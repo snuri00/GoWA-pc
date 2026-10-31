@@ -3,19 +3,25 @@ project(cloth_shadows_tests LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 get_filename_component(GOWA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(GOWA_GEN "${GOWA_ROOT}/out/gen/spu" CACHE PATH "Generated native SPU sources (tools/setup.py)")
 set(EDGE_DIR ${GOWA_ROOT}/tests/edge)
-set(CS_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-frounding-math /EHsc /O2)
+if(MSVC)
+    set(CS_FLAGS /clang:-march=x86-64-v3 /clang:-ffp-contract=off /clang:-fno-strict-aliasing /clang:-frounding-math /EHsc /O2)
+else()
+    set(CS_FLAGS -march=x86-64-v3 -ffp-contract=off -fno-strict-aliasing -frounding-math -O2)
+endif()
 
 add_library(cs_spu STATIC
     ${GOWA_ROOT}/runtime/src/spu/interpreter.cpp
     ${GOWA_ROOT}/runtime/src/ppu_ops.cpp
     ${GOWA_ROOT}/runtime/src/reservation.cpp
     ${GOWA_ROOT}/runtime/src/memory.cpp
-    ${GOWA_ROOT}/runtime/src/log.cpp)
+    ${GOWA_ROOT}/runtime/src/log.cpp
+    ${GOWA_ROOT}/runtime/src/host.cpp)
 target_include_directories(cs_spu PUBLIC ${GOWA_ROOT}/runtime/include ${GOWA_ROOT}/out/include)
 target_compile_options(cs_spu PRIVATE ${CS_FLAGS})
 
