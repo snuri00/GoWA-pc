@@ -7,6 +7,9 @@
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <algorithm>
+#include <cstdio>
+#include <string>
 
 namespace edge::gpu {
 
@@ -126,6 +129,57 @@ void materialize(uint8_t* ls, int reason) {
 
 thread_local bool t_armed = false;
 const bool g_active = g_mode != kOff;
+const bool g_mix = std::getenv("GOWA_EDGE_MIX") != nullptr;
+
+namespace {
+
+struct MixStat {
+    uint64_t jobs = 0, verts = 0;
+};
+
+std::mutex g_mix_m;
+std::map<std::string, MixStat> g_mix_stats;
+thread_local std::string t_mix;
+thread_local uint32_t t_mix_nv = 0;
+
+}
+
+void mix_job() {
+    if (t_mix.empty()) return;
+    std::lock_guard lk(g_mix_m);
+    MixStat& s = g_mix_stats[t_mix];
+    s.jobs++;
+    s.verts += t_mix_nv;
+    t_mix.clear();
+    t_mix_nv = 0;
+}
+
+void mix_note(const char* tag, int id, uint32_t n) {
+    if (!t_mix.empty()) t_mix += ' ';
+    t_mix += tag;
+    if (id >= 0) t_mix += std::to_string(id);
+    if (n > t_mix_nv) t_mix_nv = n;
+}
+
+std::string mix_report() {
+    mix_job();
+    std::lock_guard lk(g_mix_m);
+    std::vector<std::pair<uint64_t, std::string>> v;
+    uint64_t total = 0;
+    for (auto& [k, s] : g_mix_stats) {
+        v.push_back({s.jobs, k});
+        total += s.jobs;
+    }
+    std::sort(v.rbegin(), v.rend());
+    std::string out;
+    for (auto& [n, k] : v) {
+        const MixStat& s = g_mix_stats[k];
+        char b[96];
+        std::snprintf(b, sizeof b, "%6llu jobs %5.1f%% %6.0f verts/job  ", (unsigned long long)n, 100.0 * double(n) / double(total ? total : 1), double(s.verts) / double(n));
+        out += b + k + "\n";
+    }
+    return out;
+}
 
 void* state_save() { return new Pending(t_p); }
 

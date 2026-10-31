@@ -68,6 +68,7 @@ namespace ad_index {
 bool dcb0(uint8_t* ls, spu::Context& c, Outputs& outs) {
     uint32_t src = c.gpr[4].u32[3], sp = c.gpr[1].u32[3] & 0x3fff0;
     if (sp < 0x2000 || !decompress_indexes_safe(ls, c.gpr[3].u32[3] & 0x3fff0, src, sp - 0x1000)) return false;
+    if (gpu::g_mix) gpu::mix_note("I", -1, 0);
     decompress_indexes(ls, c.gpr[3].u32[3] & 0x3fff0, c.gpr[4].u32[3], &outs);
     return true;
 }
@@ -103,6 +104,7 @@ bool d618(uint8_t* ls, spu::Context& c, Outputs& outs) {
     be_quad(in.r82, c.gpr[82]);
     be_quad(in.r126, c.gpr[126]);
     if (gpu::mode()) gpu::touch_all(ls, 5);
+    if (gpu::g_mix) gpu::mix_note("C", -1, 0);
     int32_t n = force_gen ? -1 : cull_triangles(ls, in);
     if (n < 0) return run_gen<xo::f_0d618>(ls, c, outs);
     c.gpr[3].vi = _mm_set1_epi32(n);
@@ -112,6 +114,7 @@ bool d618(uint8_t* ls, spu::Context& c, Outputs& outs) {
 bool x73e0(uint8_t* ls, spu::Context& c, Outputs& outs) {
     static const bool use_gen = std::getenv("EDGE_SB_GEN") != nullptr;
     if (gpu::mode()) gpu::touch_all(ls, 6);
+    if (gpu::g_mix) gpu::mix_note("B", -1, 0);
     if (use_gen) return run_gen<xo::f_073e0>(ls, c, outs);
     uint32_t sp = c.gpr[1].u32[3];
     if ((sp & 15) || sp < 0x2000 || sp > 0x3ffc0 || c.gpr[8].u32[3] != 0 || c.gpr[11].u32[3] > 0x2000) return false;
@@ -135,6 +138,7 @@ bool e550(uint8_t* ls, spu::Context& c, Outputs&) {
     uint32_t sp = c.gpr[1].u32[3];
     if ((sp & 15) || sp < 0x1000 || sp > 0x3ffc0 || ctx < 0x10000 || ctx + 0x200 > 0x40000) return false;
     if (gpu::mode()) gpu::touch_all(ls, 4);
+    if (gpu::g_mix) gpu::mix_note("S", -1, 0);
     uint32_t q96[4];
     for (int i = 0; i < 4; i++) q96[i] = rbe32(ls + ctx + 96 + 4 * i);
     if (!skin_vertexes(ls, ctx, c.gpr[4].u32[3], c.gpr[5].u32[3], c.gpr[6].u32[3], sp - 0x1000)) return false;
@@ -192,6 +196,7 @@ bool d158(uint8_t* ls, spu::Context& c, Outputs& outs) {
     uint32_t sp = c.gpr[1].u32[3] & 0x3fff0;
     if (sp < 0x2000) return false;
     if (gpu::mode()) gpu::before_compress(ls, ctx, id);
+    if (gpu::g_mix) gpu::mix_note("K", id, 0);
     if (!compress_vertexes(ls, ctx, id, r3, &outs, &called, sp - 0x1000)) return false;
     if (gpu::mode()) gpu::after_compress(ls, ctx);
     uint32_t regs[128][4];
@@ -214,6 +219,7 @@ bool dbc8(uint8_t* ls, spu::Context& c, Outputs& outs) {
     if (!nv || !r8) return true;
     int ov = vdecomp_identify(ls, r8);
     if (ov < 0) return false;
+    if (gpu::g_mix) gpu::mix_note("D", ov, nv);
     VdRegs regs;
     auto put = [&](uint8_t* d, int r) {
         for (int j = 0; j < 4; j++) {
@@ -257,6 +263,7 @@ bool f538(uint8_t* ls, spu::Context& c, Outputs&) {
     uint32_t q[4];
     uint32_t n = c.gpr[3].u32[3];
     if (!n) return true;
+    if (gpu::g_mix) gpu::mix_note("T", -1, 0);
     if (gpu::mode() && gpu::defer_transform(ls, n, c.gpr[4].u32[3] & 0x3ffff, c.gpr[5].u32[3] & 0x3ffff, c.gpr[6].u32[3] & 0x3fff0, q)) {
         set_r3(c, q);
         return true;
@@ -278,6 +285,7 @@ bool a880(uint8_t* ls, spu::Context& c, Outputs&) {
     save_lr(ls, c);
     store_quad(ls, sp - 112, c.gpr[1]);
     uint32_t ctx = c.gpr[3].u32[3] & 0x3fff0;
+    if (gpu::g_mix) gpu::mix_note("N", -1, 0);
     if (rbe32(ls + ctx + 100) && rbe32(ls + ctx + 104) && !rbe32(ls + ctx + 96)) {
         spu::v128 lr{}, r1 = c.gpr[1];
         lr.u32[3] = 0xad88;
@@ -294,6 +302,7 @@ bool a880(uint8_t* ls, spu::Context& c, Outputs&) {
 bool bbc8(uint8_t* ls, spu::Context& c, Outputs&) {
     if (c.gpr[4].u32[3] > 0x10000) return false;
     if (gpu::mode()) gpu::touch(ls, c.gpr[3].u32[3] & 0x3fff0, (c.gpr[3].u32[3] & 0x3fff0) + 16 * ((c.gpr[4].u32[3] + 7) & ~7u), 7);
+    if (gpu::g_mix) gpu::mix_note("Z", -1, 0);
     uint32_t q[4], n[4];
     for (int i = 0; i < 4; i++) n[i] = c.gpr[4].u32[3 - i];
     if (!normalize_vertexes(ls, c.gpr[3].u32[3], n, q)) return false;
@@ -303,6 +312,7 @@ bool bbc8(uint8_t* ls, spu::Context& c, Outputs&) {
 
 bool x88b0(uint8_t* ls, spu::Context& c, Outputs&) {
     if ((c.gpr[3].u32[3] & 0x3fff0) + 0x200 > 0x40000 || c.gpr[1].u32[3] < 0x1000 || c.gpr[1].u32[3] > 0x3ffc0) return false;
+    if (gpu::g_mix) gpu::mix_job();
     {
         uint32_t spv = c.gpr[1].u32[3];
         const int rs[] = {3, 4, 5, 6, 7, 15, 16, 17};

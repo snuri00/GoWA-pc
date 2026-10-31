@@ -1389,6 +1389,7 @@ int main(int argc, char** argv) {
         std::sort(v.rbegin(), v.rend());
         for (size_t i = 0; i < v.size() && i < 40; i++) std::printf("  exit %05x %llu\n", v[i].second, (unsigned long long)v[i].first);
     }
+    if (edge::gpu::g_mix) std::printf("edge job mix:\n%s", edge::gpu::mix_report().c_str());
     if (edge::gpu::mode()) {
         edge::gpu::Stats st = edge::gpu::stats();
         std::printf("edge gpu: deferred %llu confirmed %llu published %llu dropped %llu materialized", (unsigned long long)st.deferred, (unsigned long long)st.confirmed, (unsigned long long)st.published, (unsigned long long)st.dropped);
