@@ -2,6 +2,11 @@
 #include "runtime/host.h"
 #include "runtime/session.h"
 #include <immintrin.h>
+#ifdef _WIN32
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 #include "gpu/presenter.h"
 #include "motion_vectors.h"
 #include "dlssg.h"
@@ -413,10 +418,16 @@ struct Stats {
 } g_stats;
 Stats g_slow_prev;
 
-uint64_t ticks() {
-    uint64_t v;
-    v = host::qpc();
-    return static_cast<uint64_t>(v);
+uint64_t ticks() { return __rdtsc(); }
+
+double tick_hz() {
+    static const double hz = [] {
+        uint64_t q0 = host::qpc(), t0 = __rdtsc();
+        while (host::qpc() - q0 < host::qpf() / 200) _mm_pause();
+        uint64_t q1 = host::qpc(), t1 = __rdtsc();
+        return double(t1 - t0) * double(host::qpf()) / double(q1 - q0);
+    }();
+    return hz;
 }
 
 uint32_t R(uint32_t method) { return g_regs[(method >> 2) & 0x3FFF]; }
@@ -3190,7 +3201,8 @@ struct Writeback {
     uint32_t bpp;
 };
 
-std::vector<Writeback> g_writebacks;
+std::vector<Writeback> g_writebacks[2];
+bool g_complete_all = true;
 
 uint32_t format_bytes(VkFormat f);
 
@@ -3348,12 +3360,12 @@ void schedule_writebacks() {
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         c.imageExtent = {s->width, s->height, 1};
         vkCmdCopyImageToBuffer(frame_cmd(), s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, a.buffer, 1, &c);
-        g_writebacks.push_back({a.ptr, ea, pitch, s->width, s->height, bpp});
+        g_writebacks[frame_serial() & 1].push_back({a.ptr, ea, pitch, s->width, s->height, bpp});
     }
 }
 
-void complete_writebacks() {
-    for (const Writeback& w : g_writebacks) {
+void complete_writebacks(std::vector<Writeback>& list) {
+    for (const Writeback& w : list) {
         for (uint32_t y = 0; y < w.height; y++) {
             const uint8_t* src = w.data + uint64_t(y) * w.width * w.bpp;
             uint8_t* dst = vm::ptr(w.ea + y * w.pitch);
@@ -3386,7 +3398,7 @@ void complete_writebacks() {
             }
         }
     }
-    g_writebacks.clear();
+    list.clear();
 }
 
 void set_immediate(uint32_t attr, const float* v, uint32_t n) {
@@ -3502,7 +3514,10 @@ void frame_complete_body();
 
 void sync_decodes() { g_texture_pool.sync(); }
 
-void frame_complete() {
+uint32_t needs_full_wait() { return (g_dumps.empty() ? 0u : 2u) | (g_qpool && g_qused ? 4u : 0u) | (mv::pending() ? 8u : 0u) | (edge_compute::enabled() ? 16u : 0u); }
+
+void frame_complete(bool all) {
+    g_complete_all = all;
     g_texture_pool.sync();
     uint64_t complete_start = ticks();
     frame_complete_body();
@@ -3528,22 +3543,53 @@ void frame_complete_body() {
     }
     edge_compute::frame_complete();
     resolve_zpass();
-    complete_writebacks();
+    uint64_t serial = frame_serial();
+    complete_writebacks(g_writebacks[(serial + 1) & 1]);
+    if (g_complete_all) complete_writebacks(g_writebacks[serial & 1]);
     complete_dumps();
     mv::complete();
     if (!std::getenv("GOWA_NO_GC")) collect_garbage();
 }
 
+namespace {
+
+inline void vp_word(uint32_t arg) {
+    uint32_t load = R(TRANSFORM_PROGRAM_LOAD);
+    if (g_vp_load_word / 4 != load && (g_vp_load_word % 4) == 0) g_vp_load_word = load * 4;
+    if (g_vp_load_word < 544 * 4 && g_vp_ucode[g_vp_load_word] != arg) {
+        g_vp_ucode[g_vp_load_word] = arg;
+        g_vp_ucode_serial++;
+    }
+    g_vp_load_word++;
+    g_regs[(TRANSFORM_PROGRAM_LOAD >> 2)] = g_vp_load_word / 4;
+}
+
+}
+
+uint32_t method_run(uint32_t reg, const uint32_t* args, uint32_t n) {
+    if (g_trace) return 0;
+    if (reg == 0x0100) return 1;
+    if (reg >= TRANSFORM_CONSTANT && reg < TRANSFORM_CONSTANT + 128) {
+        uint32_t k = std::min<uint32_t>(n, (TRANSFORM_CONSTANT + 128 - reg) >> 2);
+        uint32_t idx = R(TRANSFORM_CONSTANT_LOAD) * 4 + ((reg - TRANSFORM_CONSTANT) >> 2);
+        uint32_t m = idx < 468 * 4 ? std::min<uint32_t>(k, 468 * 4 - idx) : 0;
+        if (m && std::memcmp(&g_vp_constants[idx], args, m * 4) != 0) {
+            std::memcpy(&g_vp_constants[idx], args, m * 4);
+            g_vp_constants_dirty = true;
+        }
+        return k;
+    }
+    if (reg >= TRANSFORM_PROGRAM && reg < TRANSFORM_PROGRAM + 128) {
+        uint32_t k = std::min<uint32_t>(n, (TRANSFORM_PROGRAM + 128 - reg) >> 2);
+        for (uint32_t i = 0; i < k; i++) vp_word(args[i]);
+        return k;
+    }
+    return 0;
+}
+
 void method(uint32_t reg, uint32_t arg) {
     if (reg >= TRANSFORM_PROGRAM && reg < TRANSFORM_PROGRAM + 128) {
-        uint32_t load = R(TRANSFORM_PROGRAM_LOAD);
-        if (g_vp_load_word / 4 != load && (g_vp_load_word % 4) == 0) g_vp_load_word = load * 4;
-        if (g_vp_load_word < 544 * 4 && g_vp_ucode[g_vp_load_word] != arg) {
-            g_vp_ucode[g_vp_load_word] = arg;
-            g_vp_ucode_serial++;
-        }
-        g_vp_load_word++;
-        g_regs[(TRANSFORM_PROGRAM_LOAD >> 2)] = g_vp_load_word / 4;
+        vp_word(arg);
         return;
     }
     if (reg == TRANSFORM_PROGRAM_LOAD) g_vp_load_word = arg * 4;
@@ -3551,7 +3597,7 @@ void method(uint32_t reg, uint32_t arg) {
     if (reg >= TRANSFORM_CONSTANT && reg < TRANSFORM_CONSTANT + 128) {
         uint32_t idx = R(TRANSFORM_CONSTANT_LOAD) * 4 + ((reg - TRANSFORM_CONSTANT) >> 2);
         if (g_trace && idx < 8) LOG_INFO("rsx", "  const write idx %u reg 0x%x load %u arg 0x%08x", idx, reg, R(TRANSFORM_CONSTANT_LOAD), arg);
-        if (idx < 468 * 4) {
+        if (idx < 468 * 4 && std::memcmp(&g_vp_constants[idx], &arg, 4) != 0) {
             std::memcpy(&g_vp_constants[idx], &arg, 4);
             g_vp_constants_dirty = true;
         }
@@ -3725,7 +3771,7 @@ bool present(uint32_t buffer_id) {
         static uint64_t last = 0;
         Stats& prev = g_slow_prev;
         uint64_t now = ticks();
-        double ms = 1000.0 / double(host::qpf());
+        double ms = 1000.0 / tick_hz();
         if (frames_out && last) {
             const Stats& s = g_stats;
             struct {
@@ -3788,9 +3834,7 @@ bool present(uint32_t buffer_id) {
     if (g_trace) g_trace_serial++;
     if (g_trace) g_trace_draws = 0;
     if (presents % 60 == 0) {
-        uint64_t f;
-        f = host::qpf();
-        double ms = 1000.0 / double(f) / 60.0;
+        double ms = 1000.0 / tick_hz() / 60.0;
         LOG_INFO("rsx", "renderer per frame: draw %.2f ms (textures %.2f ms), present %.2f ms, frame complete %.2f ms, copy engine %.2f ms", g_stats.draw_ticks * ms, g_stats.tex_ticks * ms,
                  g_stats.present_ticks * ms, g_stats.complete_ticks * ms, g_stats.copy_ticks * ms);
         g_stats.complete_ticks = g_stats.copy_ticks = 0;

@@ -15,7 +15,7 @@ FLIP_RE = re.compile(r"^. +([0-9.]+) .*rsx: flip (\d+) .*worst ([0-9.]+) ms", re
 DRAWS_RE = re.compile(r"^. +([0-9.]+) .*rsx: renderer: (\d+) draws", re.M)
 GPU_RE = re.compile(r"^. +([0-9.]+) .*gpu: fence wait ([0-9.]+) ms(?:, gpu ([0-9.]+) ms)?", re.M)
 REC_RE = re.compile(r"^. +([0-9.]+) .*rsx: renderer per frame: draw ([0-9.]+) ms", re.M)
-FIFO_RE = re.compile(r"^. +([0-9.]+) .*rsx: fifo 5s: busy ([0-9.]+)%, idle [0-9.]+%, ([0-9.]+) idle sleeps/s", re.M)
+FIFO_RE = re.compile(r"^. +([0-9.]+) .*rsx: fifo 5s: busy ([0-9.]+)%, idle [0-9.]+%, (?:semaphore wait [0-9.]+% \([0-9]+/s\), )?([0-9.]+) idle sleeps/s", re.M)
 CENSUS_RE = re.compile(r"^. +([0-9.]+) .*census: process cpu (\d+)%.*?\[RSX FIFO#\d+ (\d+)%u (\d+)%k\]", re.M)
 
 
