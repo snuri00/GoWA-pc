@@ -50,6 +50,7 @@ struct Cmd {
 };
 
 bool parse(uint32_t cmd_ea, uint32_t cmd_size, Cmd& out);
+void prof_report(uint64_t jobs);
 bool edge_shape(const Cmd& c);
 
 struct JobRef {

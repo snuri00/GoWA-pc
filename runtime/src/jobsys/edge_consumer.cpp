@@ -657,6 +657,7 @@ void stats_line() {
     last_fb = fbk;
     static uint64_t l_dec = 0, l_lab = 0, l_oth = 0;
     uint64_t vd = g_st.decr.load(), vl = g_st.labg.load(), vo = g_st.othr.load();
+    prof_report(d[0]);
     LOG_INFO("jsedge", "5s per edge job: %.1f decrementer reads, %.2f label GETs, %.1f other channel reads", double(vd - l_dec) / jn, double(vl - l_lab) / jn, double(vo - l_oth) / jn);
     l_dec = vd;
     l_lab = vl;

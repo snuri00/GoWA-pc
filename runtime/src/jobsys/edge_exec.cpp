@@ -8,7 +8,12 @@
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -19,6 +24,45 @@
 namespace jsedge {
 
 namespace {
+
+const bool g_prof = [] {
+    const char* e = std::getenv("GOWA_JOBSYS_EDGE_PROF");
+    return e && *e && e[0] != '0';
+}();
+
+struct ProfEntry {
+    std::atomic<const char*> name{nullptr};
+    std::atomic<uint64_t> ticks{0}, calls{0};
+};
+
+ProfEntry g_prof_tab[512];
+thread_local uint64_t t_dma = 0;
+
+void prof_add(const char* name, uint64_t ticks) {
+    uint32_t h = static_cast<uint32_t>((reinterpret_cast<uintptr_t>(name) >> 3) * 2654435761u) & 511;
+    for (uint32_t i = 0; i < 512; i++) {
+        ProfEntry& e = g_prof_tab[(h + i) & 511];
+        const char* cur = e.name.load(std::memory_order_relaxed);
+        if (!cur) {
+            if (!e.name.compare_exchange_strong(cur, name)) {
+                if (cur != name) continue;
+            }
+        } else if (cur != name) {
+            continue;
+        }
+        e.ticks.fetch_add(ticks, std::memory_order_relaxed);
+        e.calls.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+}
+
+struct DmaTimer {
+    uint64_t t0;
+    DmaTimer() : t0(g_prof ? __rdtsc() : 0) {}
+    ~DmaTimer() {
+        if (g_prof) t_dma += __rdtsc() - t0;
+    }
+};
 
 uint32_t be32(const uint8_t* p) {
     uint32_t v;
@@ -101,6 +145,7 @@ struct FastHost final : spu::Host {
         }
     }
     void get(uint32_t lsa, uint32_t ea, uint32_t size) {
+        DmaTimer dt;
         hc.gets++;
         if (ea - 0x50300c80u < 0xa0u) hc.label_gets++;
         hc.get_bytes += size;
@@ -116,6 +161,7 @@ struct FastHost final : spu::Host {
         if (rsv::copy_range_if_changed(ea, t.ls + lsa, size, lo, hi)) t.mark_ls(lsa + lo, hi - lo);
     }
     void put(uint32_t lsa, uint32_t ea, uint32_t size) {
+        DmaTimer dt;
         hc.puts++;
         hc.put_bytes += size;
         rsv::store_range(ea, t.ls + (lsa & 0x3FFFF), size);
@@ -333,7 +379,9 @@ Fast fast_loop(spu::SpuThread& t, spu::Host& h, ApiState& api, std::vector<const
         c.pc = pc;
         if (pc == kJobRet) return Fast::Done;
         if (pc < 0x4000) {
+            uint64_t a0 = g_prof ? __rdtsc() : 0;
             if (!api_call(c, api)) return Fast::Fallback;
+            if (g_prof) prof_add("jobapi", __rdtsc() - a0);
             continue;
         }
         dispatches++;
@@ -351,7 +399,9 @@ Fast fast_loop(spu::SpuThread& t, spu::Host& h, ApiState& api, std::vector<const
         }
         if (!f) return Fast::Fallback;
         if (!f->host_handler) {
+            uint64_t s0 = g_prof ? __rdtsc() : 0;
             if (f->handler(c)) {
+                if (g_prof) prof_add(f->name, __rdtsc() - s0);
                 c.pc = c.gpr[0].u32[3] & spu::PC_MASK;
                 continue;
             }
@@ -360,10 +410,12 @@ Fast fast_loop(spu::SpuThread& t, spu::Host& h, ApiState& api, std::vector<const
             if (!f) return Fast::Fallback;
         }
         c.executed = 0;
+        uint64_t h0 = g_prof ? __rdtsc() : 0, d0 = t_dma;
         if (!f->host_handler(c, h)) {
             c.pc = pc;
             return Fast::Fallback;
         }
+        if (g_prof) prof_add(f->name, __rdtsc() - h0 - (t_dma - d0));
         if (c.halted) return Fast::Failed;
         c.irq_check = false;
     }
@@ -596,6 +648,7 @@ bool Executor::run_edge(const JobRef& j, const Cmd& c, bool reference, Sandbox* 
     toggle ^= 1;
     bool load_code = code_ea != c.module;
     code_ea = c.module;
+    uint64_t p0 = g_prof ? __rdtsc() : 0, pd0 = t_dma;
     prepare_ls(th.ls, th.ctx, j, c, spu_num, toggle, load_code, !pm_loaded);
     if (!pm_loaded) {
         th.mark_all_ls();
@@ -635,18 +688,49 @@ bool Executor::run_edge(const JobRef& j, const Cmd& c, bool reference, Sandbox* 
         hcache.assign(spu::LS_SIZE / 4, nullptr);
         hvalid.assign(spu::LS_SIZE / 4, 0);
     }
+    if (g_prof) prof_add(load_code ? "prepare_ls+code" : "prepare_ls", __rdtsc() - p0);
     th.stop_flag.store(false);
     Fast r = reference ? Fast::Fallback : fast_loop(th, fh, api, hcache, hvalid, dispatches);
     if (r == Fast::Fallback) {
         fallbacks++;
+        uint64_t x0 = g_prof ? __rdtsc() : 0, xd0 = t_dma;
         th.exec_host = reference ? nullptr : &fh;
         th.exec();
         th.exec_host = nullptr;
+        if (g_prof) prof_add("fallback exec", __rdtsc() - x0 - (t_dma - xd0));
+    }
+    if (g_prof) {
+        prof_add("dma", t_dma - pd0);
+        prof_add("job total", __rdtsc() - p0);
     }
     fail_pc = th.ctx.pc;
     bool ok = th.ctx.pc == kJobRet && !th.ctx.halted && !api.bad_pc;
     th.ctx.halted = false;
     return ok;
+}
+
+void prof_report(uint64_t jobs) {
+    if (!g_prof || !jobs) return;
+    static const double hz = [] {
+        uint64_t q0 = host::qpc(), t0 = __rdtsc();
+        host::sleep_ms(20);
+        return double(__rdtsc() - t0) * double(host::qpf()) / double(host::qpc() - q0);
+    }();
+    std::vector<std::pair<uint64_t, std::pair<const char*, uint64_t>>> rows;
+    for (ProfEntry& e : g_prof_tab) {
+        const char* n = e.name.load();
+        if (!n) continue;
+        uint64_t t = e.ticks.exchange(0), c = e.calls.exchange(0);
+        if (t) rows.push_back({t, {n, c}});
+    }
+    std::sort(rows.rbegin(), rows.rend());
+    std::string line;
+    for (size_t i = 0; i < rows.size() && i < 24; i++) {
+        char buf[160];
+        std::snprintf(buf, sizeof buf, " [%s %.2f us %.1f calls]", rows[i].second.first, double(rows[i].first) / hz * 1e6 / double(jobs), double(rows[i].second.second) / double(jobs));
+        line += buf;
+    }
+    LOG_INFO("jsedge", "5s profile per edge job:%s", line.c_str());
 }
 
 bool run_sandboxed(spu::SpuThread& s, ApiState& api, Sandbox& sb) {
