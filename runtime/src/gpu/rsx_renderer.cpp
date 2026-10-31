@@ -282,6 +282,7 @@ std::unordered_map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, 
 std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, std::vector<PooledImage>> g_image_pool;
 std::vector<std::pair<uint64_t, std::unique_ptr<Texture>>> g_retired_textures;
 std::unordered_map<uint64_t, VkSampler> g_samplers;
+std::unordered_map<uint64_t, VkSampler> g_sampler_objects;
 struct PipelineEntry {
     std::atomic<bool> ready{false};
     VkPipeline pipeline = VK_NULL_HANDLE;
@@ -1324,8 +1325,23 @@ VkSampler sampler(const TextureRegs& t, uint32_t levels, bool shadow) {
         bool opaque = (bc >> 24) >= 0x80;
         si.borderColor = white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : opaque ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     }
+    uint64_t ikey = fnv(&si.magFilter, offsetof(VkSamplerCreateInfo, unnormalizedCoordinates) + sizeof si.unnormalizedCoordinates - offsetof(VkSamplerCreateInfo, magFilter));
+    auto oit = g_sampler_objects.find(ikey);
+    if (oit != g_sampler_objects.end()) {
+        g_samplers[key] = oit->second;
+        return oit->second;
+    }
     VkSampler s = VK_NULL_HANDLE;
-    vkCreateSampler(vk().device, &si, nullptr, &s);
+    if (vkCreateSampler(vk().device, &si, nullptr, &s) != VK_SUCCESS || !s) {
+        static bool warned = false;
+        if (!warned) LOG_WARN("rsx", "vkCreateSampler failed after %zu samplers, reusing an existing one", g_sampler_objects.size());
+        warned = true;
+        if (g_sampler_objects.empty()) return VK_NULL_HANDLE;
+        s = g_sampler_objects.begin()->second;
+    } else {
+        g_sampler_objects[ikey] = s;
+        if (g_sampler_objects.size() % 250 == 0) LOG_INFO("rsx", "%zu distinct samplers", g_sampler_objects.size());
+    }
     g_samplers[key] = s;
     return s;
 }
