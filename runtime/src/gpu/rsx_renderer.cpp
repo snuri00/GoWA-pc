@@ -381,9 +381,21 @@ struct CompileFrame {
     uint32_t vp = 0;
     uint32_t fp = 0;
     uint32_t pipelines = 0;
+    uint32_t deferred = 0;
+    std::chrono::steady_clock::duration sync{};
 };
 
 CompileFrame g_compile_frame;
+
+bool sync_compile_budget() {
+    static const auto budget = std::chrono::microseconds(std::getenv("GOWA_COMPILE_BUDGET_US") ? std::atoi(std::getenv("GOWA_COMPILE_BUDGET_US")) : 2000);
+    return g_compile_frame.sync < budget;
+}
+
+struct SyncTimer {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~SyncTimer() { g_compile_frame.sync += std::chrono::steady_clock::now() - t0; }
+};
 
 struct CompileTimer {
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -564,10 +576,21 @@ void finish_fp(FpEntry& e, const std::string& glsl) {
 
 template <typename Entry>
 void compile_entry(Entry& e, ShaderStage stage, std::string glsl, void (*finish)(Entry&, const std::string&)) {
-    std::vector<uint32_t> spirv;
-    if (!async_compile() || load_cached_glsl(stage, glsl, spirv)) {
+    if (!async_compile()) {
         finish(e, glsl);
         return;
+    }
+    if (sync_compile_budget()) {
+        SyncTimer st;
+        std::vector<uint32_t> spirv;
+        if (load_cached_glsl(stage, glsl, spirv)) {
+            e.ok = true;
+            e.module = make_module(spirv);
+            e.ready.store(true, std::memory_order_release);
+            return;
+        }
+    } else {
+        g_compile_frame.deferred++;
     }
     g_compile_pool.submit([&e, glsl = std::move(glsl), finish] { finish(e, glsl); });
 }
@@ -637,7 +660,23 @@ VpEntry* vertex_program() {
     g_compile_frame.vp++;
     VpEntry& e = g_vp_cache[h];
     e.hash = h;
-    VertexProgramInfo vp = decompile_vertex_program(g_vp_canon, g_vp_canon_start);
+    if (async_compile() && !sync_compile_budget()) {
+        g_compile_frame.deferred++;
+        recent[start] = {g_vp_ucode_serial, &e};
+        std::vector<uint32_t> canon(g_vp_canon, g_vp_canon + 544 * 4);
+        g_compile_pool.submit([&e, canon = std::move(canon), st = g_vp_canon_start] {
+            VertexProgramInfo vp = decompile_vertex_program(canon.data(), st);
+            e.inputs = vp.input_mask | 1u;
+            if (vp.valid) finish_vp(e, vp.glsl);
+            else e.ready.store(true, std::memory_order_release);
+        });
+        return &e;
+    }
+    VertexProgramInfo vp;
+    {
+        SyncTimer st;
+        vp = decompile_vertex_program(g_vp_canon, g_vp_canon_start);
+    }
     e.inputs = vp.input_mask | 1u;
     if (vp.valid) {
         compile_entry(e, ShaderStage::Vertex, vp.glsl, finish_vp);
@@ -782,7 +821,30 @@ FpEntry* fragment_program(uint32_t ea) {
     g_compile_frame.fp++;
     FpEntry& e = g_fp_cache[h];
     e.hash = h;
-    FragmentProgramInfo fp = decompile_fragment_program(read, key);
+    if (async_compile() && !sync_compile_budget()) {
+        g_compile_frame.deferred++;
+        e.textures = a.texture_mask;
+        e.dims = key.texture_dims;
+        uint32_t words = (a.start_slot + a.length_slots) * 4;
+        std::vector<uint32_t> code(words);
+        for (uint32_t i = 0; i < words; i++) code[i] = read(i);
+        remember(&e);
+        g_compile_pool.submit([&e, code = std::move(code), key] {
+            FpWordReader r = [&code](uint32_t i) { return i < code.size() ? code[i] : 0u; };
+            FragmentProgramInfo fp = decompile_fragment_program(r, key);
+            e.literal_slots = fp.literal_slots;
+            e.start_slot = fp.start_slot;
+            e.textures = fp.texture_mask;
+            if (fp.valid) finish_fp(e, fp.glsl);
+            else e.ready.store(true, std::memory_order_release);
+        });
+        return &e;
+    }
+    FragmentProgramInfo fp;
+    {
+        SyncTimer st;
+        fp = decompile_fragment_program(read, key);
+    }
     e.literal_slots = fp.literal_slots;
     e.start_slot = fp.start_slot;
     e.textures = fp.texture_mask;
@@ -2274,9 +2336,14 @@ VkPipeline pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule fs) 
     g_compile_frame.pipelines++;
     g_stats.pipelines++;
     if (async_compile()) {
-        if (vk().cache_control && create_pipeline(k, vs, fs, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, e.pipeline) == VK_SUCCESS) {
-            e.ready.store(true, std::memory_order_release);
-            return e.pipeline;
+        if (vk().cache_control && sync_compile_budget()) {
+            SyncTimer st;
+            if (create_pipeline(k, vs, fs, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, e.pipeline) == VK_SUCCESS) {
+                e.ready.store(true, std::memory_order_release);
+                return e.pipeline;
+            }
+        } else if (vk().cache_control) {
+            g_compile_frame.deferred++;
         }
         g_compile_pool.submit([&e, k, vs, fs] {
             create_pipeline(k, vs, fs, 0, e.pipeline);
@@ -3647,7 +3714,7 @@ void frame_complete_body() {
     g_frame_draw = 0;
     double compile_ms = std::chrono::duration<double, std::milli>(g_compile_frame.time).count();
     if (compile_ms > 4.0) {
-        LOG_INFO("rsx", "compile stall %.1f ms (vp %u, fp %u, pipelines %u)", compile_ms, g_compile_frame.vp, g_compile_frame.fp, g_compile_frame.pipelines);
+        LOG_INFO("rsx", "compile stall %.1f ms (vp %u, fp %u, pipelines %u, %u deferred past the budget)", compile_ms, g_compile_frame.vp, g_compile_frame.fp, g_compile_frame.pipelines, g_compile_frame.deferred);
     }
     g_compile_frame = {};
     if (!g_vb_checks.empty()) {
