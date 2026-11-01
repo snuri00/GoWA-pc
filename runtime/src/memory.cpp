@@ -207,16 +207,26 @@ bool watch_fault(uint32_t addr, bool repair_stale) {
 }
 
 void host_write(uint32_t addr, uint64_t size) {
-    for (uint64_t a = addr & ~0xFFFull; a < uint64_t(addr) + size && a < 0x100000000ull; a += 0x1000) {
-        uint32_t page = uint32_t(a >> 12);
-        if (!g_page_watched[page].load(std::memory_order_acquire)) continue;
-        watch_lock(page).lock();
-        if (g_page_watched[page].load(std::memory_order_relaxed)) {
-            host::vm_protect(g_base + a, 0x1000, host::Prot::ReadWrite);
-            g_page_watched[page].store(0, std::memory_order_release);
-            g_page_epoch[page].fetch_add(1, std::memory_order_acq_rel);
+    if (!size) return;
+    uint64_t end = std::min<uint64_t>(uint64_t(addr) + size, 0x100000000ull);
+    uint32_t first = addr >> 12, last = uint32_t((end + 0xFFF) >> 12);
+    for (uint32_t page = first; page < last;) {
+        if (!g_page_watched[page].load(std::memory_order_acquire)) {
+            page++;
+            continue;
         }
-        watch_lock(page).unlock();
+        uint32_t run = page;
+        while (run < last && run - page < 1024 && g_page_watched[run].load(std::memory_order_acquire)) run++;
+        for (uint32_t q = page; q < run; q++) watch_lock(q).lock();
+        host::vm_protect(g_base + (uint64_t(page) << 12), uint64_t(run - page) << 12, host::Prot::ReadWrite);
+        for (uint32_t q = page; q < run; q++) {
+            if (g_page_watched[q].load(std::memory_order_relaxed)) {
+                g_page_watched[q].store(0, std::memory_order_release);
+                g_page_epoch[q].fetch_add(1, std::memory_order_acq_rel);
+            }
+        }
+        for (uint32_t q = page; q < run; q++) watch_lock(q).unlock();
+        page = run;
     }
 }
 
