@@ -95,8 +95,26 @@ struct NmsD {
     double operator()(double x, double y, double z) const { return std::fma(-x, y, z); }
 };
 
+inline int relaxed_env() {
+    const char* e = std::getenv("GOWA_SPU_RELAXED_FLOAT");
+    if (!e) return 0;
+    if (e[0] == '1') return 1;
+    return std::strcmp(e, "cloth") == 0 ? 2 : 0;
+}
+
+inline const int g_relaxed_mode = relaxed_env();
+inline const bool g_relaxed = g_relaxed_mode == 1;
+inline thread_local bool t_relaxed = false;
+
+struct RelaxedScope {
+    bool old;
+    explicit RelaxedScope(bool on) : old(t_relaxed) { t_relaxed = on; }
+    ~RelaxedScope() { t_relaxed = old; }
+};
+
 template <class Slow>
 inline __m128 fix(__m128 a, __m128 b, __m128 c, __m128 r, Slow s) {
+    if (g_relaxed || t_relaxed) return r;
     __m128i bad = special(r);
     if (!_mm_testz_si128(bad, bad)) r = slow(a, b, c, r, bad, s);
     return pos_zero(r);

@@ -39,6 +39,7 @@ template <GenFn F, bool J>
 bool run_gen(uint8_t* ls, spu::Context& c) {
     static_assert(sizeof(c.gpr) == 128 * sizeof(xo::V));
     CsrScope csr;
+    spuf::RelaxedScope relaxed(spuf::g_relaxed_mode == 2);
     if constexpr (J) {
         xo::Ctl& ctl = thread_ctl();
         ctl.reset();
