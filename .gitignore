@@ -31,6 +31,7 @@ __pycache__/
 /oracle/
 /docs/
 *.md
+!/README.md
 /run/
 build_tc/
 build_edge/
