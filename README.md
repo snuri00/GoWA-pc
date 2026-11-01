@@ -16,7 +16,7 @@ This is a hobby project. It is not affiliated with Sony Interactive Entertainmen
 
 ## Status
 
-The game boots, plays the intro, and is playable from a save through the early levels. It is not finished and not every part of the game has been tested.
+The game boots, plays the intro, and is playable. It is not finished and not every part of the game has been tested.
 
 On an i7-8700K with an RTX 4070, calm areas run at around 55-60 fps. Large fights run at roughly 35-45 fps and can still drop lower for short moments. Most of the remaining cost is SPU work (mainly Edge geometry jobs), not the GPU.
 
