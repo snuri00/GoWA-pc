@@ -27,6 +27,7 @@
 __pycache__/
 /ref/
 /build/
+/build-linux/
 /oracle/
 /docs/
 *.md

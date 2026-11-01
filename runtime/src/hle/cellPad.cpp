@@ -28,7 +28,7 @@ uint32_t g_max = 7;
 uint32_t g_setting = 0;
 std::once_flag g_script_once;
 std::vector<Press> g_script;
-std::chrono::steady_clock::time_point g_start = std::chrono::steady_clock::now();
+uint64_t g_start = 0;
 
 bool axis_of(const std::string& name, uint32_t& offset, uint16_t& value) {
     if (name.size() != 3 || (name[2] != '+' && name[2] != '-')) return false;
@@ -88,7 +88,7 @@ void load_script() {
 
 void fill(uint32_t out) {
     std::call_once(g_script_once, load_script);
-    double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+    double now = double(ppu::timebase() - g_start) / 80000000.0;
     uint16_t b[24] = {};
     b[1] = 0x70 | 12;
     b[4] = b[5] = b[6] = b[7] = 0x80;
@@ -118,7 +118,7 @@ HLE_FUNC(sys_io, cellPadInit) {
     if (g_init) return ret(ctx, static_cast<int32_t>(0x80121103));
     g_init = true;
     g_max = a32(ctx, 0) > 7 ? 7 : a32(ctx, 0);
-    g_start = std::chrono::steady_clock::now();
+    g_start = ppu::timebase();
     ret(ctx, 0);
 }
 

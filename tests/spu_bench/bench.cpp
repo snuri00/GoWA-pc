@@ -1,4 +1,5 @@
 #include "spu/aot.h"
+#include "runtime/host.h"
 #include "spu/context.h"
 #include "hle.h"
 #include "edge/edge_gpu.h"
@@ -9,13 +10,20 @@
 #include <set>
 #endif
 
+#ifdef _WIN32
 #include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <dbghelp.h>
+#endif
 #include <thread>
+#include "runtime/compat.h"
 
 #include <algorithm>
 #include <atomic>
@@ -705,11 +713,12 @@ bool g_sample = false;
 std::atomic<bool> g_sampling{false};
 std::map<uint64_t, uint64_t> g_rips;
 
+#ifdef _WIN32
 void sampler(HANDLE target) {
     while (g_sampling.load()) {
         uint64_t until = __rdtsc() + 400000;
         while (__rdtsc() < until) _mm_pause();
-        if (SuspendThread(target) == static_cast<DWORD>(-1)) return;
+        if (SuspendThread(target) == static_cast<uint32_t>(-1)) return;
         CONTEXT c{};
         c.ContextFlags = CONTEXT_CONTROL;
         bool ok = GetThreadContext(target, &c) != 0;
@@ -748,6 +757,10 @@ void report_samples() {
         std::fclose(f);
     }
 }
+#else
+void sampler(void*) {}
+void report_samples() { std::printf("  rip sampling is only implemented on Windows\n"); }
+#endif
 
 struct Result {
     uint64_t cycles = 0;
@@ -820,8 +833,8 @@ Result run(State& s, const Capture& cap, bool regions) {
         return f;
     };
     uint64_t n = 0;
-    ULONG64 t0 = 0;
-    QueryThreadCycleTime(GetCurrentThread(), &t0);
+    uint64_t t0 = 0;
+    t0 = host::thread_cycles();
     bool to_last = g_to_last_event;
     uint64_t excluded = 0;
     g_jobprof_rec = g_jobprof && (!g_hle || g_have_counts);
@@ -913,8 +926,8 @@ Result run(State& s, const Capture& cap, bool regions) {
                 f = nullptr;
             }
             if (f) {
-                ULONG64 x0 = 0, x1 = 0;
-                if (!g_have_counts) QueryThreadCycleTime(GetCurrentThread(), &x0);
+                uint64_t x0 = 0, x1 = 0;
+                if (!g_have_counts) x0 = host::thread_cycles();
                 uint64_t k = 0;
                 bool iso_ok;
                 uint32_t exit_pc = 0;
@@ -934,7 +947,7 @@ Result run(State& s, const Capture& cap, bool regions) {
                     if (iso_ok) iso_ok = iso_count(s, k, exit_pc, probe.gpr[1].u32[3]);
                     g_counts.push_back(iso_ok && n + k < cap.insns ? k : UINT64_MAX);
                 }
-                if (!g_have_counts) QueryThreadCycleTime(GetCurrentThread(), &x1);
+                if (!g_have_counts) x1 = host::thread_cycles();
                 excluded += x1 - x0;
                 const spu::hle::Function* fb = nullptr;
                 if (!iso_ok) {
@@ -1052,8 +1065,8 @@ Result run(State& s, const Capture& cap, bool regions) {
         if (!ok) break;
         if (host.pos < cap.events.size() && cap.events[host.pos].kind == 5 && cap.events[host.pos].value == n) host.next(5, 0, uint32_t(n), true);
     }
-    ULONG64 t1 = 0;
-    QueryThreadCycleTime(GetCurrentThread(), &t1);
+    uint64_t t1 = 0;
+    t1 = host::thread_cycles();
     if (g_js_on) {
         g_js_active.store(false);
         g_phase = PH_IDLE;
@@ -1148,8 +1161,7 @@ int main(int argc, char** argv) {
     }
     std::thread sampler_thread;
     if (g_sample) {
-        HANDLE self = nullptr;
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        void* self = host::current_native();
         g_sampling = true;
         sampler_thread = std::thread(sampler, self);
     }
@@ -1377,6 +1389,7 @@ int main(int argc, char** argv) {
         std::sort(v.rbegin(), v.rend());
         for (size_t i = 0; i < v.size() && i < 40; i++) std::printf("  exit %05x %llu\n", v[i].second, (unsigned long long)v[i].first);
     }
+    if (edge::gpu::g_mix) std::printf("edge job mix:\n%s", edge::gpu::mix_report().c_str());
     if (edge::gpu::mode()) {
         edge::gpu::Stats st = edge::gpu::stats();
         std::printf("edge gpu: deferred %llu confirmed %llu published %llu dropped %llu materialized", (unsigned long long)st.deferred, (unsigned long long)st.confirmed, (unsigned long long)st.published, (unsigned long long)st.dropped);

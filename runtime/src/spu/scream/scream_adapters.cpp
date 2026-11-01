@@ -10,7 +10,11 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#ifdef _WIN32
 #include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 #include <mutex>
 #include <string>
 #include <vector>

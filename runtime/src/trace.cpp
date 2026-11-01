@@ -1,4 +1,5 @@
 #include "runtime/trace.h"
+#include "runtime/host.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
 
@@ -13,8 +14,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 namespace trace {
 
@@ -84,17 +87,8 @@ void write_out(Buffer* b) {
 }
 
 std::string thread_name() {
-    PWSTR w = nullptr;
-    std::string name;
-    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &w)) && w) {
-        int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-        if (n > 1) {
-            name.resize(n - 1);
-            WideCharToMultiByte(CP_UTF8, 0, w, -1, name.data(), n, nullptr, nullptr);
-        }
-        LocalFree(w);
-    }
-    if (name.empty()) name = "host " + std::to_string(GetCurrentThreadId());
+    std::string name = host::thread_name();
+    if (name.empty()) name = "host " + std::to_string(host::tid());
     return name;
 }
 
@@ -103,7 +97,7 @@ Buffer* buffer() {
     auto* b = new Buffer();
     b->tid = g_next_tid.fetch_add(1);
     uint32_t name = intern(thread_name());
-    b->recs[b->n++] = Rec{now_ns(), T_THREAD, b->tid, b->tid, name, GetCurrentThreadId(), 0, 0, 0};
+    b->recs[b->n++] = Rec{now_ns(), T_THREAD, b->tid, b->tid, name, host::tid(), 0, 0, 0};
     t_buf = b;
     std::lock_guard lk(g_reg_lock);
     g_buffers.push_back(b);
@@ -193,7 +187,7 @@ void init() {
                 g_mask = 0;
                 LOG_INFO("trace", "event trace stopped");
             }
-            Sleep(250);
+            host::sleep_ms(250);
             flush_all();
         }
     }).detach();
@@ -207,6 +201,7 @@ void shutdown() {
 bool dump_memory(const char* path) {
     FILE* f = std::fopen(path, "wb");
     if (!f) return false;
+#ifdef _WIN32
     for (uint64_t a = 0; a < 0x100000000ull;) {
         MEMORY_BASIC_INFORMATION mi{};
         if (!VirtualQuery(vm::g_base + a, &mi, sizeof mi)) break;
@@ -218,6 +213,20 @@ bool dump_memory(const char* path) {
         }
         a += len;
     }
+#else
+    for (uint64_t a = 0; a < 0x100000000ull;) {
+        if (!vm::is_mapped(static_cast<uint32_t>(a))) {
+            a += 0x1000;
+            continue;
+        }
+        uint64_t len = 0x1000;
+        while (a + len < 0x100000000ull && vm::is_mapped(static_cast<uint32_t>(a + len))) len += 0x1000;
+        uint32_t hdr[2] = {static_cast<uint32_t>(a), static_cast<uint32_t>(len)};
+        std::fwrite(hdr, 4, 2, f);
+        std::fwrite(vm::g_base + a, 1, static_cast<size_t>(len), f);
+        a += len;
+    }
+#endif
     std::fclose(f);
     if (on(TRAP)) emit(T_MARK, 1, intern(path));
     LOG_INFO("trace", "memory dumped to %s", path);

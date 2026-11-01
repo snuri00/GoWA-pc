@@ -1,10 +1,14 @@
 #include "ppu/ops.h"
+#include "runtime/host.h"
 #include "runtime/critpath.h"
 #include "runtime/hooks.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
+#include "runtime/jobsys.h"
+#include "jobsys/jobs_graph.h"
 #include "runtime/reservation.h"
 #include "runtime/trace.h"
+#include "jobsys/edge_consumer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -20,7 +24,9 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <filesystem>
 
 namespace spu {
@@ -95,7 +101,7 @@ void record(const Hook* h, const ppu::Context& ctx) {
     e.t = logging::uptime();
     e.addr = h->addr;
     e.lr = static_cast<uint32_t>(ctx.lr);
-    e.tid = GetCurrentThreadId();
+    e.tid = host::tid();
     for (int r = 0; r < 6; r++) e.r[r] = ctx.gpr[3 + r];
     e.dump_ea = 0;
     if (!h->dumps.empty()) {
@@ -135,15 +141,7 @@ void guest_backtrace(const ppu::Context& ctx) {
 }
 
 std::string thread_name() {
-    PWSTR w = nullptr;
-    std::string out;
-    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &w)) && w) {
-        int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-        out.resize(n > 0 ? n - 1 : 0);
-        if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
-        LocalFree(w);
-    }
-    return out;
+    return host::thread_name();
 }
 
 std::string hex_dump(uint32_t ea, uint32_t len) {
@@ -567,9 +565,48 @@ void install_patches() {
     }
 }
 
+void add_guard(uint32_t addr, bool (*guard)(ppu::Context&)) {
+    Hook*& h = g_hooks[addr];
+    if (!h) {
+        h = new Hook;
+        h->addr = addr;
+        h->quiet = true;
+    }
+    if (h->guard) LOG_WARN("hook", "guard at 0x%08x replaced by jobsys", addr);
+    h->guard = guard;
+    ppu::hook_flags[addr >> 2] = 1;
+}
+
+void install_ppujobs() {
+    jobsys::wws::install(add_guard);
+    wj::install(add_guard);
+}
+
+void install_jobsys_edge() {
+    if (!jsedge::enabled()) return;
+    jsedge::init();
+    Hook*& h = g_hooks[0x41cbdc];
+    if (!h) {
+        h = new Hook;
+        h->addr = 0x41cbdc;
+        h->quiet = true;
+    }
+    jsedge::set_prev_guard(h->guard);
+    h->guard = jsedge::on_wait_previous;
+    ppu::hook_flags[0x41cbdc >> 2] = 1;
+    Hook*& sp = g_hooks[0x49cd6c];
+    if (!sp) {
+        sp = new Hook;
+        sp->addr = 0x49cd6c;
+        sp->quiet = true;
+    }
+    sp->guard = jsedge::on_set_priorities;
+    ppu::hook_flags[0x49cd6c >> 2] = 1;
+}
+
 void hog_thread(int lp, int on_ms, int off_ms, double from) {
-    SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << lp);
-    SetThreadDescription(GetCurrentThread(), L"test hog");
+    host::set_affinity({lp});
+    host::set_thread_name("test hog");
     while (logging::uptime() < from) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     LOG_WARN("hog", "normal-priority hog on lp %d (%d ms on, %d ms off)", lp, on_ms, off_ms);
     volatile uint64_t x = 0;
@@ -608,6 +645,8 @@ void init() {
     const char* spec = combined.c_str();
     if (!*spec) {
         install_patches();
+        install_ppujobs();
+        install_jobsys_edge();
         install_critpath();
         if (!g_hooks.empty()) ppu::hook_impl = impl;
         return;
@@ -668,6 +707,8 @@ void init() {
         if (!h->ring && !h->panic) LOG_INFO("hook", "hooked %s at 0x%08x", name_of(addr).c_str(), addr);
     }
     install_patches();
+    install_ppujobs();
+    install_jobsys_edge();
     install_critpath();
     if (g_hooks.empty()) return;
     ppu::hook_impl = impl;

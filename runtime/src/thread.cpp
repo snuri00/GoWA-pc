@@ -1,4 +1,5 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
 #include "runtime/thread.h"
 #include "runtime/kernel.h"
 #include "runtime/log.h"
@@ -9,8 +10,10 @@
 #include <map>
 #include <string>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 namespace crash {
 std::string sample_stack(void* native, int depth);
@@ -30,22 +33,14 @@ std::map<uint32_t, std::shared_ptr<Thread>> g_threads;
 uint32_t g_next_id = 0x01000000;
 thread_local Thread* t_current = nullptr;
 
-void set_host_name(const std::string& name) {
-    wchar_t w[128];
-    int n = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, w, 128);
-    if (n > 0) SetThreadDescription(GetCurrentThread(), w);
-}
-
 void body(std::shared_ptr<Thread> t) {
     t_current = t.get();
-    t->native = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
-    set_host_name("PPU " + t->name);
+    t->native = host::current_native();
+    host::set_thread_name("PPU " + t->name);
     placement::apply("ppu:" + t->name);
     if (const char* e = std::getenv("GOWA_PROFILE_PPU")) {
         if (t->name == e) {
-            HANDLE h = nullptr;
-            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
-            crash::profile_thread(h, e);
+            crash::profile_thread(host::current_native(), e);
         }
     }
     LOG_INFO("ppu", "thread 0x%x '%s' start entry opd 0x%08x", t->id, t->name.c_str(), t->entry_opd);
@@ -100,7 +95,7 @@ void status_dump() {
                      (unsigned long long)g[6], (unsigned long long)g[7], (unsigned long long)g[9], (unsigned long long)g[10], (unsigned long long)g[11]);
         }
         if (sc == 98) lv2::lwmutex_debug(static_cast<uint32_t>(t->ctx.gpr[3]));
-        if ((!sc || sc == 142 || t->name == "main_thread") && t->native && GetThreadId(static_cast<HANDLE>(t->native)) != GetCurrentThreadId()) LOG_INFO("status", "   %s", crash::sample_stack(t->native, 14).c_str());
+        if ((!sc || sc == 142 || t->name == "main_thread") && t->native && !host::native_is_current(t->native)) LOG_INFO("status", "   %s", crash::sample_stack(t->native, 14).c_str());
     }
 }
 
@@ -151,8 +146,8 @@ std::shared_ptr<Thread> spawn_host(const std::string& name, int32_t prio, uint32
     t->started = true;
     t->host = std::thread([t, fn = std::move(fn)]() {
         t_current = t.get();
-        t->native = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
-        set_host_name("PPU " + t->name);
+        t->native = host::current_native();
+        host::set_thread_name("PPU " + t->name);
         placement::apply("ppu:" + t->name);
         LOG_INFO("ppu", "host thread 0x%x '%s' start", t->id, t->name.c_str());
         fn(*t);

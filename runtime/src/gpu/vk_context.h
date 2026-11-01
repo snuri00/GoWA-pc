@@ -1,11 +1,13 @@
 #pragma once
 
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 #include <volk.h>
 
 #include <cstdint>
@@ -27,5 +29,9 @@ VkCommandBuffer pre_cmd();
 uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags flags);
 void image_barrier(VkCommandBuffer cmd, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to);
 void present_image(VkImage img, VkImageLayout& layout, uint32_t w, uint32_t h);
+double last_fence_wait_ms();
+double last_gpu_ms();
+void submit_partial();
+uint64_t cmd_generation();
 
 }

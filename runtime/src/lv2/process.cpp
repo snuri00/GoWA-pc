@@ -10,8 +10,10 @@
 #include <ctime>
 #include <thread>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 namespace lv2 {
 
@@ -77,19 +79,34 @@ LV2_SYSCALL(149, sys_time_get_system_time) {
 }
 
 LV2_SYSCALL(145, sys_time_get_current_time) {
+#ifdef _WIN32
     FILETIME ft;
     GetSystemTimePreciseAsFileTime(&ft);
     uint64_t t = (uint64_t(ft.dwHighDateTime) << 32 | ft.dwLowDateTime) - 116444736000000000ull;
+#else
+    timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t t = uint64_t(ts.tv_sec) * 10000000ull + uint64_t(ts.tv_nsec) / 100;
+#endif
     if (uint32_t s = u32arg(ctx, 0)) vm::write64(s, t / 10000000ull);
     if (uint32_t n = u32arg(ctx, 1)) vm::write64(n, (t % 10000000ull) * 100);
     return CELL_OK;
 }
 
 LV2_SYSCALL(144, sys_time_get_timezone) {
+#ifdef _WIN32
     TIME_ZONE_INFORMATION tz;
     DWORD r = GetTimeZoneInformation(&tz);
-    if (uint32_t p = u32arg(ctx, 0)) vm::write32(p, static_cast<uint32_t>(-tz.Bias));
-    if (uint32_t p = u32arg(ctx, 1)) vm::write32(p, r == TIME_ZONE_ID_DAYLIGHT ? static_cast<uint32_t>(-tz.DaylightBias) : 0);
+    int32_t bias = -tz.Bias, dst = r == TIME_ZONE_ID_DAYLIGHT ? -tz.DaylightBias : 0;
+#else
+    std::time_t now = std::time(nullptr);
+    std::tm lt{};
+    localtime_r(&now, &lt);
+    int32_t dst = lt.tm_isdst > 0 ? 60 : 0;
+    int32_t bias = static_cast<int32_t>(lt.tm_gmtoff / 60) - dst;
+#endif
+    if (uint32_t p = u32arg(ctx, 0)) vm::write32(p, static_cast<uint32_t>(bias));
+    if (uint32_t p = u32arg(ctx, 1)) vm::write32(p, static_cast<uint32_t>(dst));
     return CELL_OK;
 }
 

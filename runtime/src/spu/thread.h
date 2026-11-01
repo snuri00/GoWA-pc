@@ -3,7 +3,9 @@
 #include "runtime/critpath.h"
 #include "runtime/reservation.h"
 
+#include "spu/aot.h"
 #include "spu/context.h"
+#include "hle.h"
 
 #include <array>
 #include <atomic>
@@ -161,6 +163,28 @@ struct SpuThread : Host {
     void deploy();
     void start();
     void run();
+    void exec();
+
+    bool job_mode = false;
+    uint32_t job_stop = 0;
+    bool (*job_next)(SpuThread&) = nullptr;
+    bool (*job_trap)(SpuThread&) = nullptr;
+    void* job_user = nullptr;
+    Host* exec_host = nullptr;
+    uint64_t exec_insns = 0;
+    struct alignas(32) ExecSlot {
+        const CompiledBlock* b;
+        BlockFn fn;
+        BlockFn region;
+        uint32_t words;
+        uint32_t valid;
+    };
+    struct ExecHleSlot {
+        const hle::Function* f;
+        uint32_t valid;
+    };
+    std::vector<ExecSlot> exec_blocks;
+    std::vector<ExecHleSlot> exec_hle;
 
 private:
     void set_events(uint32_t bits);

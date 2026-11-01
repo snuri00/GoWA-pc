@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "runtime/hooks.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
@@ -411,3 +412,4 @@ void arm_watch() {
 }
 
 }
+#endif

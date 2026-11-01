@@ -1,5 +1,12 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
+#include "runtime/session.h"
 #include <immintrin.h>
+#ifdef _WIN32
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 #include "gpu/presenter.h"
 #include "motion_vectors.h"
 #include "dlssg.h"
@@ -18,6 +25,7 @@
 #include "vp_decompiler.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bitset>
 #include <chrono>
@@ -281,6 +289,7 @@ std::unordered_map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, 
 std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, std::vector<PooledImage>> g_image_pool;
 std::vector<std::pair<uint64_t, std::unique_ptr<Texture>>> g_retired_textures;
 std::unordered_map<uint64_t, VkSampler> g_samplers;
+std::unordered_map<uint64_t, VkSampler> g_sampler_objects;
 struct PipelineEntry {
     std::atomic<bool> ready{false};
     VkPipeline pipeline = VK_NULL_HANDLE;
@@ -372,9 +381,21 @@ struct CompileFrame {
     uint32_t vp = 0;
     uint32_t fp = 0;
     uint32_t pipelines = 0;
+    uint32_t deferred = 0;
+    std::chrono::steady_clock::duration sync{};
 };
 
 CompileFrame g_compile_frame;
+
+bool sync_compile_budget() {
+    static const auto budget = std::chrono::microseconds(std::getenv("GOWA_COMPILE_BUDGET_US") ? std::atoi(std::getenv("GOWA_COMPILE_BUDGET_US")) : 2000);
+    return g_compile_frame.sync < budget;
+}
+
+struct SyncTimer {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~SyncTimer() { g_compile_frame.sync += std::chrono::steady_clock::now() - t0; }
+};
 
 struct CompileTimer {
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -405,12 +426,21 @@ struct Stats {
     uint64_t watch_skips = 0;
     uint64_t blit_fast = 0;
     uint64_t blit_slow = 0;
+    uint64_t complete_ticks = 0;
+    uint64_t copy_ticks = 0;
 } g_stats;
+Stats g_slow_prev;
 
-uint64_t ticks() {
-    LARGE_INTEGER v;
-    QueryPerformanceCounter(&v);
-    return static_cast<uint64_t>(v.QuadPart);
+uint64_t ticks() { return __rdtsc(); }
+
+double tick_hz() {
+    static const double hz = [] {
+        uint64_t q0 = host::qpc(), t0 = __rdtsc();
+        while (host::qpc() - q0 < host::qpf() / 200) _mm_pause();
+        uint64_t q1 = host::qpc(), t1 = __rdtsc();
+        return double(t1 - t0) * double(host::qpf()) / double(q1 - q0);
+    }();
+    return hz;
 }
 
 uint32_t R(uint32_t method) { return g_regs[(method >> 2) & 0x3FFF]; }
@@ -496,7 +526,7 @@ public:
 
 private:
     void run() {
-        SetThreadDescription(GetCurrentThread(), L"Shader compiler");
+        host::set_thread_name("Shader compiler");
         placement::apply("shader");
         for (;;) {
             std::function<void()> job;
@@ -546,10 +576,21 @@ void finish_fp(FpEntry& e, const std::string& glsl) {
 
 template <typename Entry>
 void compile_entry(Entry& e, ShaderStage stage, std::string glsl, void (*finish)(Entry&, const std::string&)) {
-    std::vector<uint32_t> spirv;
-    if (!async_compile() || load_cached_glsl(stage, glsl, spirv)) {
+    if (!async_compile()) {
         finish(e, glsl);
         return;
+    }
+    if (sync_compile_budget()) {
+        SyncTimer st;
+        std::vector<uint32_t> spirv;
+        if (load_cached_glsl(stage, glsl, spirv)) {
+            e.ok = true;
+            e.module = make_module(spirv);
+            e.ready.store(true, std::memory_order_release);
+            return;
+        }
+    } else {
+        g_compile_frame.deferred++;
     }
     g_compile_pool.submit([&e, glsl = std::move(glsl), finish] { finish(e, glsl); });
 }
@@ -619,7 +660,23 @@ VpEntry* vertex_program() {
     g_compile_frame.vp++;
     VpEntry& e = g_vp_cache[h];
     e.hash = h;
-    VertexProgramInfo vp = decompile_vertex_program(g_vp_canon, g_vp_canon_start);
+    if (async_compile() && !sync_compile_budget()) {
+        g_compile_frame.deferred++;
+        recent[start] = {g_vp_ucode_serial, &e};
+        std::vector<uint32_t> canon(g_vp_canon, g_vp_canon + 544 * 4);
+        g_compile_pool.submit([&e, canon = std::move(canon), st = g_vp_canon_start] {
+            VertexProgramInfo vp = decompile_vertex_program(canon.data(), st);
+            e.inputs = vp.input_mask | 1u;
+            if (vp.valid) finish_vp(e, vp.glsl);
+            else e.ready.store(true, std::memory_order_release);
+        });
+        return &e;
+    }
+    VertexProgramInfo vp;
+    {
+        SyncTimer st;
+        vp = decompile_vertex_program(g_vp_canon, g_vp_canon_start);
+    }
     e.inputs = vp.input_mask | 1u;
     if (vp.valid) {
         compile_entry(e, ShaderStage::Vertex, vp.glsl, finish_vp);
@@ -764,7 +821,30 @@ FpEntry* fragment_program(uint32_t ea) {
     g_compile_frame.fp++;
     FpEntry& e = g_fp_cache[h];
     e.hash = h;
-    FragmentProgramInfo fp = decompile_fragment_program(read, key);
+    if (async_compile() && !sync_compile_budget()) {
+        g_compile_frame.deferred++;
+        e.textures = a.texture_mask;
+        e.dims = key.texture_dims;
+        uint32_t words = (a.start_slot + a.length_slots) * 4;
+        std::vector<uint32_t> code(words);
+        for (uint32_t i = 0; i < words; i++) code[i] = read(i);
+        remember(&e);
+        g_compile_pool.submit([&e, code = std::move(code), key] {
+            FpWordReader r = [&code](uint32_t i) { return i < code.size() ? code[i] : 0u; };
+            FragmentProgramInfo fp = decompile_fragment_program(r, key);
+            e.literal_slots = fp.literal_slots;
+            e.start_slot = fp.start_slot;
+            e.textures = fp.texture_mask;
+            if (fp.valid) finish_fp(e, fp.glsl);
+            else e.ready.store(true, std::memory_order_release);
+        });
+        return &e;
+    }
+    FragmentProgramInfo fp;
+    {
+        SyncTimer st;
+        fp = decompile_fragment_program(read, key);
+    }
     e.literal_slots = fp.literal_slots;
     e.start_slot = fp.start_slot;
     e.textures = fp.texture_mask;
@@ -1093,6 +1173,31 @@ void transition(Surface* s, VkImageLayout to) {
 }
 
 void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w, uint32_t h);
+uint32_t g_draws_since_submit = 0;
+
+struct DynState {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    uint64_t generation = 0;
+    bool set = false;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkBuffer vb[16] = {};
+    VkDeviceSize vo[16] = {}, vs[16] = {};
+    VkBuffer ib = VK_NULL_HANDLE;
+    VkDeviceSize ibo = 0;
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    float line = 0.0f;
+    uint32_t bias_on = 0;
+    uint32_t bias[2] = {};
+    uint32_t blend = 0;
+    uint32_t stencil[2][7] = {};
+    uint32_t fixed[11] = {};
+    uint32_t push_textures = 0;
+    uint32_t push_images = 0;
+    VkDescriptorImageInfo images[20] = {};
+    VkDescriptorBufferInfo ubo[4] = {};
+} g_dyn;
+const bool g_no_state_cache = std::getenv("GOWA_NO_STATE_CACHE") != nullptr;
 
 void clear(uint32_t mask) {
     if (g_trace) LOG_INFO("rsx", "trace clear 0x%x color 0x%x zeta 0x%x clip %ux%u target 0x%x scissor 0x%x 0x%x", mask, R(SURFACE_COLOR_AOFFSET), R(SURFACE_ZETA_OFFSET), clip_w(), clip_h(), R(SURFACE_COLOR_TARGET),
@@ -1260,7 +1365,24 @@ VkCompareOp reversed_compare(uint32_t v) {
     }
 }
 
+VkSampler sampler_slow(const TextureRegs& t, uint32_t levels, bool shadow);
+
 VkSampler sampler(const TextureRegs& t, uint32_t levels, bool shadow) {
+    struct Memo {
+        uint32_t k[5];
+        VkSampler s;
+    };
+    static Memo memo[256];
+    uint32_t extra = levels | (shadow ? 0x100 : 0);
+    uint32_t h = (t.address * 0x9E3779B1u) ^ (t.control0 * 0x85EBCA77u) ^ (t.filter * 0xC2B2AE3Du) ^ (t.border * 0x27D4EB2Fu) ^ (extra * 0x165667B1u);
+    Memo& m = memo[(h ^ (h >> 16)) & 255];
+    if (m.s && m.k[0] == t.address && m.k[1] == t.control0 && m.k[2] == t.filter && m.k[3] == t.border && m.k[4] == extra) return m.s;
+    VkSampler s = sampler_slow(t, levels, shadow);
+    if (s) m = {{t.address, t.control0, t.filter, t.border, extra}, s};
+    return s;
+}
+
+VkSampler sampler_slow(const TextureRegs& t, uint32_t levels, bool shadow) {
     uint64_t key = fnv(&t.address, 4);
     key = fnv(&t.control0, 4, key);
     key = fnv(&t.filter, 4, key);
@@ -1279,9 +1401,9 @@ VkSampler sampler(const TextureRegs& t, uint32_t levels, bool shadow) {
     si.addressModeV = wrap_mode((t.address >> 8) & 0xF);
     si.addressModeW = wrap_mode((t.address >> 16) & 0xF);
     int32_t bias = static_cast<int32_t>(t.filter << 19) >> 19;
-    si.mipLodBias = bias / 256.0f;
-    float min_lod = ((t.control0 >> 19) & 0xFFF) / 256.0f;
-    float max_lod = ((t.control0 >> 7) & 0xFFF) / 256.0f;
+    si.mipLodBias = float((bias + 16) >> 5) / 8.0f;
+    float min_lod = float(((t.control0 >> 19) & 0xFFF) >> 6) / 4.0f;
+    float max_lod = float((((t.control0 >> 7) & 0xFFF) + 63) >> 6) / 4.0f;
     si.minLod = mips ? std::min(min_lod, float(levels - 1)) : 0.0f;
     si.maxLod = mips ? std::min(max_lod, float(levels - 1)) : 0.0f;
     uint32_t aniso = (t.control0 >> 4) & 7;
@@ -1300,8 +1422,23 @@ VkSampler sampler(const TextureRegs& t, uint32_t levels, bool shadow) {
         bool opaque = (bc >> 24) >= 0x80;
         si.borderColor = white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : opaque ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     }
+    uint64_t ikey = fnv(&si.magFilter, offsetof(VkSamplerCreateInfo, unnormalizedCoordinates) + sizeof si.unnormalizedCoordinates - offsetof(VkSamplerCreateInfo, magFilter));
+    auto oit = g_sampler_objects.find(ikey);
+    if (oit != g_sampler_objects.end()) {
+        g_samplers[key] = oit->second;
+        return oit->second;
+    }
     VkSampler s = VK_NULL_HANDLE;
-    vkCreateSampler(vk().device, &si, nullptr, &s);
+    if (vkCreateSampler(vk().device, &si, nullptr, &s) != VK_SUCCESS || !s) {
+        static bool warned = false;
+        if (!warned) LOG_WARN("rsx", "vkCreateSampler failed after %zu samplers, reusing an existing one", g_sampler_objects.size());
+        warned = true;
+        if (g_sampler_objects.empty()) return VK_NULL_HANDLE;
+        s = g_sampler_objects.begin()->second;
+    } else {
+        g_sampler_objects[ikey] = s;
+        if (g_sampler_objects.size() % 250 == 0) LOG_INFO("rsx", "%zu distinct samplers", g_sampler_objects.size());
+    }
     g_samplers[key] = s;
     return s;
 }
@@ -1319,6 +1456,75 @@ TextureRegs texture_regs(uint32_t unit) {
     t.border = R(b + 0x1C);
     t.control3 = R(TEXTURE_CONTROL3 + unit * 4);
     return t;
+}
+
+class TextureDecodePool {
+public:
+    void start(int n) {
+        for (int k = 0; k < n; k++) {
+            std::thread([this, k] {
+                host::set_thread_name("RSX texture " + std::to_string(k));
+                for (;;) {
+                    std::function<void()> job;
+                    {
+                        std::unique_lock lk(m_);
+                        cv_.wait(lk, [this] { return !q_.empty(); });
+                        job = std::move(q_.front());
+                        q_.pop_front();
+                    }
+                    job();
+                    pending_.fetch_sub(1, std::memory_order_release);
+                }
+            }).detach();
+        }
+        threads_ = n;
+    }
+    int threads() const { return threads_; }
+    void submit(std::function<void()> job) {
+        pending_.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard lk(m_);
+            q_.push_back(std::move(job));
+        }
+        cv_.notify_one();
+    }
+    void sync() {
+        while (pending_.load(std::memory_order_acquire)) {
+            std::function<void()> job;
+            {
+                std::lock_guard lk(m_);
+                if (!q_.empty()) {
+                    job = std::move(q_.back());
+                    q_.pop_back();
+                }
+            }
+            if (job) {
+                job();
+                pending_.fetch_sub(1, std::memory_order_release);
+            } else {
+                _mm_pause();
+            }
+        }
+    }
+
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> q_;
+    std::atomic<uint32_t> pending_{0};
+    int threads_ = 0;
+};
+
+TextureDecodePool g_texture_pool;
+
+TextureDecodePool& texture_pool() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char* e = std::getenv("GOWA_TEXTURE_THREADS");
+        int n = e ? std::atoi(e) : 3;
+        if (n > 0) g_texture_pool.start(std::min(n, 8));
+    });
+    return g_texture_pool;
 }
 
 Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
@@ -1384,7 +1590,11 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
     }
     RingAlloc staging;
     if (!ring_alloc(tex->layout.decoded_size, 16, staging)) return nullptr;
-    decode_texture(src, t, tex->layout, staging.ptr);
+    if (texture_pool().threads() && tex->layout.decoded_size >= 65536 && !g_trace) {
+        texture_pool().submit([src, t, layout = tex->layout, dst = staging.ptr] { decode_texture(src, t, layout, dst); });
+    } else {
+        decode_texture(src, t, tex->layout, staging.ptr);
+    }
     end_pass();
     VkCommandBuffer cmd = frame_cmd();
     VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1596,6 +1806,7 @@ void redirect_pass(Surface* s, TempImage* t, uint32_t w, uint32_t h) {
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
     vkCmdBeginRendering(cmd, &ri);
+    g_dyn = DynState{};
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_redirect_pipeline);
     VkDescriptorImageInfo ii{g_point_sampler, depth_view(s), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii, nullptr, nullptr};
@@ -1718,6 +1929,7 @@ void dump_texture(const TextureRegs& t, uint32_t ea) {
 Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth) {
     g_bind_kind = "dummy";
     Binding b = bind_texture_impl(unit, dim, colors, depth);
+    if (!b.sampler) b.sampler = sampler(texture_regs(unit), 1, false);
     if (trace::on(trace::TEX)) {
         TextureRegs t = texture_regs(unit);
         static const char* kinds[] = {"dummy", "memory", "depth redirect", "feedback copy", "surface region", "depth surface", "color surface"};
@@ -1738,7 +1950,6 @@ Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& c
 Binding bind_texture_impl(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth) {
     Binding b{g_dummy[dim].view, VK_NULL_HANDLE};
     TextureRegs t = texture_regs(unit);
-    b.sampler = sampler(t, 1, false);
     if (!(t.control0 >> 31)) return b;
     uint32_t loc = (t.format & 3) - 1;
     uint32_t code = ((t.format >> 8) & 0xFF) & ~0x60u;
@@ -2125,9 +2336,14 @@ VkPipeline pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule fs) 
     g_compile_frame.pipelines++;
     g_stats.pipelines++;
     if (async_compile()) {
-        if (vk().cache_control && create_pipeline(k, vs, fs, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, e.pipeline) == VK_SUCCESS) {
-            e.ready.store(true, std::memory_order_release);
-            return e.pipeline;
+        if (vk().cache_control && sync_compile_budget()) {
+            SyncTimer st;
+            if (create_pipeline(k, vs, fs, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, e.pipeline) == VK_SUCCESS) {
+                e.ready.store(true, std::memory_order_release);
+                return e.pipeline;
+            }
+        } else if (vk().cache_control) {
+            g_compile_frame.deferred++;
         }
         g_compile_pool.submit([&e, k, vs, fs] {
             create_pipeline(k, vs, fs, 0, e.pipeline);
@@ -2201,6 +2417,65 @@ void build_indices(std::vector<uint32_t>& raw, bool& inline_draw, uint32_t& inli
         if (!raw.empty()) raw.push_back(RESTART);
         for (uint32_t n = 0; n < count; n++) raw.push_back(first + n);
     }
+}
+
+bool fast_indices(RingAlloc& ib, uint32_t& count, uint32_t& vmin, uint32_t& vmax, VkPrimitiveTopology& topo) {
+    if (g_trace || !g_inline.empty() || !g_indexed || g_ranges.size() != 1 || (g_prim != 5 && g_prim != 6)) return false;
+    uint32_t dma = R(INDEX_ARRAY_DMA);
+    if (((dma >> 4) & 0xF) != 1) return false;
+    uint32_t ea = lv2::rsx_address(R(INDEX_ARRAY_ADDRESS), dma & 0xF);
+    if (!ea) return false;
+    ea &= ~1u;
+    auto [first, n] = g_ranges[0];
+    if (!readable(ea, uint64_t(first + n) * 2)) return false;
+    if (g_prim == 5) n -= n % 3;
+    if (!n) return false;
+    bool restart = R(RESTART_INDEX_ENABLE) != 0 && R(RESTART_INDEX) <= 0xFFFF;
+    uint32_t restart_value = R(RESTART_INDEX);
+    uint32_t base = R(VERTEX_BASE_INDEX);
+    if (!ring_alloc(uint64_t(n) * 4, 16, ib)) return false;
+    const uint8_t* src = vm::ptr(ea + first * 2);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(ib.ptr);
+    const __m256i swap = _mm256_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    const __m256i vbase = _mm256_set1_epi32(int32_t(base)), mask = _mm256_set1_epi32(0xFFFFF), rv = _mm256_set1_epi32(int32_t(restart_value));
+    __m256i lo_min = _mm256_set1_epi32(-1), hi_max = _mm256_setzero_si256(), hit = _mm256_setzero_si256();
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256i x = _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i * 2)), swap);
+        __m256i a = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(x));
+        __m256i b = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(x, 1));
+        if (restart) hit = _mm256_or_si256(hit, _mm256_or_si256(_mm256_cmpeq_epi32(a, rv), _mm256_cmpeq_epi32(b, rv)));
+        a = _mm256_and_si256(_mm256_add_epi32(a, vbase), mask);
+        b = _mm256_and_si256(_mm256_add_epi32(b, vbase), mask);
+        lo_min = _mm256_min_epu32(lo_min, _mm256_min_epu32(a, b));
+        hi_max = _mm256_max_epu32(hi_max, _mm256_max_epu32(a, b));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), a);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i + 8), b);
+    }
+    if (!_mm256_testz_si256(hit, hit)) return false;
+    alignas(32) uint32_t mn[8], mx[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(mn), lo_min);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(mx), hi_max);
+    uint32_t lo = ~0u, hi = 0;
+    for (uint32_t k = 0; k < 8; k++) {
+        lo = std::min(lo, mn[k]);
+        hi = std::max(hi, mx[k]);
+    }
+    for (; i < n; i++) {
+        uint16_t w;
+        std::memcpy(&w, src + i * 2, 2);
+        uint32_t v = __builtin_bswap16(w);
+        if (restart && v == restart_value) return false;
+        v = (v + base) & 0xFFFFF;
+        dst[i] = v;
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+    }
+    count = n;
+    vmin = lo;
+    vmax = hi;
+    topo = g_prim == 5 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    return true;
 }
 
 VkPrimitiveTopology expand(uint32_t prim, const std::vector<uint32_t>& in, std::vector<uint32_t>& out, bool& restart) {
@@ -2284,11 +2559,36 @@ bool upload_uniform(const void* data, size_t size, VkDescriptorBufferInfo& out) 
     return true;
 }
 
+bool upload_uniform_cached(uint32_t slot, const void* data, size_t size, VkDescriptorBufferInfo& out) {
+    struct Cached {
+        uint64_t serial = ~0ull;
+        std::vector<uint8_t> data;
+        VkDescriptorBufferInfo info{};
+    };
+    static Cached cache[4];
+    Cached& c = cache[slot];
+    uint64_t serial = frame_serial();
+    if (c.serial == serial && c.data.size() == size && std::memcmp(c.data.data(), data, size) == 0) {
+        out = c.info;
+        return true;
+    }
+    if (!upload_uniform(data, size, out)) return false;
+    c.serial = serial;
+    c.data.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+    c.info = out;
+    return true;
+}
+
 void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w, uint32_t h) {
     bool same = g_pass.active && g_pass.color_count == colors.size() && g_pass.depth == depth && g_pass.width == w && g_pass.height == h;
     for (uint32_t i = 0; same && i < colors.size(); i++) same = g_pass.colors[i] == colors[i];
     if (same) return;
     end_pass();
+    static const uint32_t submit_draws = std::getenv("GOWA_SUBMIT_DRAWS") ? static_cast<uint32_t>(std::atoi(std::getenv("GOWA_SUBMIT_DRAWS"))) : 150;
+    if (submit_draws && g_draws_since_submit >= submit_draws) {
+        g_draws_since_submit = 0;
+        submit_partial();
+    }
     for (Surface* s : colors) {
         transition(s, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         s->generation++;
@@ -2332,6 +2632,7 @@ void begin_pass(const std::vector<Surface*>& colors, Surface* depth, uint32_t w,
 
 std::map<int, uint64_t> g_skip_lines;
 
+
 bool skip(int line) {
     g_skip_lines[line]++;
     if (g_trace) LOG_INFO("rsx", "  draw skipped at line %d", line);
@@ -2362,18 +2663,21 @@ bool draw() {
         return skip(__LINE__);
     }
     static std::vector<uint32_t> raw;
-    raw.clear();
     bool inline_draw = false;
     uint32_t inline_stride = 0;
     g_stats.phase[0] += ticks() - ph;
     ph = ticks();
-    build_indices(raw, inline_draw, inline_stride);
     static std::vector<uint32_t> indices;
     bool restart = false;
-    VkPrimitiveTopology topo = expand(g_prim, raw, indices, restart);
-    if (topo == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM || indices.empty()) return skip(__LINE__);
-    uint32_t vmin = ~0u, vmax = 0;
-    {
+    VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+    uint32_t vmin = ~0u, vmax = 0, index_count = 0;
+    RingAlloc ib;
+    bool fast_ib = fast_indices(ib, index_count, vmin, vmax, topo);
+    if (!fast_ib) {
+        raw.clear();
+        build_indices(raw, inline_draw, inline_stride);
+        topo = expand(g_prim, raw, indices, restart);
+        if (topo == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM || indices.empty()) return skip(__LINE__);
         const uint32_t* ip = indices.data();
         size_t n = indices.size();
         for (size_t i = 0; i < n; i++) {
@@ -2381,6 +2685,7 @@ bool draw() {
             vmin = std::min(vmin, v);
             vmax = std::max(vmax, v == RESTART ? 0u : v);
         }
+        index_count = static_cast<uint32_t>(n);
     }
     if (vmin > vmax || vmax - vmin > (1u << 20)) return skip(__LINE__);
     uint32_t vcount = vmax - vmin + 1;
@@ -2408,9 +2713,9 @@ bool draw() {
         ni++;
     }
     g_stats.phase[7] += ticks() - bind_start;
+    static const VkSampler dummy_sampler = sampler(TextureRegs{}, 1, false);
     for (uint32_t t = 0; t < 4; t++) {
-        TextureRegs dummy_regs;
-        images[ni] = {sampler(dummy_regs, 1, false), g_dummy[1].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        images[ni] = {dummy_sampler, g_dummy[1].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         writes[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 16 + t, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &images[ni], nullptr, nullptr};
         nw++;
         ni++;
@@ -2443,8 +2748,9 @@ bool draw() {
     vs.flags[1] = R(TWO_SIDE_LIGHT) ? 1 : 0;
     vs.flags[2] = R(POINT_SIZE);
     vs.flags[3] = R(BRANCH_BITS);
-    if (!upload_uniform(&vs, sizeof vs, ubo[1])) return skip(__LINE__);
-    std::vector<float> lits(std::max<size_t>(1, fp->literal_slots.size()) * 4, 0.0f);
+    if (!upload_uniform_cached(1, &vs, sizeof vs, ubo[1])) return skip(__LINE__);
+    static std::vector<float> lits;
+    lits.assign(std::max<size_t>(1, fp->literal_slots.size()) * 4, 0.0f);
     for (size_t i = 0; i < fp->literal_slots.size(); i++) {
         uint32_t a = fp_ea + (fp->start_slot + fp->literal_slots[i]) * 16;
         for (uint32_t k = 0; k < 4; k++) {
@@ -2453,7 +2759,7 @@ bool draw() {
             std::memcpy(&lits[i * 4 + k], &v, 4);
         }
     }
-    if (!upload_uniform(lits.data(), lits.size() * 4, ubo[2])) return skip(__LINE__);
+    if (!upload_uniform_cached(2, lits.data(), lits.size() * 4, ubo[2])) return skip(__LINE__);
     if (mv::enabled() && fp->hash == mv::kCameraVelocityFp && !colors.empty()) mv::set_camera(lits.data(), lits.size() / 4, colors[0]->offset, texture_regs(1).offset);
     struct FragmentState {
         float window[4];
@@ -2482,7 +2788,7 @@ bool draw() {
     fs.flags[2] = R(ALPHA_FUNC) & 7;
     static uint32_t fp_debug = std::getenv("GOWA_FP_DEBUG") ? std::atoi(std::getenv("GOWA_FP_DEBUG")) : 0;
     fs.flags[3] = fp_debug;
-    if (!upload_uniform(&fs, sizeof fs, ubo[3])) return skip(__LINE__);
+    if (!upload_uniform_cached(3, &fs, sizeof fs, ubo[3])) return skip(__LINE__);
     for (uint32_t i = 0; i < 4; i++) {
         writes[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, i, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &ubo[i], nullptr};
         nw++;
@@ -2595,20 +2901,21 @@ bool draw() {
         if (gpu_check[i] && vdata[i]) edge_compute::add_check(gpu_check[i], vdata[i], vcount, check_ea[i]);
     g_stats.phase[3] += ticks() - ph;
     ph = ticks();
-    RingAlloc ib;
-    if (!ring_alloc(indices.size() * 4, 16, ib)) return skip(__LINE__);
+    if (!fast_ib) {
+        if (!ring_alloc(indices.size() * 4, 16, ib)) return skip(__LINE__);
+        std::memcpy(ib.ptr, indices.data(), indices.size() * 4);
+    }
     uint32_t* idx_out = reinterpret_cast<uint32_t*>(ib.ptr);
-    std::memcpy(idx_out, indices.data(), indices.size() * 4);
     static const char* geom_dir = std::getenv("GOWA_DUMP_GEOM");
     if (g_trace && geom_dir && vdata[0]) {
         char fn[512];
         std::snprintf(fn, sizeof fn, "%s/geom_%04u.bin", geom_dir, g_frame_draw);
         if (FILE* f = std::fopen(fn, "wb")) {
-            uint32_t hdr[8] = {0x4D4F4547u, g_frame_draw, g_prim, vcount, static_cast<uint32_t>(indices.size()), static_cast<uint32_t>(vstrides[0]), colors.empty() ? 0u : colors[0]->offset, R(COLOR_MASK)};
+            uint32_t hdr[8] = {0x4D4F4547u, g_frame_draw, g_prim, vcount, index_count, static_cast<uint32_t>(vstrides[0]), colors.empty() ? 0u : colors[0]->offset, R(COLOR_MASK)};
             std::fwrite(hdr, 4, 8, f);
             std::fwrite(&g_vp_constants[264 * 4], 4, 16, f);
             std::fwrite(vdata[0], 4, size_t(vstrides[0] ? vcount : 1) * 4, f);
-            std::fwrite(idx_out, 4, indices.size(), f);
+            std::fwrite(idx_out, 4, index_count, f);
             std::fclose(f);
         }
     }
@@ -2645,7 +2952,7 @@ bool draw() {
             (void)dummy;
         }
         LOG_INFO("rsx", "draw #%u prim %u idx %zu verts %u [%u..%u] targets %zu c0 0x%x fmt %u depth 0x%x %ux%u scissor %u,%u-%u,%u vs %.3f %.3f %.3f off %.3f %.3f %.3f fptex 0x%x inline %d blend 0x%x mask 0x%x omask 0x%x", g_frame_draw, g_prim,
-                 indices.size(), vcount, vmin, vmax, colors.size(), colors.empty() ? 0 : colors[0]->offset, R(SURFACE_FORMAT) & 0x1F, depth ? depth->offset : 0, w, h, x0, y0, x1, y1, vs.scale[0],
+                 size_t(index_count), vcount, vmin, vmax, colors.size(), colors.empty() ? 0 : colors[0]->offset, R(SURFACE_FORMAT) & 0x1F, depth ? depth->offset : 0, w, h, x0, y0, x1, y1, vs.scale[0],
                  vs.scale[1], vs.scale[2], vs.offset[0], vs.offset[1], vs.offset[2], fp->textures, inline_draw, k.blend_mask, k.write_masks, vs.flags[0]);
         (void)p0;
         TextureRegs t0 = texture_regs(0);
@@ -2664,11 +2971,11 @@ bool draw() {
             const float* d = vdata[i];
             LOG_INFO("rsx", "  input %u fmt 0x%x off 0x%x stride %u idxbuf 0x%x v0 %g %g %g %g", i, f, R(VERTEX_ARRAY_OFFSET + i * 4), unsigned(vstrides[i]), lv2::rsx_address(R(INDEX_ARRAY_ADDRESS), R(INDEX_ARRAY_DMA) & 0xF), d ? d[0] : 0, d ? d[1] : 0, d ? d[2] : 0, d ? d[3] : 0);
         }
-        if (vdata[0] && vstrides[0] == 16 && indices.size() >= 3) {
+        if (vdata[0] && vstrides[0] == 16 && index_count >= 3) {
             const float* m = &g_vp_constants[264 * 4];
             float wx[3], wy[3], ww[3];
             for (int k = 0; k < 3; k++) {
-                const float* v = vdata[0] + (indices[k] - vmin) * 4;
+                const float* v = vdata[0] + (idx_out[k] - vmin) * 4;
                 float cx = v[0] * m[0] + v[1] * m[4] + v[2] * m[8] + v[3] * m[12];
                 float cy = v[0] * m[1] + v[1] * m[5] + v[2] * m[9] + v[3] * m[13];
                 float cw = v[0] * m[3] + v[1] * m[7] + v[2] * m[11] + v[3] * m[15];
@@ -2718,60 +3025,116 @@ bool draw() {
     }
     if (mv::enabled()) mv_draw(colors, w, h, fp->hash, vp->hash, vcount);
     begin_pass(colors, depth, w, h);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
-    for (uint32_t i = 0; i < 16; i++) {
-        if (vp->inputs & (1u << i)) vkCmdBindVertexBuffers2(cmd, i, 1, &vbufs[i], &voffs[i], nullptr, &vstrides[i]);
+    cmd = frame_cmd();
+    g_draws_since_submit++;
+    DynState& ds = g_dyn;
+    if (ds.cmd != cmd || ds.generation != cmd_generation() || g_no_state_cache) {
+        ds = DynState{};
+        ds.cmd = cmd;
+        ds.generation = cmd_generation();
     }
-    vkCmdBindIndexBuffer(cmd, ib.buffer, ib.offset, VK_INDEX_TYPE_UINT32);
+    if (ds.pipeline != pipe) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        ds.pipeline = pipe;
+    }
+    if (!ds.set || ds.push_textures != fp->textures || ds.push_images != ni || std::memcmp(ds.images, images, ni * sizeof images[0]) != 0 || std::memcmp(ds.ubo, ubo, sizeof ubo) != 0) {
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout, 0, nw, writes);
+        ds.push_textures = fp->textures;
+        ds.push_images = ni;
+        std::memcpy(ds.images, images, ni * sizeof images[0]);
+        std::memcpy(ds.ubo, ubo, sizeof ubo);
+    }
+    for (uint32_t i = 0; i < 16; i++) {
+        if (!(vp->inputs & (1u << i)) || (ds.vb[i] == vbufs[i] && ds.vo[i] == voffs[i] && ds.vs[i] == vstrides[i])) continue;
+        vkCmdBindVertexBuffers2(cmd, i, 1, &vbufs[i], &voffs[i], nullptr, &vstrides[i]);
+        ds.vb[i] = vbufs[i];
+        ds.vo[i] = voffs[i];
+        ds.vs[i] = vstrides[i];
+    }
+    if (ds.ib != ib.buffer || ds.ibo != ib.offset) {
+        vkCmdBindIndexBuffer(cmd, ib.buffer, ib.offset, VK_INDEX_TYPE_UINT32);
+        ds.ib = ib.buffer;
+        ds.ibo = ib.offset;
+    }
     float ps = colors.empty() ? (depth ? depth->scale : 1.0f) : colors[0]->scale;
     VkViewport viewport{0, 0, float(w) * ps, float(h) * ps, 0.0f, 1.0f};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    if (!ds.set || std::memcmp(&ds.viewport, &viewport, sizeof viewport) != 0) {
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        ds.viewport = viewport;
+    }
     uint32_t scx0 = x0 ? up(x0, ps) : 0, scy0 = y0 ? up(y0, ps) : 0;
     VkRect2D scissor{{int32_t(scx0), int32_t(scy0)}, {up(x1, ps) - scx0, up(y1, ps) - scy0}};
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    if (!ds.set || std::memcmp(&ds.scissor, &scissor, sizeof scissor) != 0) {
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        ds.scissor = scissor;
+    }
     uint32_t lw = R(LINE_WIDTH);
-    vkCmdSetLineWidth(cmd, vk().features.wideLines ? std::max(1.0f, (lw >> 3) + (lw & 7) / 8.0f) : 1.0f);
-    vkCmdSetDepthBiasEnable(cmd, R(POLY_OFFSET_FILL) ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthBias(cmd, RF(POLY_OFFSET_BIAS), 0.0f, RF(POLY_OFFSET_SCALE));
+    float line = vk().features.wideLines ? std::max(1.0f, (lw >> 3) + (lw & 7) / 8.0f) : 1.0f;
+    if (!ds.set || ds.line != line) {
+        vkCmdSetLineWidth(cmd, line);
+        ds.line = line;
+    }
+    uint32_t bias_on = R(POLY_OFFSET_FILL) ? 1 : 0;
+    if (!ds.set || ds.bias_on != bias_on) {
+        vkCmdSetDepthBiasEnable(cmd, bias_on ? VK_TRUE : VK_FALSE);
+        ds.bias_on = bias_on;
+    }
+    uint32_t bias[2] = {R(POLY_OFFSET_BIAS), R(POLY_OFFSET_SCALE)};
+    if (!ds.set || ds.bias[0] != bias[0] || ds.bias[1] != bias[1]) {
+        vkCmdSetDepthBias(cmd, RF(POLY_OFFSET_BIAS), 0.0f, RF(POLY_OFFSET_SCALE));
+        ds.bias[0] = bias[0];
+        ds.bias[1] = bias[1];
+    }
     uint32_t bc = R(BLEND_COLOR);
-    float blend[4] = {((bc >> 16) & 0xFF) / 255.0f, ((bc >> 8) & 0xFF) / 255.0f, (bc & 0xFF) / 255.0f, ((bc >> 24) & 0xFF) / 255.0f};
-    vkCmdSetBlendConstants(cmd, blend);
+    if (!ds.set || ds.blend != bc) {
+        float blend[4] = {((bc >> 16) & 0xFF) / 255.0f, ((bc >> 8) & 0xFF) / 255.0f, (bc & 0xFF) / 255.0f, ((bc >> 24) & 0xFF) / 255.0f};
+        vkCmdSetBlendConstants(cmd, blend);
+        ds.blend = bc;
+    }
     bool two_sided = R(TWO_SIDED_STENCIL) != 0;
     uint32_t fb[2][4] = {{STENCIL_MASK, STENCIL_FUNC, STENCIL_REF, STENCIL_FUNC_MASK}, {BACK_STENCIL_MASK, BACK_STENCIL_FUNC, BACK_STENCIL_REF, BACK_STENCIL_FUNC_MASK}};
     uint32_t ops[2] = {STENCIL_OP_FAIL, BACK_STENCIL_OP_FAIL};
     for (uint32_t face = 0; face < 2; face++) {
         uint32_t s = two_sided ? face : 0;
+        uint32_t st[7] = {R(fb[s][0]) & 0xFF, R(fb[s][2]) & 0xFF, R(fb[s][3]) & 0xFF, R(ops[s]), R(ops[s] + 8), R(ops[s] + 4), R(fb[s][1])};
+        if (ds.set && std::memcmp(ds.stencil[face], st, sizeof st) == 0) continue;
         VkStencilFaceFlags ff = face ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
-        vkCmdSetStencilWriteMask(cmd, ff, R(fb[s][0]) & 0xFF);
-        vkCmdSetStencilReference(cmd, ff, R(fb[s][2]) & 0xFF);
-        vkCmdSetStencilCompareMask(cmd, ff, R(fb[s][3]) & 0xFF);
-        vkCmdSetStencilOp(cmd, ff, stencil_op(R(ops[s])), stencil_op(R(ops[s] + 8)), stencil_op(R(ops[s] + 4)), compare_op(R(fb[s][1])));
+        vkCmdSetStencilWriteMask(cmd, ff, st[0]);
+        vkCmdSetStencilReference(cmd, ff, st[1]);
+        vkCmdSetStencilCompareMask(cmd, ff, st[2]);
+        vkCmdSetStencilOp(cmd, ff, stencil_op(st[3]), stencil_op(st[4]), stencil_op(st[5]), compare_op(st[6]));
+        std::memcpy(ds.stencil[face], st, sizeof st);
     }
     bool has_stencil = depth && depth->format == VK_FORMAT_D24_UNORM_S8_UINT;
-    vkCmdSetStencilTestEnable(cmd, has_stencil && R(STENCIL_TEST_ENABLE) ? VK_TRUE : VK_FALSE);
     bool dtest = depth && R(DEPTH_TEST_ENABLE);
-    vkCmdSetDepthTestEnable(cmd, dtest ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthWriteEnable(cmd, dtest && R(DEPTH_MASK) ? VK_TRUE : VK_FALSE);
     VkCompareOp depth_op = compare_op(R(DEPTH_FUNC));
     if (depth_op == VK_COMPARE_OP_EQUAL && !R(DEPTH_MASK)) depth_op = (g_experiment & 64) ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_LESS_OR_EQUAL;
-    vkCmdSetDepthCompareOp(cmd, depth_op);
-    if (vk().features.depthBounds) {
-        vkCmdSetDepthBoundsTestEnable(cmd, depth && R(DEPTH_BOUNDS_ENABLE) ? VK_TRUE : VK_FALSE);
-        vkCmdSetDepthBounds(cmd, std::clamp(RF(DEPTH_BOUNDS_MIN), 0.0f, 1.0f), std::clamp(RF(DEPTH_BOUNDS_MAX), 0.0f, 1.0f));
-    }
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
     if (R(CULL_FACE_ENABLE)) {
         uint32_t cf = R(CULL_FACE);
         cull = cf == 0x404 ? VK_CULL_MODE_FRONT_BIT : cf == 0x408 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_BACK_BIT;
     }
     if (g_experiment & 16) cull = VK_CULL_MODE_NONE;
-    vkCmdSetCullMode(cmd, cull);
     bool cw = R(FRONT_FACE) == 0x900;
     if (g_experiment & 32) cw = !cw;
-    vkCmdSetFrontFace(cmd, cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
-    vkCmdSetPrimitiveTopology(cmd, topo);
-    vkCmdSetPrimitiveRestartEnable(cmd, restart ? VK_TRUE : VK_FALSE);
+    float bounds[2] = {std::clamp(RF(DEPTH_BOUNDS_MIN), 0.0f, 1.0f), std::clamp(RF(DEPTH_BOUNDS_MAX), 0.0f, 1.0f)};
+    uint32_t fixed[11] = {has_stencil && R(STENCIL_TEST_ENABLE) ? 1u : 0u, dtest ? 1u : 0u, dtest && R(DEPTH_MASK) ? 1u : 0u, uint32_t(depth_op), depth && R(DEPTH_BOUNDS_ENABLE) ? 1u : 0u, 0, 0,
+                          uint32_t(cull), cw ? 1u : 0u, uint32_t(topo), restart ? 1u : 0u};
+    std::memcpy(&fixed[5], bounds, sizeof bounds);
+    if (!ds.set || fixed[0] != ds.fixed[0]) vkCmdSetStencilTestEnable(cmd, fixed[0] ? VK_TRUE : VK_FALSE);
+    if (!ds.set || fixed[1] != ds.fixed[1]) vkCmdSetDepthTestEnable(cmd, fixed[1] ? VK_TRUE : VK_FALSE);
+    if (!ds.set || fixed[2] != ds.fixed[2]) vkCmdSetDepthWriteEnable(cmd, fixed[2] ? VK_TRUE : VK_FALSE);
+    if (!ds.set || fixed[3] != ds.fixed[3]) vkCmdSetDepthCompareOp(cmd, depth_op);
+    if (vk().features.depthBounds) {
+        if (!ds.set || fixed[4] != ds.fixed[4]) vkCmdSetDepthBoundsTestEnable(cmd, fixed[4] ? VK_TRUE : VK_FALSE);
+        if (!ds.set || fixed[5] != ds.fixed[5] || fixed[6] != ds.fixed[6]) vkCmdSetDepthBounds(cmd, bounds[0], bounds[1]);
+    }
+    if (!ds.set || fixed[7] != ds.fixed[7]) vkCmdSetCullMode(cmd, cull);
+    if (!ds.set || fixed[8] != ds.fixed[8]) vkCmdSetFrontFace(cmd, cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    if (!ds.set || fixed[9] != ds.fixed[9]) vkCmdSetPrimitiveTopology(cmd, topo);
+    if (!ds.set || fixed[10] != ds.fixed[10]) vkCmdSetPrimitiveRestartEnable(cmd, restart ? VK_TRUE : VK_FALSE);
+    std::memcpy(ds.fixed, fixed, sizeof fixed);
+    ds.set = true;
     bool query = zcount && g_qpool && !g_qreset_needed && g_qused < QMAX;
     uint32_t qidx = 0;
     if (query) {
@@ -2781,7 +3144,7 @@ bool draw() {
     uint32_t draw_index = g_frame_draw++;
     static const bool skip_color_only = std::getenv("GOWA_SKIP_COLOR_ONLY") != nullptr;
     bool skip_draw = g_skip_init && draw_index >= g_skip_lo && draw_index <= g_skip_hi && (!skip_color_only || k.write_masks != 0);
-    if (!(g_experiment & 1) && !skip_draw) vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, -static_cast<int32_t>(vmin), 0);
+    if (!(g_experiment & 1) && !skip_draw) vkCmdDrawIndexed(cmd, index_count, 1, 0, -static_cast<int32_t>(vmin), 0);
     if (query) {
         vkCmdEndQuery(cmd, g_qpool, qidx);
         g_counter_queries.push_back(qidx);
@@ -2830,6 +3193,7 @@ uint16_t argb_to_565(uint32_t c) {
 }
 
 void nv308a_color(uint32_t index, uint32_t arg) {
+    g_texture_pool.sync();
     if (index >= (R(0xA308) & 0xFFFF)) return;
     uint32_t point = R(0xA304);
     uint32_t x = (point & 0xFFFF) + index, y = point >> 16;
@@ -2844,6 +3208,7 @@ void nv308a_color(uint32_t index, uint32_t arg) {
 }
 
 void nv0039_transfer() {
+    g_texture_pool.sync();
     if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv0039 in 0x%x dma 0x%x out 0x%x dma 0x%x pitch %d/%d len %u lines %u fmt 0x%x", R(0x230C), R(0x2184), R(0x2310), R(0x2188), int32_t(R(0x2314)),
                                                  int32_t(R(0x2318)), R(0x231C), R(0x2320), R(0x2324));
     if (g_trace) LOG_INFO("rsx", "trace nv0039 in 0x%x dma 0x%x out 0x%x dma 0x%x pitch %d/%d len %u lines %u fmt 0x%x", R(0x230C), R(0x2184), R(0x2310), R(0x2188), int32_t(R(0x2314)), int32_t(R(0x2318)), R(0x231C), R(0x2320), R(0x2324));
@@ -2871,6 +3236,7 @@ void nv0039_transfer() {
 }
 
 void nv3089_transfer(uint32_t arg) {
+    g_texture_pool.sync();
     if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x clip 0x%x/0x%x dst 0x%x dma 0x%x pitch 0x%x surf 0x%x cfmt 0x%x/0x%x dsdx 0x%x/0x%x arg 0x%x", R(0xC408), R(0xC184),
                                                  R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC308), R(0xC30C), R(0x630C), R(0x6188), R(0x6304), R(0xC198), R(0xC300), R(0x6300), R(0xC318), R(0xC31C), arg);
     if (g_trace) LOG_INFO("rsx", "trace nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x size 0x%x dst 0x%x dma 0x%x surf 0x%x dsdx 0x%x", R(0xC408), R(0xC184), R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC30C), R(0x630C), R(0x6188), R(0xC198), R(0xC318));
@@ -3021,7 +3387,8 @@ struct Writeback {
     uint32_t bpp;
 };
 
-std::vector<Writeback> g_writebacks;
+std::vector<Writeback> g_writebacks[2];
+bool g_complete_all = true;
 
 uint32_t format_bytes(VkFormat f);
 
@@ -3086,13 +3453,13 @@ void schedule_image_snapshot(VkImage image, uint32_t w, uint32_t h, const std::s
     g_dumps.push_back({a.ptr, 0, w, h, VK_FORMAT_R8G8B8A8_UNORM, false, name});
 }
 
-void complete_dumps() {
-    for (const Dump& d : g_dumps) {
+void write_dump(const Dump& d) {
+    {
         char fn[512];
         if (!d.name.empty()) std::snprintf(fn, sizeof fn, "%s", d.name.c_str());
         else std::snprintf(fn, sizeof fn, "surface_%s_%08x_%ux%u_f%d.ppm", d.main ? "main" : (d.format == VK_FORMAT_D24_UNORM_S8_UINT ? "depth" : "local"), d.offset, d.width, d.height, int(d.format));
         FILE* f = std::fopen(fn, "wb");
-        if (!f) continue;
+        if (!f) return;
         std::fprintf(f, "P6\n%u %u\n255\n", d.width, d.height);
         std::vector<uint8_t> row(d.width * 3);
         float zmin = 1e30f, zmax = -1e30f;
@@ -3141,6 +3508,15 @@ void complete_dumps() {
         }
         if (d.name.empty()) LOG_INFO("rsx", "dumped %s z %f..%f", fn, zmin, zmax);
     }
+}
+
+void complete_dumps() {
+    for (const Dump& d : g_dumps) {
+        auto copy = std::make_shared<std::vector<uint8_t>>(d.data, d.data + uint64_t(d.width) * d.height * 4);
+        Dump owned = d;
+        owned.data = copy->data();
+        std::thread([owned, copy] { write_dump(owned); }).detach();
+    }
     g_dumps.clear();
 }
 
@@ -3170,12 +3546,12 @@ void schedule_writebacks() {
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         c.imageExtent = {s->width, s->height, 1};
         vkCmdCopyImageToBuffer(frame_cmd(), s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, a.buffer, 1, &c);
-        g_writebacks.push_back({a.ptr, ea, pitch, s->width, s->height, bpp});
+        g_writebacks[frame_serial() & 1].push_back({a.ptr, ea, pitch, s->width, s->height, bpp});
     }
 }
 
-void complete_writebacks() {
-    for (const Writeback& w : g_writebacks) {
+void complete_writebacks(std::vector<Writeback>& list) {
+    for (const Writeback& w : list) {
         for (uint32_t y = 0; y < w.height; y++) {
             const uint8_t* src = w.data + uint64_t(y) * w.width * w.bpp;
             uint8_t* dst = vm::ptr(w.ea + y * w.pitch);
@@ -3208,7 +3584,7 @@ void complete_writebacks() {
             }
         }
     }
-    g_writebacks.clear();
+    list.clear();
 }
 
 void set_immediate(uint32_t attr, const float* v, uint32_t n) {
@@ -3320,11 +3696,25 @@ uint32_t zpass_value(uint32_t ea) {
     return it != g_zpass_cache.end() ? it->second : big;
 }
 
-void frame_complete() {
+void frame_complete_body();
+
+void sync_decodes() { g_texture_pool.sync(); }
+
+uint32_t needs_full_wait() { return (g_dumps.empty() ? 0u : 2u) | (g_qpool && g_qused ? 4u : 0u) | (mv::pending() ? 8u : 0u) | (edge_compute::enabled() ? 16u : 0u); }
+
+void frame_complete(bool all) {
+    g_complete_all = all;
+    g_texture_pool.sync();
+    uint64_t complete_start = ticks();
+    frame_complete_body();
+    g_stats.complete_ticks += ticks() - complete_start;
+}
+
+void frame_complete_body() {
     g_frame_draw = 0;
     double compile_ms = std::chrono::duration<double, std::milli>(g_compile_frame.time).count();
     if (compile_ms > 4.0) {
-        LOG_INFO("rsx", "compile stall %.1f ms (vp %u, fp %u, pipelines %u)", compile_ms, g_compile_frame.vp, g_compile_frame.fp, g_compile_frame.pipelines);
+        LOG_INFO("rsx", "compile stall %.1f ms (vp %u, fp %u, pipelines %u, %u deferred past the budget)", compile_ms, g_compile_frame.vp, g_compile_frame.fp, g_compile_frame.pipelines, g_compile_frame.deferred);
     }
     g_compile_frame = {};
     if (!g_vb_checks.empty()) {
@@ -3339,22 +3729,77 @@ void frame_complete() {
     }
     edge_compute::frame_complete();
     resolve_zpass();
-    complete_writebacks();
+    uint64_t serial = frame_serial();
+    complete_writebacks(g_writebacks[(serial + 1) & 1]);
+    if (g_complete_all) complete_writebacks(g_writebacks[serial & 1]);
     complete_dumps();
     mv::complete();
     if (!std::getenv("GOWA_NO_GC")) collect_garbage();
 }
 
+namespace {
+
+inline void vp_word(uint32_t arg) {
+    uint32_t load = R(TRANSFORM_PROGRAM_LOAD);
+    if (g_vp_load_word / 4 != load && (g_vp_load_word % 4) == 0) g_vp_load_word = load * 4;
+    if (g_vp_load_word < 544 * 4 && g_vp_ucode[g_vp_load_word] != arg) {
+        g_vp_ucode[g_vp_load_word] = arg;
+        g_vp_ucode_serial++;
+    }
+    g_vp_load_word++;
+    g_regs[(TRANSFORM_PROGRAM_LOAD >> 2)] = g_vp_load_word / 4;
+}
+
+}
+
+uint32_t* registers() { return g_regs; }
+
+const uint8_t* special_methods() {
+    static const auto table = [] {
+        std::array<uint8_t, 0x4000> t{};
+        auto mark = [&](uint32_t from, uint32_t to) {
+            for (uint32_t r = from; r < to; r += 4) t[(r >> 2) & 0x3FFF] = 1;
+        };
+        mark(TRANSFORM_PROGRAM, TRANSFORM_PROGRAM + 128);
+        mark(TRANSFORM_CONSTANT, TRANSFORM_CONSTANT + 128);
+        mark(0x0A80, 0x0B00);
+        mark(0x1500, 0x1600);
+        mark(0x1880, 0x1A00);
+        mark(0x1C00, 0x1D00);
+        mark(0x1E40, 0x1E80);
+        mark(0xA400, 0xC000);
+        for (uint32_t r : {uint32_t(TRANSFORM_PROGRAM_LOAD), uint32_t(TRANSFORM_CONSTANT_LOAD), uint32_t(BEGIN_END), uint32_t(ARRAY_ELEMENT16), uint32_t(ARRAY_ELEMENT32), uint32_t(DRAW_ARRAYS),
+                           uint32_t(INLINE_ARRAY), uint32_t(DRAW_INDEX_ARRAY), uint32_t(CLEAR_SURFACE), 0x17C8u, 0x2328u, 0xC40Cu})
+            mark(r, r + 4);
+        return t;
+    }();
+    return table.data();
+}
+
+uint32_t method_run(uint32_t reg, const uint32_t* args, uint32_t n) {
+    if (g_trace) return 0;
+    if (reg == 0x0100) return 1;
+    if (reg >= TRANSFORM_CONSTANT && reg < TRANSFORM_CONSTANT + 128) {
+        uint32_t k = std::min<uint32_t>(n, (TRANSFORM_CONSTANT + 128 - reg) >> 2);
+        uint32_t idx = R(TRANSFORM_CONSTANT_LOAD) * 4 + ((reg - TRANSFORM_CONSTANT) >> 2);
+        uint32_t m = idx < 468 * 4 ? std::min<uint32_t>(k, 468 * 4 - idx) : 0;
+        if (m && std::memcmp(&g_vp_constants[idx], args, m * 4) != 0) {
+            std::memcpy(&g_vp_constants[idx], args, m * 4);
+            g_vp_constants_dirty = true;
+        }
+        return k;
+    }
+    if (reg >= TRANSFORM_PROGRAM && reg < TRANSFORM_PROGRAM + 128) {
+        uint32_t k = std::min<uint32_t>(n, (TRANSFORM_PROGRAM + 128 - reg) >> 2);
+        for (uint32_t i = 0; i < k; i++) vp_word(args[i]);
+        return k;
+    }
+    return 0;
+}
+
 void method(uint32_t reg, uint32_t arg) {
     if (reg >= TRANSFORM_PROGRAM && reg < TRANSFORM_PROGRAM + 128) {
-        uint32_t load = R(TRANSFORM_PROGRAM_LOAD);
-        if (g_vp_load_word / 4 != load && (g_vp_load_word % 4) == 0) g_vp_load_word = load * 4;
-        if (g_vp_load_word < 544 * 4 && g_vp_ucode[g_vp_load_word] != arg) {
-            g_vp_ucode[g_vp_load_word] = arg;
-            g_vp_ucode_serial++;
-        }
-        g_vp_load_word++;
-        g_regs[(TRANSFORM_PROGRAM_LOAD >> 2)] = g_vp_load_word / 4;
+        vp_word(arg);
         return;
     }
     if (reg == TRANSFORM_PROGRAM_LOAD) g_vp_load_word = arg * 4;
@@ -3362,7 +3807,7 @@ void method(uint32_t reg, uint32_t arg) {
     if (reg >= TRANSFORM_CONSTANT && reg < TRANSFORM_CONSTANT + 128) {
         uint32_t idx = R(TRANSFORM_CONSTANT_LOAD) * 4 + ((reg - TRANSFORM_CONSTANT) >> 2);
         if (g_trace && idx < 8) LOG_INFO("rsx", "  const write idx %u reg 0x%x load %u arg 0x%08x", idx, reg, R(TRANSFORM_CONSTANT_LOAD), arg);
-        if (idx < 468 * 4) {
+        if (idx < 468 * 4 && std::memcmp(&g_vp_constants[idx], &arg, 4) != 0) {
             std::memcpy(&g_vp_constants[idx], &arg, 4);
             g_vp_constants_dirty = true;
         }
@@ -3398,7 +3843,12 @@ void method(uint32_t reg, uint32_t arg) {
         g_counter_queries.clear();
     }
     if (reg == BEGIN_END && !(arg & 0xFF) && g_in_begin && R(0x17CC)) g_zpass_draws.fetch_add(1, std::memory_order_relaxed);
-    if (copy_engine(reg, arg)) return;
+    if (reg == 0x2328 || reg == 0xC40C || (reg >= 0xA400 && reg < 0xC000)) {
+        uint64_t ct = ticks();
+        bool handled = copy_engine(reg, arg);
+        g_stats.copy_ticks += ticks() - ct;
+        if (handled) return;
+    }
     if (immediate_method(reg, arg)) return;
     if (!enabled()) return;
     switch (reg) {
@@ -3518,6 +3968,59 @@ bool present(uint32_t buffer_id) {
     end_pass();
     schedule_writebacks();
     static uint64_t presents = 0;
+    static const double slow_ms = std::getenv("GOWA_SLOW_FRAME_MS") ? std::atof(std::getenv("GOWA_SLOW_FRAME_MS")) : 0.0;
+    static FILE* frames_out = [] {
+        FILE* f = session::open("frames.bin");
+        if (f) {
+            const char magic[8] = {'G', 'F', 'R', 'M', '1', 0, 0, 0};
+            std::fwrite(magic, 1, 8, f);
+        }
+        return f;
+    }();
+    if (slow_ms > 0.0 || frames_out) {
+        static uint64_t last = 0;
+        Stats& prev = g_slow_prev;
+        uint64_t now = ticks();
+        double ms = 1000.0 / tick_hz();
+        if (frames_out && last) {
+            const Stats& s = g_stats;
+            struct {
+                double t;
+                float gap, draw, tex, vertices, indices, bind, record, copy, complete, present, fence, gpu;
+                uint32_t draws, skipped, uploads, upload_kb, pipelines, copies;
+            } rec{logging::uptime(),
+                  float(double(now - last) * ms),
+                  float(double(s.draw_ticks - prev.draw_ticks) * ms),
+                  float(double(s.tex_ticks - prev.tex_ticks) * ms),
+                  float(double(s.phase[3] - prev.phase[3]) * ms),
+                  float(double(s.phase[1] - prev.phase[1]) * ms),
+                  float(double(s.phase[7] - prev.phase[7]) * ms),
+                  float(double(s.phase[6] - prev.phase[6]) * ms),
+                  float(double(s.copy_ticks - prev.copy_ticks) * ms),
+                  float(double(s.complete_ticks - prev.complete_ticks) * ms),
+                  float(double(s.present_ticks - prev.present_ticks) * ms),
+                  float(last_fence_wait_ms()),
+                  float(last_gpu_ms()),
+                  uint32_t(s.draws - prev.draws),
+                  uint32_t(s.skipped - prev.skipped),
+                  uint32_t(s.upload_frame - prev.upload_frame),
+                  uint32_t((s.upload_bytes - prev.upload_bytes) >> 10),
+                  uint32_t(s.pipelines - prev.pipelines),
+                  uint32_t(s.copies - prev.copies)};
+            std::fwrite(&rec, sizeof rec, 1, frames_out);
+            static uint32_t n = 0;
+            if (++n % 120 == 0) std::fflush(frames_out);
+        }
+        if (slow_ms > 0.0 && last && double(now - last) * ms >= slow_ms) {
+            const Stats& s = g_stats;
+            LOG_INFO("slowframe", "present gap %.1f ms: draw %.1f (tex %.1f, hash %.1f), present %.1f, fence %.1f, draws %llu, pipelines %llu, uploads %llu (%.1f MB), copies %llu",
+                     double(now - last) * ms, double(s.draw_ticks - prev.draw_ticks) * ms, double(s.tex_ticks - prev.tex_ticks) * ms, double(s.hash_ticks - prev.hash_ticks) * ms,
+                     double(s.present_ticks - prev.present_ticks) * ms, last_fence_wait_ms(), (unsigned long long)(s.draws - prev.draws), (unsigned long long)(s.pipelines - prev.pipelines),
+                     (unsigned long long)(s.upload_frame - prev.upload_frame), double(s.upload_bytes - prev.upload_bytes) / 1048576.0, (unsigned long long)(s.copies - prev.copies));
+        }
+        last = now;
+        prev = g_stats;
+    }
     static uint64_t trace_frame = std::getenv("GOWA_TRACE_FRAME") ? std::strtoull(std::getenv("GOWA_TRACE_FRAME"), nullptr, 0) : 0;
     ++presents;
     if (g_trace) {
@@ -3541,10 +4044,10 @@ bool present(uint32_t buffer_id) {
     if (g_trace) g_trace_serial++;
     if (g_trace) g_trace_draws = 0;
     if (presents % 60 == 0) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        double ms = 1000.0 / double(f.QuadPart) / 60.0;
-        LOG_INFO("rsx", "renderer per frame: draw %.2f ms (textures %.2f ms), present %.2f ms", g_stats.draw_ticks * ms, g_stats.tex_ticks * ms, g_stats.present_ticks * ms);
+        double ms = 1000.0 / tick_hz() / 60.0;
+        LOG_INFO("rsx", "renderer per frame: draw %.2f ms (textures %.2f ms), present %.2f ms, frame complete %.2f ms, copy engine %.2f ms", g_stats.draw_ticks * ms, g_stats.tex_ticks * ms,
+                 g_stats.present_ticks * ms, g_stats.complete_ticks * ms, g_stats.copy_ticks * ms);
+        g_stats.complete_ticks = g_stats.copy_ticks = 0;
         LOG_INFO("rsx", "  phases: programs %.2f indices %.2f textures+ubo %.2f (bind %.2f) vertices %.2f misc %.2f pipeline %.2f record %.2f", g_stats.phase[0] * ms, g_stats.phase[1] * ms, g_stats.phase[2] * ms,
                  g_stats.phase[7] * ms, g_stats.phase[3] * ms, g_stats.phase[4] * ms, g_stats.phase[5] * ms, g_stats.phase[6] * ms);
         std::memset(g_stats.phase, 0, sizeof g_stats.phase);
@@ -3569,6 +4072,7 @@ bool present(uint32_t buffer_id) {
         }
         g_stats.image_allocs = g_stats.pool_hits = g_stats.textures_freed = 0;
         g_stats.draw_ticks = g_stats.tex_ticks = g_stats.present_ticks = 0;
+        g_slow_prev = g_stats;
     }
     if (presents % 300 == 0 && g_stats.pipelines != g_pipelines_saved) {
         g_pipelines_saved = g_stats.pipelines;
@@ -3641,7 +4145,7 @@ bool present(uint32_t buffer_id) {
             }
             if (snap) schedule_snapshot(s.get(), width, height, snap_dir + name);
             uint64_t pt = ticks();
-            present_image(s->image, s->layout, width, height);
+            present_image(s->image, s->layout, std::min(s->iw, up(width, s->scale)), std::min(s->ih, up(height, s->scale)));
             g_stats.present_ticks += ticks() - pt;
             dlssnr::end_frame();
             return true;

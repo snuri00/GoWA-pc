@@ -1,5 +1,6 @@
 #include "common.h"
 #include "runtime/vfs.h"
+#include "runtime/compat.h"
 
 #include <sys/stat.h>
 

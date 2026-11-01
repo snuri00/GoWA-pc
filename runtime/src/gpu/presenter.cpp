@@ -1,4 +1,5 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
 #include "gpu/presenter.h"
 #include "gpu/rsx.h"
 #include "vk_context.h"
@@ -9,6 +10,7 @@
 #include "runtime/memory.h"
 #include "runtime/hooks.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <condition_variable>
@@ -17,6 +19,11 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#endif
 
 namespace gpu {
 
@@ -31,8 +38,25 @@ struct DisplayBuffer {
     uint32_t height = 0;
 };
 
+constexpr uint32_t kFrames = 2;
+
+struct Slot {
+    std::vector<VkCommandBuffer> inflight_cmds;
+    VkFence fence = VK_NULL_HANDLE;
+    VkQueryPool gpu_time = VK_NULL_HANDLE;
+    bool gpu_time_valid = false;
+    uint32_t ts_used = 0;
+    VkSemaphore acquired = VK_NULL_HANDLE;
+    VkSemaphore rendered = VK_NULL_HANDLE;
+};
+
 struct State {
+#ifdef _WIN32
     HWND hwnd = nullptr;
+#else
+    SDL_Window* window = nullptr;
+    bool window_failed = false;
+#endif
     VkInstance instance = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
@@ -47,7 +71,13 @@ struct State {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkCommandBuffer pre = VK_NULL_HANDLE;
     bool pre_recording = false;
+    std::vector<VkCommandBuffer> spare_cmds;
+    std::vector<VkCommandBuffer> inflight_cmds;
     VkFence fence = VK_NULL_HANDLE;
+    VkQueryPool gpu_time = VK_NULL_HANDLE;
+    float ts_period = 1.0f;
+    bool gpu_time_valid = false;
+    uint32_t ts_used = 0;
     VkSemaphore acquired = VK_NULL_HANDLE;
     VkSemaphore rendered = VK_NULL_HANDLE;
     VkBuffer staging = VK_NULL_HANDLE;
@@ -65,10 +95,60 @@ struct State {
     bool recording = false;
     VkCtx ctx;
     VkPhysicalDeviceFeatures features{};
+    Slot slots[kFrames];
+    uint32_t slot = 0;
+    bool sync_all = false;
 };
 
 State g;
 std::atomic<bool> g_enabled{false};
+double g_last_fence_ms = 0.0;
+double g_last_gpu_ms = 0.0;
+constexpr uint32_t kTimestamps = 256;
+
+void ts_mark(bool end) {
+    if (!g.gpu_time || end != ((g.ts_used & 1) != 0)) return;
+    if (!end && g.ts_used + 2 > kTimestamps) return;
+    vkCmdWriteTimestamp(g.cmd, end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.gpu_time, g.ts_used++);
+}
+
+uint64_t g_cmd_generation = 0;
+
+float window_scale() {
+    float s = dlssnr::mode() == 2 ? 2.0f : 1.0f;
+    if (const char* e = std::getenv("GOWA_RES_SCALE")) s = std::max(s, std::clamp(static_cast<float>(std::atof(e)), 1.0f, 4.0f));
+    return s;
+}
+
+bool want_fullscreen() {
+    const char* e = std::getenv("GOWA_FULLSCREEN");
+    return e && std::atoi(e) != 0;
+}
+
+void fit_window(int& w, int& h, int max_w, int max_h) {
+    if (max_w <= 0 || max_h <= 0 || (w <= max_w && h <= max_h)) return;
+    double k = std::min(double(max_w) / w, double(max_h) / h);
+    w = static_cast<int>(w * k);
+    h = static_cast<int>(h * k);
+}
+
+#ifdef _WIN32
+WINDOWPLACEMENT g_placement{sizeof(WINDOWPLACEMENT)};
+
+void toggle_fullscreen(HWND h) {
+    LONG style = GetWindowLongW(h, GWL_STYLE);
+    if (style & WS_OVERLAPPEDWINDOW) {
+        MONITORINFO mi{sizeof mi};
+        if (GetWindowPlacement(h, &g_placement) && GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            SetWindowLongW(h, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+            SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        }
+    } else {
+        SetWindowLongW(h, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(h, &g_placement);
+        SetWindowPos(h, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+}
 
 LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -78,10 +158,23 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         g.resized = true;
         return 0;
+    case WM_SYSKEYDOWN:
+        if (wp == VK_RETURN && (lp & (1 << 29))) {
+            toggle_fullscreen(h);
+            return 0;
+        }
+        return DefWindowProcW(h, msg, wp, lp);
+    case WM_KEYDOWN:
+        if (wp == VK_F11) {
+            toggle_fullscreen(h);
+            return 0;
+        }
+        return DefWindowProcW(h, msg, wp, lp);
     default:
         return DefWindowProcW(h, msg, wp, lp);
     }
 }
+#endif
 
 uint32_t find_memory_impl(uint32_t bits, VkMemoryPropertyFlags flags) {
     VkPhysicalDeviceMemoryProperties props;
@@ -95,6 +188,14 @@ uint32_t find_memory_impl(uint32_t bits, VkMemoryPropertyFlags flags) {
 bool create_swapchain() {
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps);
+#ifndef _WIN32
+    if (caps.currentExtent.width == UINT32_MAX) {
+        int w = 0, h = 0;
+        SDL_GetWindowSizeInPixels(g.window, &w, &h);
+        caps.currentExtent.width = std::clamp(static_cast<uint32_t>(w), caps.minImageExtent.width, caps.maxImageExtent.width);
+        caps.currentExtent.height = std::clamp(static_cast<uint32_t>(h), caps.minImageExtent.height, caps.maxImageExtent.height);
+    }
+#endif
     if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) return false;
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.phys, g.surface, &n, nullptr);
@@ -135,7 +236,10 @@ bool create_swapchain() {
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = g.swapchain;
     VkSwapchainKHR sc;
-    if (vkCreateSwapchainKHR(g.device, &ci, nullptr, &sc) != VK_SUCCESS) return false;
+    if (VkResult r = vkCreateSwapchainKHR(g.device, &ci, nullptr, &sc); r != VK_SUCCESS) {
+        LOG_ERROR("gpu", "vkCreateSwapchainKHR %ux%u failed %d", g.swap_extent.width, g.swap_extent.height, int(r));
+        return false;
+    }
     if (g.swapchain) vkDestroySwapchainKHR(g.device, g.swapchain, nullptr);
     g.swapchain = sc;
     vkGetSwapchainImagesKHR(g.device, g.swapchain, &n, nullptr);
@@ -194,7 +298,7 @@ uint64_t g_frame_serial = 0;
 struct PresentSnap {
     double every = 0.0;
     double next = 0.0;
-    LARGE_INTEGER freq{}, start{};
+    uint64_t freq = 0, start = 0;
     VkBuffer buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     void* ptr = nullptr;
@@ -229,17 +333,17 @@ void snap_write() {
 }
 
 bool snap_due() {
-    if (!g_snap.freq.QuadPart) {
-        QueryPerformanceFrequency(&g_snap.freq);
-        QueryPerformanceCounter(&g_snap.start);
+    if (!g_snap.freq) {
+        g_snap.freq = host::qpf();
+        g_snap.start = host::qpc();
         const char* e = std::getenv("GOWA_PRESENT_SNAP");
         g_snap.every = e ? std::atof(e) : 0.0;
         g_snap.next = g_snap.every;
     }
     if (g_snap.every <= 0.0) return false;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    double t = double(now.QuadPart - g_snap.start.QuadPart) / double(g_snap.freq.QuadPart);
+    uint64_t now;
+    now = host::qpc();
+    double t = double(now - g_snap.start) / double(g_snap.freq);
     if (t < g_snap.next) return false;
     while (g_snap.next <= t) g_snap.next += g_snap.every;
     const char* d = std::getenv("GOWA_SNAP_DIR");
@@ -278,30 +382,119 @@ void snap_record(VkImage img) {
     g_snap.pending = true;
 }
 
+void save_slot() {
+    Slot& s = g.slots[g.slot];
+    s.inflight_cmds.swap(g.inflight_cmds);
+    g.inflight_cmds.clear();
+    s.fence = g.fence;
+    s.gpu_time = g.gpu_time;
+    s.gpu_time_valid = g.gpu_time_valid;
+    s.ts_used = g.ts_used;
+    s.acquired = g.acquired;
+    s.rendered = g.rendered;
+}
+
+void load_slot(uint32_t i) {
+    Slot& s = g.slots[i];
+    g.slot = i;
+    g.inflight_cmds.swap(s.inflight_cmds);
+    s.inflight_cmds.clear();
+    g.fence = s.fence;
+    g.gpu_time = s.gpu_time;
+    g.gpu_time_valid = s.gpu_time_valid;
+    g.ts_used = s.ts_used;
+    g.acquired = s.acquired;
+    g.rendered = s.rendered;
+}
+
+void recycle(std::vector<VkCommandBuffer>& cmds) {
+    for (VkCommandBuffer c : cmds) {
+        vkResetCommandBuffer(c, 0);
+        g.spare_cmds.push_back(c);
+    }
+    cmds.clear();
+}
+
+VkCommandBuffer spare_cmd();
+
+void wait_all_frames() {
+    VkFence fences[kFrames];
+    for (uint32_t i = 0; i < kFrames; i++) fences[i] = g.slots[i].fence;
+    vkWaitForFences(g.device, kFrames, fences, VK_TRUE, UINT64_MAX);
+}
+
+void retire_cmds(const VkCommandBuffer* cmds, uint32_t n, bool had_pre) {
+    for (uint32_t i = 0; i < n; i++) g.inflight_cmds.push_back(cmds[i]);
+    if (had_pre) g.pre = spare_cmd();
+}
+
 void begin_frame() {
     if (g.recording) return;
-    LARGE_INTEGER a, b, f;
-    QueryPerformanceCounter(&a);
-    if (VkResult wr = vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX); wr != VK_SUCCESS) {
+    uint64_t a, b, f;
+    a = host::qpc();
+    static const bool single = std::getenv("GOWA_FRAMES_IN_FLIGHT") && std::atoi(std::getenv("GOWA_FRAMES_IN_FLIGHT")) <= 1;
+    uint32_t why = (single ? 32u : 0u) | (g.sync_all ? 64u : 0u) | (g_snap.pending ? 128u : 0u) | (dlssg::active() || dlssnr::active() ? 256u : 0u) | gpu::rsx::needs_full_wait();
+    bool full = why != 0;
+    static uint32_t full_n = 0, why_mask = 0;
+    full_n += full;
+    why_mask |= why;
+    g.sync_all = false;
+    uint32_t prev = g.slot, next = (g.slot + 1) % kFrames;
+    save_slot();
+    VkFence fences[kFrames];
+    uint32_t nf = 0;
+    if (full) {
+        for (uint32_t i = 0; i < kFrames; i++) fences[nf++] = g.slots[i].fence;
+    } else {
+        fences[nf++] = g.slots[next].fence;
+    }
+    if (VkResult wr = vkWaitForFences(g.device, nf, fences, VK_TRUE, UINT64_MAX); wr != VK_SUCCESS) {
         static int reported = 0;
         if (reported++ < 5) LOG_ERROR("gpu", "vkWaitForFences failed %d", int(wr));
     }
-    QueryPerformanceCounter(&b);
+    b = host::qpc();
+    if (full) recycle(g.slots[prev].inflight_cmds);
+    load_slot(next);
     snap_write();
-    QueryPerformanceFrequency(&f);
+    f = host::qpf();
     static double total = 0;
     static uint64_t n = 0;
-    total += double(b.QuadPart - a.QuadPart) * 1000.0 / double(f.QuadPart);
-    if (++n % 60 == 0) {
-        LOG_INFO("gpu", "fence wait %.2f ms per frame", total / 60.0);
-        total = 0;
+    g_last_fence_ms = double(b - a) * 1000.0 / double(f);
+    total += g_last_fence_ms;
+    static double gpu_total = 0;
+    if (g.gpu_time && g.gpu_time_valid && g.ts_used >= 2) {
+        uint64_t ts[kTimestamps] = {};
+        uint32_t n = g.ts_used & ~1u;
+        if (vkGetQueryPoolResults(g.device, g.gpu_time, 0, n, n * sizeof ts[0], ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            uint64_t busy = 0, last_end = 0;
+            for (uint32_t i = 0; i + 1 < n; i += 2) {
+                uint64_t a0 = std::max(ts[i], last_end);
+                if (ts[i + 1] > a0) busy += ts[i + 1] - a0;
+                last_end = std::max(last_end, ts[i + 1]);
+            }
+            g_last_gpu_ms = double(busy) * g.ts_period * 1e-6;
+            gpu_total += g_last_gpu_ms;
+        }
     }
-    gpu::rsx::frame_complete();
+    if (++n % 60 == 0) {
+        LOG_INFO("gpu", "fence wait %.2f ms, gpu %.2f ms per frame, %u/60 full waits (0x%x)", total / 60.0, gpu_total / 60.0, full_n, why_mask);
+        full_n = why_mask = 0;
+        total = 0;
+        gpu_total = 0;
+    }
+    recycle(g.inflight_cmds);
+    gpu::rsx::frame_complete(full);
     g_frame_serial++;
-    vkResetCommandBuffer(g.cmd, 0);
+    g.cmd = spare_cmd();
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g.cmd, &begin);
+    g_cmd_generation++;
+    if (g.gpu_time) {
+        vkCmdResetQueryPool(g.cmd, g.gpu_time, 0, kTimestamps);
+        g.ts_used = 0;
+        ts_mark(false);
+    }
     g.recording = true;
 }
 
@@ -319,6 +512,7 @@ void barrier(VkImage img, VkImageLayout from, VkImageLayout to, VkAccessFlags sr
 }
 
 void convert(const DisplayBuffer& d) {
+    wait_all_frames();
     auto* dst = static_cast<uint32_t*>(g.staging_ptr);
     for (uint32_t y = 0; y < d.height; y++) {
         const uint8_t* row = vm::ptr(LOCAL_BASE + d.offset + y * d.pitch);
@@ -326,7 +520,7 @@ void convert(const DisplayBuffer& d) {
         for (uint32_t x = 0; x < d.width; x++) {
             uint32_t v;
             std::memcpy(&v, row + x * 4, 4);
-            out[x] = _byteswap_ulong(v) | 0xFF000000u;
+            out[x] = __builtin_bswap32(v) | 0xFF000000u;
         }
     }
 }
@@ -334,6 +528,16 @@ void convert(const DisplayBuffer& d) {
 }
 
 bool enabled() { return g_enabled; }
+
+double last_fence_wait_ms() { return g_last_fence_ms; }
+
+double last_gpu_ms() { return g_last_gpu_ms; }
+
+uint64_t cmd_generation() { return g_cmd_generation; }
+
+#ifndef _WIN32
+void* native_window() { return g.window; }
+#endif
 
 bool init() {
     if (std::getenv("GOWA_HEADLESS")) return false;
@@ -343,8 +547,9 @@ bool init() {
     }
     std::mutex wm;
     std::condition_variable wcv;
+#ifdef _WIN32
     std::thread([&] {
-        SetThreadDescription(GetCurrentThread(), L"Window");
+        host::set_thread_name("Window");
         placement::apply("window");
         WNDCLASSW wc{};
         wc.lpfnWndProc = wnd_proc;
@@ -352,11 +557,18 @@ bool init() {
         wc.lpszClassName = L"GOWA";
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         RegisterClassW(&wc);
-        LONG ws = dlssnr::mode() == 2 ? 2 : 1;
-        RECT r{0, 0, 1280 * ws, 720 * ws};
+        float ws = window_scale();
+        int cw = static_cast<int>(1280 * ws), ch = static_cast<int>(720 * ws);
+        RECT work{};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+        RECT frame{0, 0, 0, 0};
+        AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+        fit_window(cw, ch, (work.right - work.left) - (frame.right - frame.left), (work.bottom - work.top) - (frame.bottom - frame.top));
+        RECT r{0, 0, cw, ch};
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
         HWND h = CreateWindowExW(0, L"GOWA", L"God of War: Ascension", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
                                  r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+        if (h && want_fullscreen()) toggle_fullscreen(h);
         {
             std::lock_guard lk(wm);
             g.hwnd = h;
@@ -378,20 +590,92 @@ bool init() {
         std::unique_lock lk(wm);
         wcv.wait(lk, [] { return g.hwnd != nullptr; });
     }
+    std::vector<const char*> exts = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+#else
+    std::thread([&] {
+        host::set_thread_name("Window");
+        placement::apply("window");
+        SDL_Window* w = nullptr;
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+            float ws = window_scale();
+            int cw = static_cast<int>(1280 * ws), ch = static_cast<int>(720 * ws);
+            SDL_Rect usable{};
+            if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable)) fit_window(cw, ch, usable.w, usable.h - 40);
+            w = SDL_CreateWindow("God of War: Ascension", cw, ch, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (want_fullscreen() ? SDL_WINDOW_FULLSCREEN : 0));
+        }
+        if (!w) LOG_ERROR("gpu", "SDL window creation failed: %s", SDL_GetError());
+        {
+            std::lock_guard lk(wm);
+            g.window = w;
+            g.window_failed = !w;
+        }
+        wcv.notify_all();
+        if (!w) return;
+        int npads = 0;
+        if (SDL_JoystickID* ids = SDL_GetGamepads(&npads)) {
+            for (int i = 0; i < npads; i++) {
+                if (SDL_GetGamepadFromID(ids[i])) continue;
+                if (SDL_Gamepad* p = SDL_OpenGamepad(ids[i])) LOG_INFO("input", "gamepad connected: %s", SDL_GetGamepadName(p));
+            }
+            SDL_free(ids);
+        }
+        for (;;) {
+            SDL_Event e;
+            if (!SDL_WaitEventTimeout(&e, 100)) continue;
+            switch (e.type) {
+            case SDL_EVENT_QUIT:
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                LOG_INFO("gpu", "window closed, exiting");
+                std::fflush(nullptr);
+                std::_Exit(0);
+            case SDL_EVENT_WINDOW_RESIZED:
+            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                g.resized = true;
+                break;
+            case SDL_EVENT_KEY_DOWN:
+                if (!e.key.repeat && (e.key.key == SDLK_F11 || (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)))) SDL_SetWindowFullscreen(w, !(SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN));
+                break;
+            case SDL_EVENT_GAMEPAD_ADDED:
+                if (SDL_GetGamepadFromID(e.gdevice.which)) break;
+                if (SDL_Gamepad* p = SDL_OpenGamepad(e.gdevice.which)) LOG_INFO("input", "gamepad connected: %s", SDL_GetGamepadName(p));
+                break;
+            default:
+                break;
+            }
+        }
+    }).detach();
+    {
+        std::unique_lock lk(wm);
+        wcv.wait(lk, [] { return g.window != nullptr || g.window_failed; });
+    }
+    if (!g.window) return false;
+    std::vector<const char*> exts;
+    Uint32 sdl_n = 0;
+    if (const char* const* se = SDL_Vulkan_GetInstanceExtensions(&sdl_n)) exts.assign(se, se + sdl_n);
+#endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "gowa";
     app.apiVersion = VK_API_VERSION_1_3;
-    const char* exts[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = 2;
-    ici.ppEnabledExtensionNames = exts;
-    if (vkCreateInstance(&ici, nullptr, &g.instance) != VK_SUCCESS) return false;
+    ici.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+    ici.ppEnabledExtensionNames = exts.data();
+    if (VkResult r = vkCreateInstance(&ici, nullptr, &g.instance); r != VK_SUCCESS) {
+        LOG_ERROR("gpu", "vkCreateInstance failed %d", int(r));
+        return false;
+    }
     volkLoadInstance(g.instance);
+#ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     sci.hinstance = GetModuleHandleW(nullptr);
     sci.hwnd = g.hwnd;
     if (vkCreateWin32SurfaceKHR(g.instance, &sci, nullptr, &g.surface) != VK_SUCCESS) return false;
+#else
+    if (!SDL_Vulkan_CreateSurface(g.window, g.instance, nullptr, &g.surface)) {
+        LOG_ERROR("gpu", "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+        return false;
+    }
+#endif
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(g.instance, &n, nullptr);
     std::vector<VkPhysicalDevice> devs(n);
@@ -415,7 +699,10 @@ bool init() {
             }
         }
     }
-    if (!g.phys) return false;
+    if (!g.phys) {
+        LOG_ERROR("gpu", "no Vulkan device with graphics+present support (%u devices)", n);
+        return false;
+    }
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(g.phys, &props);
     float prio = 1.0f;
@@ -474,13 +761,19 @@ bool init() {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = static_cast<uint32_t>(dexts.size());
     dci.ppEnabledExtensionNames = dexts.data();
-    if (vkCreateDevice(g.phys, &dci, nullptr, &g.device) != VK_SUCCESS) return false;
+    if (VkResult r = vkCreateDevice(g.phys, &dci, nullptr, &g.device); r != VK_SUCCESS) {
+        LOG_ERROR("gpu", "vkCreateDevice failed %d", int(r));
+        return false;
+    }
     volkLoadDevice(g.device);
     vkGetDeviceQueue(g.device, g.queue_family, 0, &g.queue);
     dlssg::device_ready(g.phys, g.device);
     dlssnr::device_ready(g.instance, g.phys, g.device);
     g.ctx = {g.phys, g.device, g.queue, g.queue_family, g.features, a13.pipelineCreationCacheControl == VK_TRUE};
-    if (!create_swapchain()) return false;
+    if (!create_swapchain()) {
+        LOG_ERROR("gpu", "swapchain creation failed");
+        return false;
+    }
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = g.queue_family;
@@ -491,12 +784,22 @@ bool init() {
     cai.commandBufferCount = 1;
     vkAllocateCommandBuffers(g.device, &cai, &g.cmd);
     vkAllocateCommandBuffers(g.device, &cai, &g.pre);
-    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    vkCreateFence(g.device, &fci, nullptr, &g.fence);
-    VkSemaphoreCreateInfo sei{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    vkCreateSemaphore(g.device, &sei, nullptr, &g.acquired);
-    vkCreateSemaphore(g.device, &sei, nullptr, &g.rendered);
+    g.ts_period = props.limits.timestampPeriod;
+    for (Slot& sl : g.slots) {
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        vkCreateFence(g.device, &fci, nullptr, &sl.fence);
+        if (props.limits.timestampComputeAndGraphics) {
+            VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qci.queryCount = kTimestamps;
+            if (vkCreateQueryPool(g.device, &qci, nullptr, &sl.gpu_time) != VK_SUCCESS) sl.gpu_time = VK_NULL_HANDLE;
+        }
+        VkSemaphoreCreateInfo sei{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        vkCreateSemaphore(g.device, &sei, nullptr, &sl.acquired);
+        vkCreateSemaphore(g.device, &sei, nullptr, &sl.rendered);
+    }
+    load_slot(0);
     g.ready = true;
     g_enabled = true;
     LOG_INFO("gpu", "Vulkan presenter on %s, swapchain %ux%u", props.deviceName, g.swap_extent.width, g.swap_extent.height);
@@ -571,13 +874,32 @@ uint32_t gather_cmds(VkCommandBuffer out[2]) {
     return n;
 }
 
+VkCommandBuffer spare_cmd() {
+    if (!g.spare_cmds.empty()) {
+        VkCommandBuffer c = g.spare_cmds.back();
+        g.spare_cmds.pop_back();
+        return c;
+    }
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = g.pool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer c = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(g.device, &cai, &c);
+    return c;
+}
+
 void submit_and_present(uint32_t index) {
+    gpu::rsx::sync_decodes();
     dlssg::pre_submit(g.cmd, g.swap_extent.width, g.swap_extent.height);
+    ts_mark(true);
+    g.gpu_time_valid = g.gpu_time != VK_NULL_HANDLE;
     vkEndCommandBuffer(g.cmd);
     g.recording = false;
     vkResetFences(g.device, 1, &g.fence);
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkCommandBuffer cmds[2];
+    bool had_pre = g.pre_recording;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.waitSemaphoreCount = 1;
     si.pWaitSemaphores = &g.acquired;
@@ -590,6 +912,7 @@ void submit_and_present(uint32_t index) {
         static int reported = 0;
         if (reported++ < 5) LOG_ERROR("gpu", "vkQueueSubmit failed %d", int(sr));
     }
+    retire_cmds(cmds, si.commandBufferCount, had_pre);
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &g.rendered;
@@ -605,10 +928,14 @@ void submit_and_present(uint32_t index) {
 
 void flush_without_present() {
     if (!g.recording) return;
+    gpu::rsx::sync_decodes();
+    ts_mark(true);
+    g.gpu_time_valid = g.gpu_time != VK_NULL_HANDLE;
     vkEndCommandBuffer(g.cmd);
     g.recording = false;
     vkResetFences(g.device, 1, &g.fence);
     VkCommandBuffer cmds[2];
+    bool had_pre = g.pre_recording;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = gather_cmds(cmds);
     si.pCommandBuffers = cmds;
@@ -616,6 +943,7 @@ void flush_without_present() {
         static int reported = 0;
         if (reported++ < 5) LOG_ERROR("gpu", "vkQueueSubmit failed %d", int(sr));
     }
+    retire_cmds(cmds, si.commandBufferCount, had_pre);
 }
 
 bool acquire(uint32_t& index) {
@@ -656,6 +984,30 @@ void blit_to_swapchain(VkImage src, uint32_t w, uint32_t h, uint32_t index) {
     barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
 }
 
+}
+
+void submit_partial() {
+    if (!g_enabled || !g.recording) return;
+    gpu::rsx::sync_decodes();
+    ts_mark(true);
+    vkEndCommandBuffer(g.cmd);
+    VkCommandBuffer cmds[2];
+    bool had_pre = g.pre_recording;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = gather_cmds(cmds);
+    si.pCommandBuffers = cmds;
+    if (VkResult sr = vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE); sr != VK_SUCCESS) {
+        static int reported = 0;
+        if (reported++ < 5) LOG_ERROR("gpu", "partial vkQueueSubmit failed %d", int(sr));
+    }
+    for (uint32_t i = 0; i < si.commandBufferCount; i++) g.inflight_cmds.push_back(cmds[i]);
+    if (had_pre) g.pre = spare_cmd();
+    g.cmd = spare_cmd();
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(g.cmd, &begin);
+    g_cmd_generation++;
+    ts_mark(false);
 }
 
 void present_image(VkImage img, VkImageLayout& layout, uint32_t w, uint32_t h) {

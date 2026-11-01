@@ -1,4 +1,5 @@
 #include "runtime/critpath.h"
+#include "runtime/host.h"
 #include "runtime/placement.h"
 #include "runtime/hostsleep.h"
 #include "event.h"
@@ -11,14 +12,22 @@
 #include "runtime/hostsleep.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 namespace crash {
 std::string sample_stack(void* native, int depth);
@@ -70,7 +79,7 @@ void send_event(uint64_t bits) {
     if (!(bits >> 32) && !(handlers & bits)) return;
     auto q = get<EventQueue>(g_rsx.queue_id);
     if (!q) return;
-    for (int i = 0; i < 100 && push_event(q, {(uint64_t(1) << 32) | g_rsx.port_id, 0, bits, 0}) == CELL_EBUSY; i++) Sleep(1);
+    for (int i = 0; i < 100 && push_event(q, {(uint64_t(1) << 32) | g_rsx.port_id, 0, bits, 0}) == CELL_EBUSY; i++) host::sleep_ms(1);
 }
 
 uint32_t io_to_ea(uint32_t io) {
@@ -154,7 +163,7 @@ int64_t context_attribute(uint32_t package, uint64_t a3, uint64_t a4, uint64_t a
             return CELL_OK;
         }
         g_rsx.pending_flip = buffer;
-        while (g_rsx.pending_flip >= 0 && g_rsx.running) Sleep(0);
+        while (g_rsx.pending_flip >= 0 && g_rsx.running) host::sleep_ms(0);
         return CELL_OK;
     }
     case 0x103: {
@@ -208,7 +217,7 @@ void semaphore_wait(uint32_t addr, uint32_t value) {
             std::this_thread::yield();
             continue;
         }
-        Sleep(0);
+        host::sleep_ms(0);
         if (tdr_us && (spins & 255) == 0) {
             auto waited = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
             if (static_cast<uint64_t>(waited) > tdr_us) {
@@ -221,9 +230,11 @@ void semaphore_wait(uint32_t addr, uint32_t value) {
 }
 
 std::atomic<uint64_t> g_method_counts[0x4000];
+uint64_t g_sema_ticks = 0, g_sema_waits = 0;
 
 void execute(uint32_t reg, uint32_t arg) {
-    g_method_counts[(reg >> 2) & 0x3FFF].fetch_add(1, std::memory_order_relaxed);
+    std::atomic<uint64_t>& mc = g_method_counts[(reg >> 2) & 0x3FFF];
+    mc.store(mc.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     g_rsx.last_method.store(reg, std::memory_order_relaxed);
     g_rsx.last_arg.store(arg, std::memory_order_relaxed);
     if (reg >= 0xE000) LOG_DEBUG("rsx", "driver method 0x%04x arg 0x%08x", reg, arg);
@@ -235,6 +246,14 @@ void execute(uint32_t reg, uint32_t arg) {
     }
     if (reg < 0xE000) gpu::rsx::method(reg, arg);
     switch (reg) {
+    case 0x50: case 0x68: case 0x6C: case 0x1D70: case 0x1D74: case 0x1800:
+        gpu::rsx::sync_decodes();
+        break;
+    default:
+        if (reg >= 0xE000) gpu::rsx::sync_decodes();
+        break;
+    }
+    switch (reg) {
     case 0x50: vm::write32(g_rsx.dma_control + 0x48, arg); break;
     case 0x60: g_rsx.sema_ctx_406e = arg; break;
     case 0x64: g_rsx.sema_off_406e = arg; break;
@@ -242,7 +261,12 @@ void execute(uint32_t reg, uint32_t arg) {
         LOG_DEBUG("rsx", "acquire ctx 0x%08x off 0x%x == 0x%x", g_rsx.sema_ctx_406e, g_rsx.sema_off_406e, arg);
         if (uint32_t a = get_address(g_rsx.sema_off_406e, g_rsx.sema_ctx_406e)) {
             if (trace::on(trace::RSX)) trace::emit(trace::T_SEMA, 0x68, a, arg, vm::read32(a));
-            semaphore_wait(a, arg);
+            if (vm::read32(a) != arg) {
+                uint64_t t0 = host::qpc();
+                semaphore_wait(a, arg);
+                g_sema_ticks += host::qpc() - t0;
+                g_sema_waits++;
+            }
         }
         break;
     case 0x6C:
@@ -302,7 +326,7 @@ void execute(uint32_t reg, uint32_t arg) {
     }
 }
 
-HANDLE g_fifo_handle = nullptr;
+void* g_fifo_handle = nullptr;
 
 struct LineReader {
     uint32_t line = ~0u;
@@ -320,20 +344,66 @@ struct LineReader {
 };
 
 void fifo_thread() {
-    SetThreadDescription(GetCurrentThread(), L"RSX FIFO");
+    host::set_thread_name("RSX FIFO");
     placement::apply("fifo");
-    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_fifo_handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    g_fifo_handle = host::current_native();
     if (std::getenv("GOWA_PROFILE_FIFO")) crash::profile_thread(g_fifo_handle, "rsx fifo");
     LOG_INFO("rsx", "null RSX FIFO thread started");
     uint32_t ctrl = g_rsx.dma_control;
     uint32_t idle = 0;
+    static const uint64_t idle_us = std::getenv("GOWA_FIFO_IDLE_US") ? std::strtoull(std::getenv("GOWA_FIFO_IDLE_US"), nullptr, 0) : 1000;
+    uint64_t idle_since = 0, idle_ticks = 0, sleeps = 0, window_start = host::qpc();
+    uint64_t window_tsc = __rdtsc(), exec_tsc = 0, methods = 0;
+    uint64_t kind_tsc[5] = {}, kind_n[5] = {};
+    auto idle_wait = [&](uint32_t spins) {
+        if (!idle_since) idle_since = host::qpc();
+        if (++idle < spins) {
+            std::this_thread::yield();
+        } else {
+            sleeps++;
+            host::sleep_us(idle_us);
+        }
+    };
+    static const auto special = [] {
+        std::array<uint8_t, 0x4000> t{};
+        std::memcpy(t.data(), gpu::rsx::special_methods(), t.size());
+        for (uint32_t r : {0x50u, 0x60u, 0x64u, 0x68u, 0x6Cu, 0x1A4u, 0x1A8u, 0x1D6Cu, 0x1D70u, 0x1D74u, 0x1800u}) t[r >> 2] = 1;
+        for (uint32_t r = 0xE000; r < 0x10000; r += 4) t[r >> 2] = 1;
+        return t;
+    }();
+    uint32_t* regs = gpu::rsx::registers();
+    static const bool full_dispatch = std::getenv("GOWA_RSX_TRACE") || std::getenv("GOWA_RSX_STATS");
+    uint32_t loops = 0;
     while (g_rsx.running) {
+        uint64_t now = (++loops & 4095) == 0 ? host::qpc() : window_start;
+        if (now - window_start >= 5 * host::qpf()) {
+            double span = double(now - window_start);
+            uint64_t tsc = __rdtsc();
+            LOG_INFO("rsx", "fifo 5s: busy %.1f%%, idle %.1f%%, semaphore wait %.1f%% (%.0f/s), %.0f idle sleeps/s, methods %.1f%% (%.0fk/s)", 100.0 * (span - idle_ticks - g_sema_ticks) / span,
+                     100.0 * idle_ticks / span, 100.0 * g_sema_ticks / span, g_sema_waits * double(host::qpf()) / span, sleeps * double(host::qpf()) / span,
+                     100.0 * double(exec_tsc) / double(tsc - window_tsc), methods * double(host::qpf()) / span / 1000.0);
+            static const char* kinds[5] = {"draw", "flip", "clear", "bulk", "other"};
+            std::string split;
+            for (int k = 0; k < 5; k++) {
+                char b[64];
+                std::snprintf(b, sizeof b, " %s %.1f%% (%.0fk/s)", kinds[k], 100.0 * double(kind_tsc[k]) / double(tsc - window_tsc), kind_n[k] * double(host::qpf()) / span / 1000.0);
+                split += b;
+                kind_tsc[k] = kind_n[k] = 0;
+            }
+            LOG_INFO("rsx", "fifo 5s packets:%s", split.c_str());
+            window_start = now;
+            window_tsc = tsc;
+            idle_ticks = sleeps = g_sema_ticks = g_sema_waits = exec_tsc = methods = 0;
+        }
         uint32_t put = vm::read32(ctrl + 0x40);
         uint32_t get = vm::read32(ctrl + 0x44);
         if (get == put) {
-            if (++idle < 256) std::this_thread::yield();
-            else Sleep(1);
+            idle_wait(256);
             continue;
+        }
+        if (idle_since) {
+            idle_ticks += host::qpc() - idle_since;
+            idle_since = 0;
         }
         idle = 0;
         static uint32_t hist_get[64], hist_cmd[64], hist_put[64];
@@ -360,7 +430,7 @@ void fifo_thread() {
                 }
             }
             LOG_ERROR("rsx", "FIFO get 0x%08x not IO-mapped (put 0x%08x)", get, put);
-            Sleep(10);
+            host::sleep_ms(10);
             continue;
         }
         LineReader reader;
@@ -376,8 +446,7 @@ void fifo_thread() {
         if ((cmd & 0xE0000003) == 0x20000000 || (cmd & 0xE0000003) == 0x00000001) {
             uint32_t target = (cmd & 3) == 1 ? cmd & 0xFFFFFFFC : cmd & 0x1FFFFFFC;
             if (target == get) {
-                if (++idle < 20000) std::this_thread::yield();
-                else Sleep(1);
+                idle_wait(20000);
                 continue;
             }
             static const uint32_t delay_us = std::getenv("GOWA_FIFO_DELAY_US") ? std::atoi(std::getenv("GOWA_FIFO_DELAY_US")) : 0;
@@ -431,15 +500,44 @@ void fifo_thread() {
                 LOG_INFO("rsxpkt", "  2ms later:%s", later.c_str());
             }
         }
-        for (uint32_t i = 0; i < count; i++) {
-            execute(noninc ? method : method + i * 4, reader.read(ea + 4 + i * 4));
+        uint64_t x0 = __rdtsc();
+        if (!noninc && !trace && (method == 0x0100 || (method >= 0x0B80 && method < 0x0C00) || (method >= 0x1EFC && method < 0x2000))) {
+            uint32_t args[2048];
+            for (uint32_t i = 0; i < count; i++) args[i] = reader.read(ea + 4 + i * 4);
+            for (uint32_t i = 0; i < count;) {
+                uint32_t reg = method + i * 4;
+                if (uint32_t k = gpu::rsx::method_run(reg, args + i, count - i)) {
+                    i += k;
+                    continue;
+                }
+                execute(reg, args[i]);
+                i++;
+            }
+        } else if (!noninc || method != 0x0100) {
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t reg = noninc ? method : method + i * 4;
+                uint32_t arg = reader.read(ea + 4 + i * 4);
+                if (!full_dispatch && !special[reg >> 2]) {
+                    regs[reg >> 2] = arg;
+                    continue;
+                }
+                execute(reg, arg);
+            }
         }
+        uint64_t dx = __rdtsc() - x0;
+        exec_tsc += dx;
+        methods += count;
+        uint32_t end = noninc ? method + 4 : method + count * 4;
+        int kind = (method <= 0x1808 && 0x1808 < end) ? 0 : (method <= 0xE924 && 0xE920 < end) ? 1 : (method <= 0x1D94 && 0x1D94 < end) ? 2
+                 : (!noninc && (method == 0x0100 || (method >= 0x0B80 && method < 0x0C00) || (method >= 0x1EFC && method < 0x2000))) ? 3 : 4;
+        kind_tsc[kind] += dx;
+        kind_n[kind] += count;
         vm::write32(ctrl + 0x44, get + 4 + count * 4);
     }
 }
 
 void vblank_thread() {
-    SetThreadDescription(GetCurrentThread(), L"RSX VBlank");
+    host::set_thread_name("RSX VBlank");
     placement::apply("vblank");
     auto next = std::chrono::steady_clock::now();
     while (g_rsx.running) {

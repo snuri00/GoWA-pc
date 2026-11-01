@@ -34,11 +34,45 @@ std::string lower(std::string s) {
     return s;
 }
 
+#ifndef _WIN32
+std::string fold_case(const std::string& root, const std::string& rest) {
+    std::error_code ec;
+    std::string path = root + rest;
+    if (rest.empty() || std::filesystem::exists(path, ec)) return path;
+    std::string cur = root;
+    size_t pos = 0;
+    while (pos < rest.size()) {
+        size_t start = rest.find_first_not_of('/', pos);
+        if (start == std::string::npos) break;
+        size_t end = rest.find('/', start);
+        if (end == std::string::npos) end = rest.size();
+        std::string part = rest.substr(start, end - start);
+        std::string next = cur + "/" + part;
+        if (!std::filesystem::exists(next, ec)) {
+            std::string want = lower(part);
+            for (const auto& e : std::filesystem::directory_iterator(cur, ec)) {
+                if (lower(e.path().filename().string()) == want) {
+                    next = cur + "/" + e.path().filename().string();
+                    break;
+                }
+            }
+        }
+        cur = next;
+        pos = end;
+    }
+    return cur;
+}
+#endif
+
 }
 
 void init() {
     std::call_once(g_once, [] {
-        std::string rpcs3 = env_or("GOWA_RPCS3_DIR", "D:/Games/rpcs3");
+#ifdef _WIN32
+        std::string rpcs3 = env_or("GOWA_RPCS3_DIR", "rpcs3");
+#else
+        std::string rpcs3 = env_or("GOWA_RPCS3_DIR", (env_or("HOME", ".") + "/.config/rpcs3").c_str());
+#endif
         std::string local = env_or("GOWA_VFS_DIR", "vfs");
         g_disc = env_or("GOWA_DISC_DIR", (rpcs3 + "/games/BCES01741").c_str());
         std::string rpcs3_hdd0 = rpcs3 + "/dev_hdd0";
@@ -73,7 +107,11 @@ std::string host_path(const std::string& guest) {
     while (g.find("//") != std::string::npos) g.replace(g.find("//"), 2, "/");
     for (const auto& m : g_mounts) {
         if (lower(g.substr(0, m.guest.size())) == m.guest && (g.size() == m.guest.size() || g[m.guest.size()] == '/')) {
+#ifdef _WIN32
             return m.host + g.substr(m.guest.size());
+#else
+            return fold_case(m.host, g.substr(m.guest.size()));
+#endif
         }
     }
     return {};

@@ -1,4 +1,5 @@
 #include "natsched.h"
+#include "runtime/host.h"
 
 #include "thread.h"
 
@@ -6,7 +7,9 @@
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <immintrin.h>
 
 #include <atomic>
@@ -168,7 +171,7 @@ void filter_once(Saved* saved) {
 Saved g_saved[32];
 
 void filter_thread() {
-    SetThreadDescription(GetCurrentThread(), L"natsched filter");
+    host::set_thread_name("natsched filter");
     auto next_log = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     for (;;) {
         filter_once(g_saved);
@@ -283,7 +286,7 @@ bool aux_wait(SpuThread& t, uint32_t line, uint64_t rtime, const uint8_t* rdata,
         }
         g_sleeps.fetch_add(1, std::memory_order_relaxed);
         rsv::g_watch_sleepers.fetch_add(1, std::memory_order_seq_cst);
-        if (w0 == rsv::g_watch_word.load(std::memory_order_seq_cst)) WaitOnAddress(&rsv::g_watch_word, &w0, sizeof w0, static_cast<DWORD>(cfg().sleep_ms));
+        if (w0 == rsv::g_watch_word.load(std::memory_order_seq_cst)) host::wait_on(&rsv::g_watch_word, &w0, sizeof w0, static_cast<uint32_t>(cfg().sleep_ms));
         rsv::g_watch_sleepers.fetch_sub(1, std::memory_order_seq_cst);
     }
 }

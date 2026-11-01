@@ -1,4 +1,5 @@
 #include "osd.h"
+#include "runtime/host.h"
 
 #include "dlssg.h"
 
@@ -52,7 +53,7 @@ struct State {
     char text[40] = {};
     char drawn[40] = {};
     bool dirty = true;
-    LARGE_INTEGER freq{}, start{};
+    uint64_t freq = 0, start = 0;
     uint64_t flips = 0;
     uint64_t presented_start = 0;
 };
@@ -131,17 +132,17 @@ void rasterize() {
 }
 
 void update_text() {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (!s.start.QuadPart) {
-        QueryPerformanceFrequency(&s.freq);
+    uint64_t now;
+    now = host::qpc();
+    if (!s.start) {
+        s.freq = host::qpf();
         s.start = now;
         s.flips = 0;
         s.presented_start = dlssg::presented_total();
         std::snprintf(s.text, sizeof s.text, "-- fps");
         return;
     }
-    double dt = double(now.QuadPart - s.start.QuadPart) / double(s.freq.QuadPart);
+    double dt = double(now - s.start) / double(s.freq);
     if (dt < 0.5 || !s.flips) return;
     double fps = double(s.flips) / dt;
     double ms = dt * 1000.0 / double(s.flips);

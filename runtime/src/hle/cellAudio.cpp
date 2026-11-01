@@ -1,6 +1,8 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
 #include "ppu/ops.h"
 #include "runtime/hostsleep.h"
+#include "runtime/session.h"
 #include "common.h"
 
 #include <atomic>
@@ -8,17 +10,20 @@
 #include <mutex>
 #include <thread>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#pragma comment(lib, "ole32.lib")
+#else
+#include <SDL3/SDL.h>
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-
-#pragma comment(lib, "ole32.lib")
 
 namespace hle {
 
@@ -39,6 +44,7 @@ Port g_ports[8];
 uint32_t g_index_area = 0;
 std::atomic<bool> g_init{false};
 
+#ifdef _WIN32
 struct Output {
     IAudioClient* client = nullptr;
     IAudioRenderClient* render = nullptr;
@@ -97,6 +103,38 @@ struct Output {
         render->ReleaseBuffer(n, 0);
     }
 };
+#else
+struct Output {
+    SDL_AudioStream* stream = nullptr;
+
+    bool open() {
+        if (const char* e = std::getenv("GOWA_AUDIO"); e && e[0] == '0') return false;
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            LOG_WARN("cellAudio", "SDL audio init failed: %s", SDL_GetError());
+            return false;
+        }
+        SDL_AudioSpec spec{SDL_AUDIO_F32, 2, 48000};
+        stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+        if (!stream) {
+            LOG_WARN("cellAudio", "SDL audio open failed: %s", SDL_GetError());
+            return false;
+        }
+        SDL_ResumeAudioStreamDevice(stream);
+        LOG_INFO("cellAudio", "SDL audio output opened (%s)", SDL_GetCurrentAudioDriver());
+        return true;
+    }
+
+    uint64_t underruns = 0;
+
+    void write(const float* stereo, uint32_t n) {
+        if (!stream) return;
+        if (SDL_GetAudioStreamQueued(stream) == 0) underruns++;
+        static const int target = std::getenv("GOWA_AUDIO_LATENCY_MS") ? std::atoi(std::getenv("GOWA_AUDIO_LATENCY_MS")) * 48 : 4800;
+        if (SDL_GetAudioStreamQueued(stream) / 8 > target) return;
+        SDL_PutAudioStreamData(stream, stereo, static_cast<int>(n * 8));
+    }
+};
+#endif
 
 float be_float(const uint8_t* p) {
     uint32_t v;
@@ -131,16 +169,35 @@ void mix_block(const Port& p, uint64_t block, float* stereo) {
 }
 
 void audio_thread() {
-    SetThreadDescription(GetCurrentThread(), L"cellAudio");
+    host::set_thread_name("cellAudio");
     placement::apply("audio");
     Output out;
     out.open();
     auto next = std::chrono::steady_clock::now();
     const auto period = std::chrono::microseconds(5333);
     std::vector<float> stereo(512);
+    uint64_t late = 0, stale = 0, blocks = 0;
+    uint64_t block_hash[8][32] = {};
+    const bool every_second = session::active();
+    auto stats_at = std::chrono::steady_clock::now() + std::chrono::seconds(every_second ? 1 : 5);
     while (g_init) {
         next += std::chrono::microseconds(static_cast<int64_t>(period.count() / ppu::time_scale()));
         host::sleep_until_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
+        auto woke = std::chrono::steady_clock::now();
+        if (woke - next > std::chrono::milliseconds(4)) late++;
+        if (woke >= stats_at) {
+            stats_at = woke + std::chrono::seconds(every_second ? 1 : 5);
+#ifdef _WIN32
+            uint64_t underruns = 0;
+#else
+            uint64_t underruns = out.underruns;
+            out.underruns = 0;
+#endif
+            if (every_second || late || stale || underruns)
+                LOG_INFO("cellAudio", "audio stats: %llu blocks, %llu late wakeups, %llu stale blocks, %llu device underruns", static_cast<unsigned long long>(blocks),
+                         static_cast<unsigned long long>(late), static_cast<unsigned long long>(stale), static_cast<unsigned long long>(underruns));
+            late = stale = blocks = 0;
+        }
         std::fill(stereo.begin(), stereo.end(), 0.0f);
         bool any = false;
         {
@@ -151,6 +208,18 @@ void audio_thread() {
                 if (p.addr && vm::range_mapped(p.addr, p.size)) {
                     mix_block(p, p.index, stereo.data());
                     any = true;
+                    const uint8_t* src = vm::ptr(p.addr) + size_t(p.index) * p.channels * 256 * 4;
+                    uint64_t h = 1469598103934665603ull;
+                    bool silent = true;
+                    for (uint32_t k = 0; k + 8 <= p.channels * 256 * 4; k += 8) {
+                        uint64_t w;
+                        std::memcpy(&w, src + k, 8);
+                        silent = silent && !w;
+                        h = (h ^ w) * 1099511628211ull;
+                    }
+                    if (!silent && p.index < 32 && block_hash[i][p.index] == h) stale++;
+                    if (p.index < 32) block_hash[i][p.index] = h;
+                    blocks++;
                 }
                 p.index = (p.index + 1) % p.blocks;
                 vm::write64(g_index_area + i * 8, p.index);

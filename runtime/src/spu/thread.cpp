@@ -1,4 +1,7 @@
 #include "runtime/placement.h"
+#include "runtime/host.h"
+#include "runtime/jobsys.h"
+#include "../jobsys/edge_consumer.h"
 #include "spu/aot.h"
 #include "hle.h"
 #include "edge/edge_gpu.h"
@@ -13,9 +16,11 @@
 #include "runtime/trace.h"
 #include "runtime/memory.h"
 #include "runtime/reservation.h"
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <thread>
@@ -24,16 +29,20 @@
 #include <unordered_map>
 #include <string>
 #include <chrono>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
 #include <malloc.h>
-
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
+#include "runtime/compat.h"
 
 namespace crash {
 void profile_thread(void* native, const char* name);
+std::string sample_stack(void* native, int depth);
 }
 
 namespace spu {
@@ -280,6 +289,17 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
                 uint64_t rt = rtime;
                 uint8_t snap[128];
                 std::memcpy(snap, rdata, 128);
+                if (!job_mode && ctx.pc < 0x4000) {
+                    lk.unlock();
+                    waiting.store(1, std::memory_order_relaxed);
+                    bool ran = jsedge::spu_idle(slot) || (ctx.pc < 0xa00 && jobsys::spu_idle_donate(slot));
+                    waiting.store(0, std::memory_order_relaxed);
+                    lk.lock();
+                    if (ran) {
+                        collect_events();
+                        continue;
+                    }
+                }
                 if (park_slot >= 0 && rsv::park_enabled()) {
                     uint32_t w0 = rsv::park_word(park_slot);
                     int64_t limit = -1;
@@ -1089,7 +1109,7 @@ bool SpuThread::stop_and_signal(uint32_t code) {
     switch (code) {
     case 0x001: {
         const uint64_t cp0 = critpath::g_on ? __rdtsc() : 0;
-        Sleep(1);
+        host::sleep_ms(1);
         if (cp0) critpath::spu_waited(cp, cp0, critpath::SW_BLOCK);
         return true;
     }
@@ -1375,7 +1395,7 @@ std::mutex g_cap_dir_lock;
 std::string g_cap_dir;
 
 void write_capture(SpuThread& t, const Context& start, const std::vector<uint8_t>& ls0, CaptureHost& cap, uint32_t insns, const std::string& dir) {
-    CreateDirectoryA(dir.c_str(), nullptr);
+    { std::error_code mkdir_ec; std::filesystem::create_directory(dir, mkdir_ec); }
     std::string path = dir + "/cap_" + std::to_string(t.slot) + ".bin";
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) return;
@@ -1398,35 +1418,41 @@ void write_capture(SpuThread& t, const Context& start, const std::vector<uint8_t
 }
 
 void SpuThread::run() {
-    wchar_t w[64];
-    swprintf(w, 64, L"SPU %u %hs", slot, name.c_str());
-    SetThreadDescription(GetCurrentThread(), w);
-    if (std::getenv("GOWA_SPU_LOW_PRIO")) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    host::set_thread_name("SPU " + std::to_string(slot) + " " + name);
+    if (std::getenv("GOWA_SPU_LOW_PRIO")) host::set_priority(-1);
     if (const char* aff = std::getenv("GOWA_SPU_AFFINITY")) {
         int stride = std::atoi(aff);
-        if (stride > 0) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << ((slot * stride) % 12));
+        if (stride > 0) host::set_affinity({static_cast<int>((slot * stride) % 12)});
     }
     placement::apply("spu" + std::to_string(slot));
     _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);
     LOG_INFO("spu", "thread 0x%x '%s' start pc 0x%05x args 0x%llx 0x%llx", id, name.c_str(), ctx.pc,
              static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]));
     if (!native) {
-        HANDLE hh = nullptr;
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &hh, 0, FALSE, DUPLICATE_SAME_ACCESS);
-        native = hh;
+        native = host::current_native();
     }
     hle::install_builtin();
     register_thread(this);
     if (const char* e = std::getenv("GOWA_PROFILE_SPU")) {
         if (std::string(e) == "all" || static_cast<uint32_t>(std::atoi(e)) == slot) {
-            HANDLE h = nullptr;
-            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            void* h = host::current_native();
             static std::string labels[8];
             std::string& label = labels[slot & 7];
             label = "spu " + std::to_string(slot);
             crash::profile_thread(h, label.c_str());
         }
     }
+    exec();
+    LOG_INFO("spu", "thread 0x%x '%s' stopped at 0x%05x", id, name.c_str(), ctx.pc);
+    {
+        std::lock_guard lk(m);
+        running = false;
+        in_mbox.clear();
+    }
+    if (group && !aux) group->thread_stopped(*this);
+}
+
+void SpuThread::exec() {
     uint32_t n = 0;
     static const std::vector<uint32_t> bps = [] {
         std::vector<uint32_t> v;
@@ -1483,23 +1509,16 @@ void SpuThread::run() {
         if (!int_ok) halted_in_verify = true;
         return true;
     };
-    struct alignas(32) Slot {
-        const CompiledBlock* b;
-        BlockFn fn;
-        BlockFn region;
-        uint32_t words;
-        uint32_t valid;
-    };
-    std::vector<Slot> block_cache(aot_on ? LS_SIZE / 4 : 0, Slot{});
-    struct HleSlot {
-        const hle::Function* f;
-        uint32_t valid;
-    };
+    using Slot = ExecSlot;
+    using HleSlot = ExecHleSlot;
+    if (aot_on && exec_blocks.size() != LS_SIZE / 4) exec_blocks.assign(LS_SIZE / 4, Slot{});
+    std::vector<Slot>& block_cache = exec_blocks;
     static const bool hle_cache_on = [] {
         const char* e = std::getenv("GOWA_SPU_HLE_CACHE");
         return !e || e[0] != '0';
     }();
-    std::vector<HleSlot> hle_cache(hle_cache_on ? LS_SIZE / 4 : 0, HleSlot{});
+    if (hle_cache_on && exec_hle.size() != LS_SIZE / 4) exec_hle.assign(LS_SIZE / 4, HleSlot{});
+    std::vector<HleSlot>& hle_cache = exec_hle;
     auto hle_find = [&](uint32_t pc) -> const hle::Function* {
         if (!hle_cache_on) return hle::lookup(ls, pc);
         HleSlot& hs = hle_cache[pc >> 2];
@@ -1515,7 +1534,7 @@ void SpuThread::run() {
     const bool use_regions = !verify && !std::getenv("GOWA_SPU_NO_REGIONS");
     uint32_t irq_countdown = 256;
     uint64_t cyc_mark = 0;
-    Host* host = this;
+    Host* host = exec_host ? exec_host : this;
     static const double cap_at = std::getenv("GOWA_SPU_CAPTURE_AT") ? std::atof(std::getenv("GOWA_SPU_CAPTURE_AT")) : 0.0;
     static const uint32_t cap_insns = std::getenv("GOWA_SPU_CAPTURE_INSNS") ? static_cast<uint32_t>(std::strtoul(std::getenv("GOWA_SPU_CAPTURE_INSNS"), nullptr, 0)) : 20000000u;
     std::unique_ptr<CaptureHost> cap;
@@ -1534,7 +1553,7 @@ void SpuThread::run() {
     bool block_start = true;
     uint32_t block_len = 0;
     static const int job_log = std::getenv("GOWA_SPU_JOBS") ? std::atoi(std::getenv("GOWA_SPU_JOBS")) : 0;
-    const bool cp_on = critpath::g_on;
+    const bool cp_on = critpath::g_on && !job_mode;
     if (cp_on) critpath::spu_init_sig();
     const uint32_t* cp_src = line_src.get();
     const bool edge_stats = edge::ovl::stats_on();
@@ -1554,6 +1573,20 @@ void SpuThread::run() {
                 ctx.pc = __builtin_bswap32(exit_pc) & PC_MASK;
             }
             if (cp_on) critpath::spu_block(cp, slot, ls, cp_src, ctx.pc);
+            if (job_mode && ctx.pc < 0x4000) {
+                if (ctx.pc == job_stop) {
+                    exec_insns += n;
+                    n = 0;
+                    if (!job_next(*this)) break;
+                    host = exec_host ? exec_host : this;
+                    block_start = true;
+                    continue;
+                }
+                if (job_trap && job_trap(*this)) {
+                    block_start = true;
+                    continue;
+                }
+            }
             if (job_log) {
                 uint32_t src = line_src[ctx.pc >> 7];
                 if (src != cur_src) {
@@ -1687,8 +1720,8 @@ void SpuThread::run() {
                             while (__rdtsc() < until) _mm_pause();
                         }
                         if (job_log && (n & ~0xFFFFu) != ((n - ran) & ~0xFFFFu)) {
-                            ULONG64 cyc = 0;
-                            QueryThreadCycleTime(GetCurrentThread(), &cyc);
+                            uint64_t cyc = 0;
+                            cyc = host::thread_cycles();
                             if (cyc_mark) {
                                 g_cyc_cycles.fetch_add(cyc - cyc_mark, std::memory_order_relaxed);
                                 g_cyc_insns.fetch_add(uint32_t(n - cyc_insn_mark), std::memory_order_relaxed);
@@ -1703,7 +1736,7 @@ void SpuThread::run() {
                         pc_samples[pc_sample_pos.fetch_add(1, std::memory_order_relaxed) & 255] = ctx.pc;
                         if (stop_flag.load(std::memory_order_relaxed)) break;
                         bool cap_start_now = false;
-                        if (!cap) {
+                        if (!cap && !job_mode) {
                             uint32_t g = g_cap_gen.load(std::memory_order_relaxed);
                             if (g != cap_gen_seen) {
                                 cap_gen_seen = g;
@@ -1776,13 +1809,7 @@ void SpuThread::run() {
         }
     }
     if (rec) aot::flush();
-    LOG_INFO("spu", "thread 0x%x '%s' stopped at 0x%05x", id, name.c_str(), ctx.pc);
-    {
-        std::lock_guard lk(m);
-        running = false;
-        in_mbox.clear();
-    }
-    if (group && !aux) group->thread_stopped(*this);
+    exec_insns += n;
 }
 
 namespace {
@@ -1806,8 +1833,8 @@ void occupancy_sampler(double period_s, int periods, std::string out_path) {
     {
         std::lock_guard lk(g_reg_lock);
         for (SpuThread* t : g_reg) {
-            ULONG64 cyc = 0;
-            if (t->native) QueryThreadCycleTime(static_cast<HANDLE>(t->native), &cyc);
+            uint64_t cyc = 0;
+            if (t->native) cyc = host::thread_cycles(t->native);
             prev_cpu[t] = {cyc, t->insns.load()};
         }
     }
@@ -1873,8 +1900,8 @@ void occupancy_sampler(double period_s, int periods, std::string out_path) {
             std::string u;
             std::lock_guard lk(g_reg_lock);
             for (SpuThread* t : g_reg) {
-                ULONG64 cyc = 0;
-                if (t->native) QueryThreadCycleTime(static_cast<HANDLE>(t->native), &cyc);
+                uint64_t cyc = 0;
+                if (t->native) cyc = host::thread_cycles(t->native);
                 uint64_t ins = t->insns.load();
                 auto& pv = prev_cpu[t];
                 char b[96];
@@ -1938,11 +1965,11 @@ void lowfps_tick(uint64_t flips) {
     last_trigger = now;
     low_since = -1;
     taken++;
-    CreateDirectoryA(cfg.dir.c_str(), nullptr);
+    { std::error_code mkdir_ec; std::filesystem::create_directory(cfg.dir, mkdir_ec); }
     char name[96];
     std::snprintf(name, sizeof name, "/low%d_t%.0f_fps%.1f", taken, now, fps);
     std::string dir = cfg.dir + name;
-    CreateDirectoryA(dir.c_str(), nullptr);
+    { std::error_code mkdir_ec; std::filesystem::create_directory(dir, mkdir_ec); }
     LOG_INFO("spucap", "low fps %.1f for %.0f s: capturing SPU state and occupancy to %s", fps, cfg.secs, dir.c_str());
     request_capture(dir);
     std::thread(occupancy_sampler, cfg.occ_secs, 1, dir + "/occ.txt").detach();
@@ -1966,6 +1993,13 @@ std::string brief() {
         out += b;
     }
     return out;
+}
+
+void stack_dump() {
+    std::lock_guard lk(g_reg_lock);
+    for (SpuThread* t : g_reg) {
+        if (t->native) LOG_INFO("hitch", "spu %u '%s' pc 0x%05x:%s", t->slot, t->name.c_str(), t->ctx.pc, crash::sample_stack(t->native, 10).c_str());
+    }
 }
 
 void status_dump() {

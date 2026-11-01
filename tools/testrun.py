@@ -11,7 +11,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN_DIR = os.path.join(ROOT, "run")
 RUNS = os.path.join(ROOT, "out", "runs")
-EXE = os.environ.get("GOWA_TESTRUN_EXE") or os.path.join(ROOT, "build", "gowa.exe")
+EXE = os.environ.get("GOWA_TESTRUN_EXE") or (os.path.join(ROOT, "build", "God of War Ascension.exe") if sys.platform == "win32" else os.path.join(ROOT, "build-linux", "God of War Ascension"))
 KEEP = 15
 
 
@@ -53,6 +53,11 @@ SCENARIOS = {
     "ingame": (480, pad_ingame, 20.0, 150.0),
     "continue": (240, pad_continue, 10.0, 80.0),
     "idle": (600, pad_idle, 30.0, 80.0),
+    "fight": (130, pad_continue, 10.0, 50.0),
+}
+
+SCENARIO_ENV = {
+    "fight": {"GOWA_TURBO": "3@20"},
 }
 
 
@@ -107,7 +112,10 @@ def supervise(env, duration):
             open(os.path.join(RUN_DIR, "blackbox.req"), "w").close()
             print("no flips for %.0fs, requesting blackbox capture" % (now - flip))
     proc.kill()
-    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        proc.wait()
     return 124
 
 
@@ -130,7 +138,7 @@ def keep_blackbox(out):
 
 
 def prune():
-    dirs = run_dirs()
+    dirs = [d for d in run_dirs() if not os.path.exists(os.path.join(RUNS, d, "keep"))]
     for d in dirs[:-KEEP]:
         shutil.rmtree(os.path.join(RUNS, d), ignore_errors=True)
 
@@ -184,7 +192,7 @@ def summarize(out, duration, rc, wall):
 def cmd_run(args):
     duration, padfn, snap_every, snap_from = SCENARIOS[args.scenario]
     duration = args.secs or duration
-    snap_every = args.snap_every or snap_every
+    snap_every = args.snap_every if args.snap_every is not None else snap_every
     snap_from = args.snap_from if args.snap_from is not None else snap_from
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     name = stamp + "-" + (args.name or args.scenario)
@@ -192,10 +200,15 @@ def cmd_run(args):
     os.makedirs(out, exist_ok=True)
     env = dict(os.environ)
     env["GOWA_ROOT"] = ROOT
-    env["GOWA_SNAP_EVERY"] = str(snap_every)
+    env.setdefault("GOWA_NO_LAUNCHER", "1")
+    if "GOWA_RPCS3_DIR" not in env and os.path.isdir(os.path.join(RUN_DIR, "rpcs3")):
+        env["GOWA_RPCS3_DIR"] = os.path.join(RUN_DIR, "rpcs3")
+    env["GOWA_SNAP_EVERY"] = str(snap_every if snap_every > 0 else 1e9)
     env["GOWA_SNAP_FROM"] = str(snap_from)
     env["GOWA_SNAP_DIR"] = out
-    pad = padfn(duration)
+    for k, v in SCENARIO_ENV.get(args.scenario, {}).items():
+        env.setdefault(k, v)
+    pad = padfn(duration if args.scenario != "fight" else 240)
     if pad:
         env["GOWA_AUTOPAD"] = ",".join("%s@%s" % (b, t if isinstance(t, str) else "%d:0.6" % t) for b, t in pad)
     extra = {}

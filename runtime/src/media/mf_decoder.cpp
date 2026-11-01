@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "runtime/video_decoder.h"
 #include "runtime/log.h"
 
@@ -308,3 +309,4 @@ std::unique_ptr<VideoDecoder> create_decoder(Codec codec) {
 }
 
 }
+#endif

@@ -355,6 +355,8 @@ int run(VkCommandBuffer cmd, VkImageView velocity, VkImageView depth, uint32_t w
     return dump ? 2 : 1;
 }
 
+bool pending() { return g.pending; }
+
 void complete() {
     if (!g.pending) return;
     g.pending = false;

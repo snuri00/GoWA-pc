@@ -9,8 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "runtime/host.h"
 
 namespace ppu {
 
@@ -28,13 +27,9 @@ namespace {
 
 uint64_t host_ticks() {
     static const double scale = [] {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        return 80000000.0 / static_cast<double>(f.QuadPart);
+        return 80000000.0 / static_cast<double>(host::qpf());
     }();
-    LARGE_INTEGER c;
-    QueryPerformanceCounter(&c);
-    return static_cast<uint64_t>(static_cast<double>(c.QuadPart) * scale);
+    return static_cast<uint64_t>(static_cast<double>(host::qpc()) * scale);
 }
 
 struct Turbo {

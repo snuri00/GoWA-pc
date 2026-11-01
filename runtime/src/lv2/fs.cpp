@@ -9,7 +9,10 @@
 #include <filesystem>
 #include <vector>
 
+#ifdef _WIN32
 #include <io.h>
+#endif
+#include "runtime/compat.h"
 #include <sys/stat.h>
 
 namespace crash {

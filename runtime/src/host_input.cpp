@@ -1,16 +1,41 @@
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <xinput.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <mutex>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <xinput.h>
+#else
+#include <SDL3/SDL.h>
+#endif
+
 namespace host {
 
 namespace {
+
+void press(uint16_t* b, uint32_t offset, uint16_t mask, uint32_t pressure) {
+    b[offset] |= mask;
+    if (pressure) b[pressure] = 0xFF;
+}
+
+void stick(int sx, int sy, int deadzone, uint16_t& ox, uint16_t& oy) {
+    float x = static_cast<float>(sx), y = static_cast<float>(sy);
+    float mag = std::sqrt(x * x + y * y);
+    if (mag <= deadzone) {
+        ox = oy = 128;
+        return;
+    }
+    float scale = (std::min(mag, 32767.0f) - deadzone) / (32767.0f - deadzone) / mag;
+    x *= scale;
+    y *= scale;
+    ox = static_cast<uint16_t>(std::clamp(static_cast<int>(std::lround(128.0f + x * 127.0f)), 0, 255));
+    oy = static_cast<uint16_t>(std::clamp(static_cast<int>(std::lround(128.0f - y * 127.0f)), 0, 255));
+}
+
+#ifdef _WIN32
 
 using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
 
@@ -37,29 +62,13 @@ bool focused() {
 
 bool key(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-void stick(SHORT sx, SHORT sy, int deadzone, uint16_t& ox, uint16_t& oy) {
-    float x = sx, y = sy;
-    float mag = std::sqrt(x * x + y * y);
-    if (mag <= deadzone) {
-        ox = oy = 128;
-        return;
-    }
-    float scale = (std::min(mag, 32767.0f) - deadzone) / (32767.0f - deadzone) / mag;
-    x *= scale;
-    y *= scale;
-    ox = static_cast<uint16_t>(std::clamp(static_cast<int>(std::lround(128.0f + x * 127.0f)), 0, 255));
-    oy = static_cast<uint16_t>(std::clamp(static_cast<int>(std::lround(128.0f - y * 127.0f)), 0, 255));
-}
-
 int g_slot = -1;
 ULONGLONG g_next_scan = 0;
-
-void press(uint16_t* b, uint32_t offset, uint16_t mask, uint32_t pressure) {
-    b[offset] |= mask;
-    if (pressure) b[pressure] = 0xFF;
-}
+#endif
 
 }
+
+#ifdef _WIN32
 
 void poll_pad(uint16_t* b) {
     std::call_once(g_once, load);
@@ -124,5 +133,93 @@ void poll_pad(uint16_t* b) {
     if (key('I')) b[7] = 0;
     if (key('K')) b[7] = 255;
 }
+
+#else
+
+namespace {
+
+const bool* keys() {
+    int n = 0;
+    return SDL_GetKeyboardState(&n);
+}
+
+bool key(SDL_Scancode sc) {
+    const bool* k = keys();
+    return k && k[sc];
+}
+
+SDL_Gamepad* pad() {
+    int n = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&n);
+    SDL_Gamepad* p = nullptr;
+    for (int i = 0; i < n && !p; i++) p = SDL_GetGamepadFromID(ids[i]);
+    SDL_free(ids);
+    return p;
+}
+
+}
+
+}
+
+namespace gpu {
+void* native_window();
+}
+
+namespace host {
+
+void poll_pad(uint16_t* b) {
+    void* w = gpu::native_window();
+    if (!w) return;
+    if (SDL_Gamepad* p = pad()) {
+        auto btn = [&](SDL_GamepadButton x) { return SDL_GetGamepadButton(p, x); };
+        if (btn(SDL_GAMEPAD_BUTTON_BACK)) press(b, 2, 0x01, 0);
+        if (btn(SDL_GAMEPAD_BUTTON_LEFT_STICK)) press(b, 2, 0x02, 0);
+        if (btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK)) press(b, 2, 0x04, 0);
+        if (btn(SDL_GAMEPAD_BUTTON_START)) press(b, 2, 0x08, 0);
+        if (btn(SDL_GAMEPAD_BUTTON_DPAD_UP)) press(b, 2, 0x10, 10);
+        if (btn(SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) press(b, 2, 0x20, 8);
+        if (btn(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) press(b, 2, 0x40, 11);
+        if (btn(SDL_GAMEPAD_BUTTON_DPAD_LEFT)) press(b, 2, 0x80, 9);
+        int lt = SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) >> 7, rt = SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) >> 7;
+        if (lt > 30) {
+            b[3] |= 0x01;
+            b[18] = static_cast<uint16_t>(std::min(lt, 255));
+        }
+        if (rt > 30) {
+            b[3] |= 0x02;
+            b[19] = static_cast<uint16_t>(std::min(rt, 255));
+        }
+        if (btn(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER)) press(b, 3, 0x04, 16);
+        if (btn(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) press(b, 3, 0x08, 17);
+        if (btn(SDL_GAMEPAD_BUTTON_NORTH)) press(b, 3, 0x10, 12);
+        if (btn(SDL_GAMEPAD_BUTTON_EAST)) press(b, 3, 0x20, 13);
+        if (btn(SDL_GAMEPAD_BUTTON_SOUTH)) press(b, 3, 0x40, 14);
+        if (btn(SDL_GAMEPAD_BUTTON_WEST)) press(b, 3, 0x80, 15);
+        auto axis = [&](SDL_GamepadAxis a) { return std::clamp(static_cast<int>(SDL_GetGamepadAxis(p, a)), -32767, 32767); };
+        stick(axis(SDL_GAMEPAD_AXIS_RIGHTX), -axis(SDL_GAMEPAD_AXIS_RIGHTY), 8689, b[4], b[5]);
+        stick(axis(SDL_GAMEPAD_AXIS_LEFTX), -axis(SDL_GAMEPAD_AXIS_LEFTY), 7849, b[6], b[7]);
+    }
+    if (SDL_GetKeyboardFocus() != static_cast<SDL_Window*>(w)) return;
+    if (key(SDL_SCANCODE_BACKSPACE)) press(b, 2, 0x01, 0);
+    if (key(SDL_SCANCODE_RETURN)) press(b, 2, 0x08, 0);
+    if (key(SDL_SCANCODE_UP)) press(b, 2, 0x10, 10);
+    if (key(SDL_SCANCODE_RIGHT)) press(b, 2, 0x20, 8);
+    if (key(SDL_SCANCODE_DOWN)) press(b, 2, 0x40, 11);
+    if (key(SDL_SCANCODE_LEFT)) press(b, 2, 0x80, 9);
+    if (key(SDL_SCANCODE_1)) press(b, 3, 0x01, 18);
+    if (key(SDL_SCANCODE_3)) press(b, 3, 0x02, 19);
+    if (key(SDL_SCANCODE_Q)) press(b, 3, 0x04, 16);
+    if (key(SDL_SCANCODE_E)) press(b, 3, 0x08, 17);
+    if (key(SDL_SCANCODE_S)) press(b, 3, 0x10, 12);
+    if (key(SDL_SCANCODE_X)) press(b, 3, 0x20, 13);
+    if (key(SDL_SCANCODE_Z) || key(SDL_SCANCODE_SPACE)) press(b, 3, 0x40, 14);
+    if (key(SDL_SCANCODE_A)) press(b, 3, 0x80, 15);
+    if (key(SDL_SCANCODE_J)) b[6] = 0;
+    if (key(SDL_SCANCODE_L)) b[6] = 255;
+    if (key(SDL_SCANCODE_I)) b[7] = 0;
+    if (key(SDL_SCANCODE_K)) b[7] = 255;
+}
+
+#endif
 
 }

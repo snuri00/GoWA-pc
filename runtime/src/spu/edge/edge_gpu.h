@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace edge::gpu {
@@ -44,6 +45,11 @@ void before_compress(uint8_t* ls, uint32_t ctx, int id);
 void after_compress(uint8_t* ls, uint32_t ctx);
 void touch(uint8_t* ls, uint32_t lo, uint32_t hi, int reason);
 void touch_all(uint8_t* ls, int reason);
+
+extern const bool g_mix;
+void mix_note(const char* tag, int id, uint32_t n);
+void mix_job();
+std::string mix_report();
 
 void decode_fixed(const uint8_t* stream, uint32_t v, const uint32_t off[3], const uint32_t wid[3], const uint32_t frac[3], float out[3]);
 void transform_point(const float in[4], const uint32_t m[4][4], float out[4]);

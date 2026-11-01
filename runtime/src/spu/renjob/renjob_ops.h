@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../edge/edge_cull_ops.h"
+#include "renjob_chan.h"
 
 #include <bit>
 #include <cstdint>
@@ -27,6 +28,9 @@ struct Ctl {
     uint32_t jn = 0;
     JEntry* j = nullptr;
     uint64_t* dirty = nullptr;
+    renjob::ChanHost* host = nullptr;
+    bool* ie = nullptr;
+    uint32_t icall_miss = 0;
     void clear_dirty() {
         for (uint32_t i = 0; i < jn; i++) dirty[j[i].a >> 10] = 0;
         jn = 0;

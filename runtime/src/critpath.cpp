@@ -1,4 +1,5 @@
 #include "runtime/critpath.h"
+#include "runtime/host.h"
 
 #include "ppu/context.h"
 #include "runtime/log.h"
@@ -13,7 +14,9 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 namespace critpath {
 
@@ -60,16 +63,8 @@ Ring* make_ring() {
     Ring* r = new Ring;
     std::string name;
     if (guest::Thread* t = guest::current()) name = t->name;
-    if (name.empty()) {
-        PWSTR w = nullptr;
-        if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &w)) && w) {
-            int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-            name.resize(n > 0 ? n - 1 : 0);
-            if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w, -1, name.data(), n, nullptr, nullptr);
-            LocalFree(w);
-        }
-    }
-    if (name.empty()) name = "tid" + std::to_string(GetCurrentThreadId());
+    if (name.empty()) name = host::thread_name();
+    if (name.empty()) name = "tid" + std::to_string(host::tid());
     std::snprintf(r->name, sizeof r->name, "%s", name.c_str());
     r->main = name == "main_thread";
     std::lock_guard lk(g_rings_lock);
@@ -187,7 +182,7 @@ const char* kind_name(int k) {
 }
 
 void writer() {
-    SetThreadDescription(GetCurrentThread(), L"critpath writer");
+    host::set_thread_name("critpath writer");
     Agg agg;
     agg.win0 = __rdtsc();
     auto last_log = std::chrono::steady_clock::now();
@@ -228,14 +223,10 @@ void writer() {
 }
 
 double calibrate() {
-    LARGE_INTEGER f, q0, q1;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&q0);
-    uint64_t t0 = __rdtsc();
-    Sleep(60);
-    QueryPerformanceCounter(&q1);
-    uint64_t t1 = __rdtsc();
-    return double(t1 - t0) * double(f.QuadPart) / double(q1.QuadPart - q0.QuadPart);
+    uint64_t q0 = host::qpc(), t0 = __rdtsc();
+    host::sleep_ms(60);
+    uint64_t q1 = host::qpc(), t1 = __rdtsc();
+    return double(t1 - t0) * double(host::qpf()) / double(q1 - q0);
 }
 
 const Hook g_hooks[] = {
