@@ -4,6 +4,14 @@ A static recompilation of God of War: Ascension (PS3, BCES01741) for PC.
 
 The game's PPU code is translated to C++ and compiled for x86-64. SPU programs are compiled ahead of time as well, and some of the heavier SPU jobs (Edge geometry, cloth, parts of the job system) have been rewritten by hand and checked against the original output. The PS3 system libraries the game uses are reimplemented in the runtime, and the RSX command stream is drawn with Vulkan.
 
+<p align="center">
+  <img src="media/demo.webp" alt="God of War: Ascension running natively on Linux" width="720">
+  <br>
+  <a href="media/demo.mp4">Watch the full recording (2:53)</a>
+</p>
+
+The recording was made on Linux with an i7-8700K and an RTX 4070 at 1080p internal resolution. The counter in the corner is the game's frame rate.
+
 This is a hobby project. It is not affiliated with Sony Interactive Entertainment or Santa Monica Studio, and it contains no game code or data. You need your own copy of the game.
 
 ## Status
