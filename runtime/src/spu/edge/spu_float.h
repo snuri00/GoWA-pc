@@ -97,9 +97,8 @@ struct NmsD {
 
 inline int relaxed_env() {
     const char* e = std::getenv("GOWA_SPU_RELAXED_FLOAT");
-    if (!e) return 0;
-    if (e[0] == '1') return 1;
-    return std::strcmp(e, "cloth") == 0 ? 2 : 0;
+    if (!e || std::strcmp(e, "cloth") == 0) return 2;
+    return e[0] == '1' ? 1 : 0;
 }
 
 inline const int g_relaxed_mode = relaxed_env();
