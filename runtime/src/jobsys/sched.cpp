@@ -14,10 +14,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <immintrin.h>
 
@@ -51,7 +53,9 @@ bool gate_open(uint32_t ea) {
     return vm::read16(ea) == 0;
 }
 
-Pop pop(Item& out, uint32_t only_list = 0) {
+using Accept = bool (*)(const JobDesc&);
+
+Pop pop(Item& out, uint32_t only_list = 0, Accept accept = nullptr) {
     if (!g_qn.load(std::memory_order_acquire)) return Pop::Empty;
     std::lock_guard lk(g_m);
     if (g_q.empty()) return Pop::Empty;
@@ -60,6 +64,7 @@ Pop pop(Item& out, uint32_t only_list = 0) {
     bool any = false;
     for (auto it = g_q.begin(); it != g_q.end(); ++it) {
         if (only_list && it->d.list_obj != only_list) continue;
+        if (accept && !accept(it->d)) continue;
         any = true;
         if (std::find(closed, closed + nclosed, it->d.list_obj) != closed + nclosed) continue;
         if (it->d.gate_ea) {
@@ -325,14 +330,85 @@ bool run_job(const JobDesc& job, JobCtx& ctx) {
     return exec_job(x, job, tier_for(job.module_ea));
 }
 
+struct DonateMods {
+    std::vector<uint32_t> allow, deny;
+};
+
+DonateMods parse_mods(const char* e) {
+    DonateMods m;
+    while (e && *e) {
+        bool neg = *e == '-';
+        if (neg) e++;
+        char* end = nullptr;
+        unsigned long v = std::strtoul(e, &end, 16);
+        if (end == e) break;
+        if (v) (neg ? m.deny : m.allow).push_back(static_cast<uint32_t>(v));
+        e = *end ? end + 1 : end;
+    }
+    return m;
+}
+
+const DonateMods& donate_mods() {
+    static const DonateMods mods = [] {
+        const char* e = std::getenv("GOWA_JOBSYS_DONATE_MODS");
+        return parse_mods(e && *e ? e : "-730800");
+    }();
+    return mods;
+}
+
+bool donate_accept(const JobDesc& d) {
+    const DonateMods& m = donate_mods();
+    if (std::find(m.deny.begin(), m.deny.end(), d.module_ea) != m.deny.end()) return false;
+    return m.allow.empty() || std::find(m.allow.begin(), m.allow.end(), d.module_ea) != m.allow.end();
+}
+
+namespace {
+struct DonateTrace {
+    std::atomic<uint32_t> module{0};
+    std::atomic<uint64_t> at{0};
+    std::atomic<uint64_t> count{0};
+};
+DonateTrace g_donate_trace[16];
+}
+
+void donate_last(uint32_t spu_slot, uint32_t& module, uint64_t& age_us, uint64_t& count) {
+    DonateTrace& t = g_donate_trace[spu_slot & 15];
+    module = t.module.load(std::memory_order_relaxed);
+    uint64_t at = t.at.load(std::memory_order_relaxed);
+    age_us = at ? static_cast<uint64_t>(double(now() - at) * 1e6 / tsc_hz()) : 0;
+    count = t.count.load(std::memory_order_relaxed);
+}
+
 bool spu_idle_donate(uint32_t spu_slot) {
     if (!cfg().donate || !g_qn.load(std::memory_order_relaxed)) return false;
     Item it;
-    if (pop(it) != Pop::Got) return false;
+    if (pop(it, 0, donate_accept) != Pop::Got) return false;
     Executor& x = thread_executor(16 + spu_slot);
+    uint32_t module = it.d.module_ea;
+    uint64_t t0 = now();
+    DonateTrace& tr = g_donate_trace[spu_slot & 15];
+    tr.module.store(module, std::memory_order_relaxed);
+    tr.count.fetch_add(1, std::memory_order_relaxed);
     run_item(x, it);
+    uint64_t dt = now() - t0;
+    tr.at.store(now(), std::memory_order_relaxed);
     stats().donated.fetch_add(1, std::memory_order_relaxed);
+    static const uint64_t long_ticks = static_cast<uint64_t>(tsc_hz() * 0.004);
+    if (dt > long_ticks) {
+        static std::atomic<uint64_t> next_log{0};
+        uint64_t t = now(), n = next_log.load(std::memory_order_relaxed);
+        if (t >= n && next_log.compare_exchange_strong(n, t + long_ticks * 1250))
+            LOG_WARN("jobsys", "donated job module 0x%06x took %.2f ms on SPU %u", module, double(dt) * 1e3 / tsc_hz(), spu_slot);
+    }
     return true;
+}
+
+uint32_t donate_gate() {
+    static const uint32_t gate = [] {
+        const char* e = std::getenv("GOWA_JOBSYS_DONATE_GATE");
+        return e && *e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 16)) : 0x4000u;
+    }();
+    return gate;
 }
 
 void spu_thread_started(uint32_t) {}

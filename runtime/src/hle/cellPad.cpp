@@ -8,6 +8,7 @@
 
 namespace host {
 void poll_pad(uint16_t* b);
+void set_rumble(uint8_t small, uint8_t large);
 }
 
 namespace hle {
@@ -123,6 +124,7 @@ HLE_FUNC(sys_io, cellPadInit) {
 }
 
 HLE_FUNC(sys_io, cellPadEnd) {
+    host::set_rumble(0, 0);
     g_init = false;
     ret(ctx, 0);
 }
@@ -136,7 +138,7 @@ HLE_FUNC(sys_io, cellPadGetInfo2) {
     vm::write32(out + 8, 0);
     vm::write32(out + 12, 1);
     vm::write32(out + 12 + 28, g_setting);
-    vm::write32(out + 12 + 56, 0x7);
+    vm::write32(out + 12 + 56, 0x1F);
     vm::write32(out + 12 + 84, 0);
     ret(ctx, 0);
 }
@@ -158,6 +160,22 @@ HLE_FUNC(sys_io, cellPadSetPortSetting) {
     ret(ctx, 0);
 }
 
-HLE_FUNC(sys_io, cellPadSetActDirect) { ret(ctx, 0); }
+HLE_FUNC(sys_io, cellPadSetActDirect) {
+    uint32_t port = a32(ctx, 0), param = a32(ctx, 1);
+    if (!g_init) return ret(ctx, static_cast<int32_t>(0x80121104));
+    if (port >= g_max || !param) return ret(ctx, static_cast<int32_t>(0x80121107));
+    if (port == 0) {
+        const uint8_t* m = static_cast<const uint8_t*>(vm::ptr(param));
+        static uint32_t last = ~0u, logged = 0;
+        uint32_t v = uint32_t(m[0]) << 8 | m[1];
+        if (v != last && logged < 40) {
+            logged++;
+            LOG_INFO("pad", "actuator small %u large %u", m[0], m[1]);
+        }
+        last = v;
+        host::set_rumble(m[0], m[1]);
+    }
+    ret(ctx, 0);
+}
 
 }

@@ -615,7 +615,7 @@ bool init() {
         if (SDL_JoystickID* ids = SDL_GetGamepads(&npads)) {
             for (int i = 0; i < npads; i++) {
                 if (SDL_GetGamepadFromID(ids[i])) continue;
-                if (SDL_Gamepad* p = SDL_OpenGamepad(ids[i])) LOG_INFO("input", "gamepad connected: %s", SDL_GetGamepadName(p));
+                if (SDL_Gamepad* p = SDL_OpenGamepad(ids[i])) LOG_INFO("input", "gamepad connected: %s, rumble %s", SDL_GetGamepadName(p), SDL_GetBooleanProperty(SDL_GetGamepadProperties(p), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false) ? "yes" : "no");
             }
             SDL_free(ids);
         }
@@ -637,7 +637,7 @@ bool init() {
                 break;
             case SDL_EVENT_GAMEPAD_ADDED:
                 if (SDL_GetGamepadFromID(e.gdevice.which)) break;
-                if (SDL_Gamepad* p = SDL_OpenGamepad(e.gdevice.which)) LOG_INFO("input", "gamepad connected: %s", SDL_GetGamepadName(p));
+                if (SDL_Gamepad* p = SDL_OpenGamepad(e.gdevice.which)) LOG_INFO("input", "gamepad connected: %s, rumble %s", SDL_GetGamepadName(p), SDL_GetBooleanProperty(SDL_GetGamepadProperties(p), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false) ? "yes" : "no");
                 break;
             default:
                 break;
@@ -711,6 +711,28 @@ bool init() {
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
     std::vector<const char*> dexts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    bool want_vid = [] {
+        const char* e = std::getenv("GOWA_VTX_NATIVE");
+        return !(e && e[0] == '0');
+    }();
+    bool have_vid = false;
+    if (want_vid) {
+        uint32_t en = 0;
+        vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &en, nullptr);
+        std::vector<VkExtensionProperties> avail_exts(en);
+        vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &en, avail_exts.data());
+        for (auto& e : avail_exts)
+            if (std::strcmp(e.extensionName, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME) == 0) have_vid = true;
+    }
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vid{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
+    if (have_vid) {
+        VkPhysicalDeviceFeatures2 v2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        v2.pNext = &vid;
+        vkGetPhysicalDeviceFeatures2(g.phys, &v2);
+        have_vid = vid.vertexInputDynamicState == VK_TRUE;
+        vid.pNext = nullptr;
+    }
+    if (have_vid) dexts.push_back(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     if (dlssg::active() || dlssnr::requested()) {
         uint32_t en = 0;
         vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &en, nullptr);
@@ -755,6 +777,10 @@ bool init() {
     f2.features.shaderFloat64 = avail.shaderFloat64;
     f2.features.shaderInt64 = avail.shaderInt64;
     g.features = f2.features;
+    if (have_vid) {
+        vid.pNext = f2.pNext;
+        f2.pNext = &vid;
+    }
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
@@ -769,7 +795,8 @@ bool init() {
     vkGetDeviceQueue(g.device, g.queue_family, 0, &g.queue);
     dlssg::device_ready(g.phys, g.device);
     dlssnr::device_ready(g.instance, g.phys, g.device);
-    g.ctx = {g.phys, g.device, g.queue, g.queue_family, g.features, a13.pipelineCreationCacheControl == VK_TRUE};
+    g.ctx = {g.phys, g.device, g.queue, g.queue_family, g.features, a13.pipelineCreationCacheControl == VK_TRUE, have_vid};
+    LOG_INFO("gpu", "dynamic vertex input %s", have_vid ? "on" : want_vid ? "not supported" : "off");
     if (!create_swapchain()) {
         LOG_ERROR("gpu", "swapchain creation failed");
         return false;

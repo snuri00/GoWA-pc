@@ -292,7 +292,7 @@ uint32_t SpuThread::read_channel(uint32_t ch) {
                 if (!job_mode && ctx.pc < 0x4000) {
                     lk.unlock();
                     waiting.store(1, std::memory_order_relaxed);
-                    bool ran = jsedge::spu_idle(slot) || (ctx.pc < 0xa00 && jobsys::spu_idle_donate(slot));
+                    bool ran = jsedge::spu_idle(slot) || (ctx.pc < jobsys::donate_gate() && jobsys::spu_idle_donate(slot));
                     waiting.store(0, std::memory_order_relaxed);
                     lk.lock();
                     if (ran) {
@@ -1188,7 +1188,26 @@ bool SpuThread::stop_and_signal(uint32_t code) {
 }
 
 void SpuThread::halt(uint32_t pc, uint32_t word) {
-    LOG_ERROR("spu", "thread 0x%x '%s' halted at 0x%05x (0x%08x)", id, name.c_str(), pc, word);
+    uint32_t mod = 0;
+    uint64_t age = 0, cnt = 0;
+    if (slot < 16) jobsys::donate_last(slot, mod, age, cnt);
+    LOG_ERROR("spu", "thread 0x%x '%s' halted at 0x%05x (0x%08x), lr 0x%05x sp 0x%05x, last donated job module 0x%06x finished %llu us ago (%llu donated)", id, name.c_str(), pc, word, ctx.gpr[0].u32[3], ctx.gpr[1].u32[3], mod,
+              static_cast<unsigned long long>(age), static_cast<unsigned long long>(cnt));
+    static std::atomic<int> dumps{0};
+    if (dumps.fetch_add(1) < 4) {
+        char name_buf[64];
+        std::snprintf(name_buf, sizeof name_buf, "spu_halt_%08x.ls", id);
+        if (FILE* f = std::fopen(name_buf, "wb")) {
+            std::fwrite(ls, 1, LS_SIZE, f);
+            std::fclose(f);
+        }
+        std::snprintf(name_buf, sizeof name_buf, "spu_halt_%08x.regs", id);
+        if (FILE* f = std::fopen(name_buf, "wb")) {
+            std::fwrite(ctx.gpr, sizeof ctx.gpr, 1, f);
+            std::fwrite(&pc, sizeof pc, 1, f);
+            std::fclose(f);
+        }
+    }
 }
 
 void SpuThread::deploy() {

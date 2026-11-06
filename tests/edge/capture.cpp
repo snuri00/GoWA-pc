@@ -88,7 +88,10 @@ const Event* Machine::next(int kind, uint32_t ch, uint32_t value, bool check) {
         }
         c.halted = true;
     }
-    for (auto& [l, d] : e.lines) std::memcpy(ls.data() + l, d, 128);
+    for (auto& [l, d] : e.lines) {
+        std::memcpy(ls.data() + l, d, 128);
+        if (on_line) on_line(l);
+    }
     c.pc = e.pc;
     c.srr0 = e.srr0;
     c.interrupts_enabled = e.ie != 0;
@@ -98,7 +101,9 @@ const Event* Machine::next(int kind, uint32_t ch, uint32_t value, bool check) {
 
 uint32_t Machine::read_channel(uint32_t ch) {
     const Event* e = next(0, ch, 0, false);
-    return e ? e->value : 0;
+    uint32_t v = e ? e->value : 0;
+    if (on_read) on_read(ch, v);
+    return v;
 }
 
 void Machine::write_channel(uint32_t ch, uint32_t value) {
@@ -122,7 +127,9 @@ void Machine::write_channel(uint32_t ch, uint32_t value) {
 
 uint32_t Machine::channel_count(uint32_t ch) {
     const Event* e = next(2, ch, 0, false);
-    return e ? e->value : 0;
+    uint32_t v = e ? e->value : 0;
+    if (on_count) on_count(ch, v);
+    return v;
 }
 
 bool Machine::stop_and_signal(uint32_t code) {
@@ -144,7 +151,10 @@ void Machine::skip(uint64_t k) {
     uint64_t target = n + k;
     while (pos < cap.events.size() && cap.events[pos].kind == 5 && cap.events[pos].value <= target) {
         const Event& e = cap.events[pos++];
-        for (auto& [l, d] : e.lines) std::memcpy(ls.data() + l, d, 128);
+        for (auto& [l, d] : e.lines) {
+            std::memcpy(ls.data() + l, d, 128);
+            if (on_line) on_line(l);
+        }
     }
     n = target;
 }

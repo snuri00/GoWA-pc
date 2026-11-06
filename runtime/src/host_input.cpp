@@ -1,6 +1,10 @@
+#include "runtime/log.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 
 #ifdef _WIN32
@@ -15,6 +19,17 @@
 namespace host {
 
 namespace {
+
+std::atomic<uint32_t> g_rumble{0};
+uint32_t g_rumble_sent = 0;
+
+bool rumble_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("GOWA_VIBRATION");
+        return !e || !e[0] || e[0] != '0';
+    }();
+    return on;
+}
 
 void press(uint16_t* b, uint32_t offset, uint16_t mask, uint32_t pressure) {
     b[offset] |= mask;
@@ -38,8 +53,10 @@ void stick(int sx, int sy, int deadzone, uint16_t& ox, uint16_t& oy) {
 #ifdef _WIN32
 
 using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+using XInputSetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_VIBRATION*);
 
 XInputGetStateFn g_xinput = nullptr;
+XInputSetStateFn g_xinput_set = nullptr;
 std::once_flag g_once;
 
 void load() {
@@ -47,6 +64,7 @@ void load() {
     for (const wchar_t* n : names) {
         if (HMODULE m = LoadLibraryW(n)) {
             g_xinput = reinterpret_cast<XInputGetStateFn>(GetProcAddress(m, "XInputGetState"));
+            g_xinput_set = reinterpret_cast<XInputSetStateFn>(GetProcAddress(m, "XInputSetState"));
             if (g_xinput) return;
         }
     }
@@ -66,6 +84,11 @@ int g_slot = -1;
 ULONGLONG g_next_scan = 0;
 #endif
 
+}
+
+void set_rumble(uint8_t small, uint8_t large) {
+    if (!rumble_enabled()) return;
+    g_rumble.store(static_cast<uint32_t>(large) << 8 | (small ? 0xFFu : 0u), std::memory_order_relaxed);
 }
 
 #ifdef _WIN32
@@ -111,6 +134,13 @@ void poll_pad(uint16_t* b) {
             if (w & XINPUT_GAMEPAD_X) press(b, 3, 0x80, 15);
             stick(st.Gamepad.sThumbRX, st.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, b[4], b[5]);
             stick(st.Gamepad.sThumbLX, st.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, b[6], b[7]);
+            uint32_t r = g_rumble.load(std::memory_order_relaxed);
+            if (g_xinput_set && r != g_rumble_sent) {
+                XINPUT_VIBRATION v{};
+                v.wLeftMotorSpeed = static_cast<WORD>((r >> 8 & 0xFF) * 257);
+                v.wRightMotorSpeed = static_cast<WORD>((r & 0xFF) * 257);
+                if (g_xinput_set(static_cast<DWORD>(g_slot), &v) == ERROR_SUCCESS) g_rumble_sent = r;
+            }
         }
     }
     if (!focused()) return;
@@ -198,6 +228,15 @@ void poll_pad(uint16_t* b) {
         auto axis = [&](SDL_GamepadAxis a) { return std::clamp(static_cast<int>(SDL_GetGamepadAxis(p, a)), -32767, 32767); };
         stick(axis(SDL_GAMEPAD_AXIS_RIGHTX), -axis(SDL_GAMEPAD_AXIS_RIGHTY), 8689, b[4], b[5]);
         stick(axis(SDL_GAMEPAD_AXIS_LEFTX), -axis(SDL_GAMEPAD_AXIS_LEFTY), 7849, b[6], b[7]);
+        uint32_t r = g_rumble.load(std::memory_order_relaxed);
+        if (r || g_rumble_sent) {
+            static bool warned = false;
+            if (!SDL_RumbleGamepad(p, static_cast<Uint16>((r >> 8 & 0xFF) * 257), static_cast<Uint16>((r & 0xFF) * 257), r ? 250 : 0) && !warned) {
+                warned = true;
+                LOG_WARN("input", "gamepad rumble failed: %s", SDL_GetError());
+            }
+            g_rumble_sent = r;
+        }
     }
     if (SDL_GetKeyboardFocus() != static_cast<SDL_Window*>(w)) return;
     if (key(SDL_SCANCODE_BACKSPACE)) press(b, 2, 0x01, 0);

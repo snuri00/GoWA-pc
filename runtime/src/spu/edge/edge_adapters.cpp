@@ -114,10 +114,10 @@ bool d618(uint8_t* ls, spu::Context& c, Outputs& outs) {
 bool x73e0(uint8_t* ls, spu::Context& c, Outputs& outs) {
     static const bool use_gen = std::getenv("EDGE_SB_GEN") != nullptr;
     if (gpu::mode()) gpu::touch_all(ls, 6);
-    if (gpu::g_mix) gpu::mix_note("B", -1, 0);
+    if (gpu::g_mix) gpu::mix_note("Z", -1, 0);
     if (use_gen) return run_gen<xo::f_073e0>(ls, c, outs);
     uint32_t sp = c.gpr[1].u32[3];
-    if ((sp & 15) || sp < 0x2000 || sp > 0x3ffc0 || c.gpr[8].u32[3] != 0 || c.gpr[11].u32[3] > 0x2000) return false;
+    if ((sp & 15) || sp < 0x2000 || sp > 0x3ffc0 || c.gpr[11].u32[3] > 0x2000) return false;
     if ((c.gpr[3].u32[3] & 0x3fff0) < 0x10000 || (c.gpr[3].u32[3] & 0x3fff0) + 0x200 > 0x40000) return false;
     const int rs[] = {4, 5, 6, 7, 9, 10, 12};
     for (int r : rs) {
@@ -171,6 +171,12 @@ const Sig kSigs[] = {
     {7, 0x450, 0xc38105349f01041cull, 0x0a95e932a57168f5ull},
     {3, 0x7c0, 0xd0c0ff2439001c41ull, 0x28d85cde44accd9bull},
     {6, 0x350, 0x828105340442001cull, 0x2141150a87839f69ull},
+    {21, 0x100, 0xc8810534bb01041cull, 0x55759048cd2f18c3ull},
+    {22, 0x100, 0xb78105342c42001cull, 0xf6b5d50af651d52aull},
+    {23, 0x100, 0xb5810534a901041cull, 0x14de2d771e913763ull},
+    {24, 0x100, 0x9f810534a301041cull, 0x4c68222f0f78f3beull},
+    {26, 0x100, 0xbb8105349401041cull, 0x50fe487ceb49936cull},
+    {28, 0x100, 0x8a810534b47f2341ull, 0x4776727a88c141d3ull},
 };
 
 int identify(const uint8_t* ls, uint32_t entry) {
@@ -285,7 +291,7 @@ bool a880(uint8_t* ls, spu::Context& c, Outputs&) {
     save_lr(ls, c);
     store_quad(ls, sp - 112, c.gpr[1]);
     uint32_t ctx = c.gpr[3].u32[3] & 0x3fff0;
-    if (gpu::g_mix) gpu::mix_note("N", -1, 0);
+    if (gpu::g_mix) gpu::mix_note("B", -1, 0);
     if (rbe32(ls + ctx + 100) && rbe32(ls + ctx + 104) && !rbe32(ls + ctx + 96)) {
         spu::v128 lr{}, r1 = c.gpr[1];
         lr.u32[3] = 0xad88;
@@ -302,7 +308,7 @@ bool a880(uint8_t* ls, spu::Context& c, Outputs&) {
 bool bbc8(uint8_t* ls, spu::Context& c, Outputs&) {
     if (c.gpr[4].u32[3] > 0x10000) return false;
     if (gpu::mode()) gpu::touch(ls, c.gpr[3].u32[3] & 0x3fff0, (c.gpr[3].u32[3] & 0x3fff0) + 16 * ((c.gpr[4].u32[3] + 7) & ~7u), 7);
-    if (gpu::g_mix) gpu::mix_note("Z", -1, 0);
+    if (gpu::g_mix) gpu::mix_note("N", -1, 0);
     uint32_t q[4], n[4];
     for (int i = 0; i < 4; i++) n[i] = c.gpr[4].u32[3 - i];
     if (!normalize_vertexes(ls, c.gpr[3].u32[3], n, q)) return false;

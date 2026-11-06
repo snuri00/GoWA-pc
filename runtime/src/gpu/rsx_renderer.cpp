@@ -367,6 +367,10 @@ bool g_skip_init = [] {
 }();
 uint32_t g_trace_draws = 0;
 void schedule_dumps();
+const bool g_vtx_native = [] {
+    const char* e = std::getenv("GOWA_VTX_NATIVE");
+    return !(e && e[0] == '0');
+}();
 uint32_t g_experiment = std::getenv("GOWA_GPU_EXPERIMENT") ? std::atoi(std::getenv("GOWA_GPU_EXPERIMENT")) : 0;
 
 uint32_t g_prim = 0;
@@ -428,6 +432,21 @@ struct Stats {
     uint64_t blit_slow = 0;
     uint64_t complete_ticks = 0;
     uint64_t copy_ticks = 0;
+    uint64_t tex_create_ticks = 0;
+    uint64_t tex_decode_ticks = 0;
+    uint64_t tex_ring_ticks = 0;
+    uint64_t tex_record_ticks = 0;
+    uint64_t tex_pass_breaks = 0;
+    uint64_t tex_async = 0;
+    uint64_t pool_sync_ticks = 0;
+    uint64_t pool_sync_calls = 0;
+    uint64_t fmt_bytes[256] = {};
+    uint64_t sub[8] = {};
+    uint64_t sub_n[8] = {};
+    uint64_t vtx_native = 0;
+    uint64_t vtx_native_bytes = 0;
+    uint64_t vtx_float = 0;
+    uint64_t vtx_float_bytes = 0;
 } g_stats;
 Stats g_slow_prev;
 
@@ -1182,6 +1201,10 @@ struct DynState {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkBuffer vb[16] = {};
     VkDeviceSize vo[16] = {}, vs[16] = {};
+    bool vin_set = false;
+    uint32_t vin_mask = 0;
+    uint32_t vin_fmt[16] = {};
+    uint32_t vin_stride[16] = {};
     VkBuffer ib = VK_NULL_HANDLE;
     VkDeviceSize ibo = 0;
     VkViewport viewport{};
@@ -1489,6 +1512,13 @@ public:
         cv_.notify_one();
     }
     void sync() {
+        if (!pending_.load(std::memory_order_acquire)) return;
+        uint64_t s0 = __rdtsc();
+        sync_wait();
+        g_stats.pool_sync_ticks += __rdtsc() - s0;
+        g_stats.pool_sync_calls++;
+    }
+    void sync_wait() {
         while (pending_.load(std::memory_order_acquire)) {
             std::function<void()> job;
             {
@@ -1532,6 +1562,7 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
     auto it = g_textures.find(key);
     Texture* tex = it != g_textures.end() ? it->second.get() : nullptr;
     if (!tex) {
+        uint64_t ct = ticks();
         auto n = std::make_unique<Texture>();
         if (!describe_texture(t, n->layout)) return nullptr;
         TextureLayout& l = n->layout;
@@ -1560,6 +1591,7 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
         n->view = make_view(n->image, l.format, l.view_type, VK_IMAGE_ASPECT_COLOR_BIT, l.mapping, l.levels, l.layers);
         tex = n.get();
         g_textures[key] = std::move(n);
+        g_stats.tex_create_ticks += ticks() - ct;
     }
     uint64_t serial = frame_serial();
     tex->last_used = serial;
@@ -1589,12 +1621,19 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
         return tex;
     }
     RingAlloc staging;
+    uint64_t rt = ticks();
     if (!ring_alloc(tex->layout.decoded_size, 16, staging)) return nullptr;
+    uint64_t dt = ticks();
+    g_stats.tex_ring_ticks += dt - rt;
     if (texture_pool().threads() && tex->layout.decoded_size >= 65536 && !g_trace) {
         texture_pool().submit([src, t, layout = tex->layout, dst = staging.ptr] { decode_texture(src, t, layout, dst); });
+        g_stats.tex_async++;
     } else {
         decode_texture(src, t, tex->layout, staging.ptr);
     }
+    uint64_t et = ticks();
+    g_stats.tex_decode_ticks += et - dt;
+    if (g_pass.active) g_stats.tex_pass_breaks++;
     end_pass();
     VkCommandBuffer cmd = frame_cmd();
     VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1624,9 +1663,11 @@ Texture* memory_texture(const TextureRegs& t, uint32_t ea) {
     tex->hash = h;
     tex->epoch = epoch;
     tex->watched = watch_ok;
+    g_stats.tex_record_ticks += ticks() - et;
     g_stats.uploads++;
     g_stats.upload_frame++;
     g_stats.upload_bytes += tex->layout.source_size;
+    g_stats.fmt_bytes[(t.format >> 8) & 0xFF] += tex->layout.source_size;
     return tex;
 }
 
@@ -1928,7 +1969,14 @@ void dump_texture(const TextureRegs& t, uint32_t ea) {
 
 Binding bind_texture(uint32_t unit, uint32_t dim, const std::vector<Surface*>& colors, Surface* depth) {
     g_bind_kind = "dummy";
+    uint64_t bt0 = ticks();
     Binding b = bind_texture_impl(unit, dim, colors, depth);
+    {
+        char k = g_bind_kind[0];
+        int slot = k == 'm' ? 3 : (k == 'f' || k == 's' || (k == 'd' && g_bind_kind[1] == 'e' && g_bind_kind[6] == 'r')) ? 4 : (k == 'c' || k == 'd') && g_bind_kind[1] != 'u' ? 5 : 6;
+        g_stats.sub[slot] += ticks() - bt0;
+        g_stats.sub_n[slot]++;
+    }
     if (!b.sampler) b.sampler = sampler(texture_regs(unit), 1, false);
     if (trace::on(trace::TEX)) {
         TextureRegs t = texture_regs(unit);
@@ -2098,6 +2146,15 @@ void decode_run(const uint8_t* p, uint32_t stride, uint32_t count, float* out) {
             f = _mm_div_ps(_mm_add_ps(_mm_cvtepi32_ps(x), _mm_set1_ps(0.5f)), _mm_set1_ps(32767.5f));
         } else if constexpr (Type == 3) {
             f = _mm_cvtph_ps(_mm_shuffle_epi8(load_attr<Size * 2>(p), swap16));
+        } else if constexpr (Type == 5) {
+            f = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(_mm_shuffle_epi8(load_attr<Size * 2>(p), swap16)));
+        } else if constexpr (Type == 6) {
+            uint32_t w;
+            std::memcpy(&w, p, 4);
+            __m128i b = _mm_set1_epi32(int(__builtin_bswap32(w)));
+            __m128i q = _mm_srav_epi32(_mm_sllv_epi32(b, _mm_setr_epi32(21, 10, 0, 0)), _mm_setr_epi32(21, 21, 22, 0));
+            q = _mm_sllv_epi32(q, _mm_setr_epi32(5, 5, 6, 0));
+            f = _mm_div_ps(_mm_cvtepi32_ps(q), _mm_set1_ps(32767.0f));
         } else {
             __m128i x = _mm_cvtepu8_epi32(load_attr<Size>(p));
             f = _mm_div_ps(_mm_cvtepi32_ps(x), _mm_set1_ps(255.0f));
@@ -2117,6 +2174,86 @@ bool decode_typed(uint32_t size, const uint8_t* p, uint32_t stride, uint32_t cou
     }
 }
 
+struct NativeFmt {
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t elem = 0;
+    uint32_t bytes = 0;
+    uint32_t packed = 0;
+};
+
+bool vertex_format_ok(VkFormat f) {
+    static std::unordered_map<uint32_t, bool> cache;
+    auto it = cache.find(uint32_t(f));
+    if (it != cache.end()) return it->second;
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(vk().phys, f, &fp);
+    bool ok = (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
+    cache[uint32_t(f)] = ok;
+    return ok;
+}
+
+NativeFmt native_format(uint32_t type, uint32_t size) {
+    NativeFmt n;
+    if (size < 1 || size > 4) return n;
+    static const VkFormat f32[4] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT};
+    static const VkFormat f16[4] = {VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16B16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT};
+    static const VkFormat u8[4] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
+    if (type == 2) n = {f32[size - 1], 4, 4 * size, 4 * size};
+    else if (type == 3) n = {f16[size - 1], 2, 2 * size, (2 * size + 3) & ~3u};
+    else if (type == 4) n = {u8[size - 1], 1, size, 4};
+    else return n;
+    if (!vertex_format_ok(n.format)) n.format = VK_FORMAT_UNDEFINED;
+    return n;
+}
+
+template <uint32_t Elem, uint32_t Bytes, bool Wide>
+void native_run(const uint8_t* p, uint32_t stride, uint32_t count, uint8_t* out, uint32_t ostride) {
+    const __m128i swap32 = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    const __m128i swap16 = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    for (uint32_t v = 0; v < count; v++, p += stride, out += ostride) {
+        __m128i x = Wide ? _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)) : load_attr<Bytes>(p);
+        if constexpr (Elem == 4) x = _mm_shuffle_epi8(x, swap32);
+        else if constexpr (Elem == 2) x = _mm_shuffle_epi8(x, swap16);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out), x);
+    }
+}
+
+template <uint32_t Elem, uint32_t Bytes>
+void native_typed(const uint8_t* p, uint32_t stride, uint32_t count, uint8_t* out, uint32_t ostride, bool wide) {
+    if (wide) native_run<Elem, Bytes, true>(p, stride, count, out, ostride);
+    else native_run<Elem, Bytes, false>(p, stride, count, out, ostride);
+}
+
+void native_copy(const NativeFmt& n, const uint8_t* p, uint32_t stride, uint32_t count, uint8_t* out, bool wide) {
+    if (n.elem == 4 && stride == n.bytes && n.packed == n.bytes) {
+        size_t bytes = size_t(count) * n.bytes;
+        const __m128i swap32 = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+        size_t i = 0;
+        for (; i + 16 <= bytes; i += 16) _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i), _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i)), swap32));
+        for (; i < bytes; i += 4) {
+            uint32_t w;
+            std::memcpy(&w, p + i, 4);
+            w = __builtin_bswap32(w);
+            std::memcpy(out + i, &w, 4);
+        }
+        return;
+    }
+    switch (n.elem * 16 + n.bytes) {
+    case 4 * 16 + 4: native_typed<4, 4>(p, stride, count, out, n.packed, wide); break;
+    case 4 * 16 + 8: native_typed<4, 8>(p, stride, count, out, n.packed, wide); break;
+    case 4 * 16 + 12: native_typed<4, 12>(p, stride, count, out, n.packed, wide); break;
+    case 4 * 16 + 16: native_typed<4, 16>(p, stride, count, out, n.packed, wide); break;
+    case 2 * 16 + 2: native_typed<2, 2>(p, stride, count, out, n.packed, wide); break;
+    case 2 * 16 + 4: native_typed<2, 4>(p, stride, count, out, n.packed, wide); break;
+    case 2 * 16 + 6: native_typed<2, 6>(p, stride, count, out, n.packed, wide); break;
+    case 2 * 16 + 8: native_typed<2, 8>(p, stride, count, out, n.packed, wide); break;
+    case 1 * 16 + 1: native_typed<1, 1>(p, stride, count, out, n.packed, wide); break;
+    case 1 * 16 + 2: native_typed<1, 2>(p, stride, count, out, n.packed, wide); break;
+    case 1 * 16 + 3: native_typed<1, 3>(p, stride, count, out, n.packed, wide); break;
+    default: native_typed<1, 4>(p, stride, count, out, n.packed, wide); break;
+    }
+}
+
 void decode_vertices(uint32_t type, uint32_t size, const uint8_t* p, uint32_t stride, uint32_t count, float* out) {
     bool done = false;
     switch (type) {
@@ -2124,10 +2261,61 @@ void decode_vertices(uint32_t type, uint32_t size, const uint8_t* p, uint32_t st
     case 2: done = decode_typed<2>(size, p, stride, count, out); break;
     case 3: done = decode_typed<3>(size, p, stride, count, out); break;
     case 4: done = decode_typed<4>(size, p, stride, count, out); break;
+    case 5: done = decode_typed<5>(size, p, stride, count, out); break;
+    case 6:
+        decode_run<6, 3>(p, stride, count, out);
+        done = true;
+        break;
     default: break;
     }
     if (done) return;
     for (uint32_t v = 0; v < count; v++, p += stride, out += 4) decode_attribute(type, size, p, out);
+}
+
+const bool g_vtx_async = [] {
+    const char* e = std::getenv("GOWA_VTX_ASYNC");
+    return e && *e && e[0] != '0';
+}();
+
+struct VtxCopy {
+    NativeFmt nf;
+    uint32_t type, size, stride, count;
+    const uint8_t* src;
+    uint8_t* dst;
+    bool native, wide;
+};
+
+std::vector<VtxCopy> g_vbatch;
+uint64_t g_vbatch_bytes = 0;
+
+void run_vtx_copy(const VtxCopy& c) {
+    if (c.native) native_copy(c.nf, c.src, c.stride, c.count, c.dst, c.wide);
+    else decode_vertices(c.type, c.size, c.src, c.stride, c.count, reinterpret_cast<float*>(c.dst));
+}
+
+void vbatch_flush() {
+    if (g_vbatch.empty()) return;
+    auto jobs = std::make_shared<std::vector<VtxCopy>>(std::move(g_vbatch));
+    g_vbatch.clear();
+    g_vbatch_bytes = 0;
+    texture_pool().submit([jobs] {
+        for (const VtxCopy& c : *jobs) run_vtx_copy(c);
+    });
+}
+
+void vtx_copy(const VtxCopy& c, uint64_t bytes) {
+    if (!g_vtx_async || texture_pool().threads() == 0) {
+        run_vtx_copy(c);
+        return;
+    }
+    g_vbatch.push_back(c);
+    g_vbatch_bytes += bytes;
+    if (g_vbatch_bytes >= 512 * 1024) vbatch_flush();
+}
+
+void sync_pool() {
+    vbatch_flush();
+    g_texture_pool.sync();
 }
 
 uint32_t attribute_bytes(uint32_t type, uint32_t size) {
@@ -2284,7 +2472,7 @@ VkResult create_pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule
                                        VK_DYNAMIC_STATE_CULL_MODE,
                                        VK_DYNAMIC_STATE_FRONT_FACE,
                                        VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
-                                       VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
+                                       vk().vertex_input_dynamic ? VK_DYNAMIC_STATE_VERTEX_INPUT_EXT : VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
                                        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
                                        VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
                                        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
@@ -2649,13 +2837,18 @@ bool draw() {
     uint64_t ph = ticks();
     VpEntry* vp = vertex_program();
     if (!vp || !vp->ready.load(std::memory_order_acquire) || !vp->ok) return skip(__LINE__);
+    uint64_t sp0 = ticks();
+    g_stats.sub[0] += sp0 - ph;
     uint32_t fp_ea = fp_address();
     FpEntry* fp = fragment_program(fp_ea);
     if (!fp || !fp->ready.load(std::memory_order_acquire) || !fp->ok) return skip(__LINE__);
+    uint64_t sp1 = ticks();
+    g_stats.sub[1] += sp1 - sp0;
     uint32_t w = clip_w(), h = clip_h();
     if (!w || !h) return skip(__LINE__);
     std::vector<Surface*> colors = color_targets();
     Surface* depth = depth_target();
+    g_stats.sub[2] += ticks() - sp1;
     if (colors.empty() && !depth) {
         static int logged = 0;
         if (logged++ < 10) LOG_INFO("rsx", "no target: color target 0x%x dmaA 0x%x dmaB 0x%x zeta dma 0x%x fmt 0x%x offA 0x%x offZ 0x%x pitchA 0x%x clip %ux%u", R(SURFACE_COLOR_TARGET), R(CONTEXT_DMA_COLOR_A),
@@ -2799,6 +2992,8 @@ bool draw() {
     VkBuffer vbufs[16];
     VkDeviceSize voffs[16];
     VkDeviceSize vstrides[16];
+    uint32_t vfmts[16];
+    for (uint32_t i = 0; i < 16; i++) vfmts[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
     const float* vdata[16] = {};
     uint32_t div_ops = R(FREQUENCY_DIVIDER);
     uint32_t inline_offset = 0;
@@ -2859,7 +3054,28 @@ bool draw() {
                 check_ea[i] = base;
             }
         }
+        if (g_vtx_native && !inline_draw && stride && freq <= 1 && !gpu_check[i]) {
+            NativeFmt nf = native_format(type, size);
+            if (nf.format != VK_FORMAT_UNDEFINED) {
+                uint64_t span = uint64_t(vmax) * stride + attribute_bytes(type, size);
+                if (!readable(base, span)) return skip(__LINE__);
+                if (!ring_alloc(uint64_t(vcount) * nf.packed + 16, 16, a)) return skip(__LINE__);
+                bool wide = readable(base, uint64_t(vmax) * stride + 16);
+                VtxCopy c{nf, type, size, stride, vcount, vm::ptr(base + vmin * stride), a.ptr, true, wide};
+                if (g_trace) run_vtx_copy(c);
+                else vtx_copy(c, uint64_t(vcount) * nf.packed);
+                vbufs[i] = a.buffer;
+                voffs[i] = a.offset;
+                vstrides[i] = nf.packed;
+                vfmts[i] = nf.format;
+                g_stats.vtx_native++;
+                g_stats.vtx_native_bytes += uint64_t(vcount) * nf.packed;
+                continue;
+            }
+        }
         if (!ring_alloc(uint64_t(vcount) * 16, 16, a)) return skip(__LINE__);
+        g_stats.vtx_float++;
+        g_stats.vtx_float_bytes += uint64_t(vcount) * 16;
         float* out = reinterpret_cast<float*>(a.ptr);
         if (inline_draw) {
             for (uint32_t v = 0; v < vcount; v++) {
@@ -2890,11 +3106,21 @@ bool draw() {
         vstrides[i] = 16;
         vdata[i] = out;
     }
-    for (uint32_t v0 = 0; v0 < vcount; v0 += 256) {
-        uint32_t nv = std::min<uint32_t>(256, vcount - v0);
+    bool defer = g_vtx_async && !g_trace;
+    for (uint32_t i = 0; i < 16 && defer; i++)
+        if (gpu_check[i]) defer = false;
+    if (defer) {
         for (uint32_t k = 0; k < npending; k++) {
             const PendingDecode& d = pending[k];
-            decode_vertices(d.type, d.size, d.src + size_t(v0) * d.stride, d.stride, nv, d.out + size_t(v0) * 4);
+            vtx_copy(VtxCopy{NativeFmt{}, d.type, d.size, d.stride, vcount, d.src, reinterpret_cast<uint8_t*>(d.out), false, false}, uint64_t(vcount) * 16);
+        }
+    } else {
+        for (uint32_t v0 = 0; v0 < vcount; v0 += 256) {
+            uint32_t nv = std::min<uint32_t>(256, vcount - v0);
+            for (uint32_t k = 0; k < npending; k++) {
+                const PendingDecode& d = pending[k];
+                decode_vertices(d.type, d.size, d.src + size_t(v0) * d.stride, d.stride, nv, d.out + size_t(v0) * 4);
+            }
         }
     }
     for (uint32_t i = 0; i < 16; i++)
@@ -3044,12 +3270,40 @@ bool draw() {
         std::memcpy(ds.images, images, ni * sizeof images[0]);
         std::memcpy(ds.ubo, ubo, sizeof ubo);
     }
-    for (uint32_t i = 0; i < 16; i++) {
-        if (!(vp->inputs & (1u << i)) || (ds.vb[i] == vbufs[i] && ds.vo[i] == voffs[i] && ds.vs[i] == vstrides[i])) continue;
-        vkCmdBindVertexBuffers2(cmd, i, 1, &vbufs[i], &voffs[i], nullptr, &vstrides[i]);
-        ds.vb[i] = vbufs[i];
-        ds.vo[i] = voffs[i];
-        ds.vs[i] = vstrides[i];
+    if (vk().vertex_input_dynamic) {
+        bool same = ds.vin_set && ds.vin_mask == vp->inputs;
+        for (uint32_t i = 0; i < 16 && same; i++)
+            if ((vp->inputs >> i) & 1) same = ds.vin_fmt[i] == vfmts[i] && ds.vin_stride[i] == uint32_t(vstrides[i]);
+        if (!same) {
+            VkVertexInputBindingDescription2EXT vb2[16];
+            VkVertexInputAttributeDescription2EXT va2[16];
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < 16; i++) {
+                if (!((vp->inputs >> i) & 1)) continue;
+                vb2[n] = {VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, nullptr, i, uint32_t(vstrides[i]), VK_VERTEX_INPUT_RATE_VERTEX, 1};
+                va2[n] = {VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, nullptr, i, i, static_cast<VkFormat>(vfmts[i]), 0};
+                n++;
+                ds.vin_fmt[i] = vfmts[i];
+                ds.vin_stride[i] = uint32_t(vstrides[i]);
+            }
+            vkCmdSetVertexInputEXT(cmd, n, vb2, n, va2);
+            ds.vin_set = true;
+            ds.vin_mask = vp->inputs;
+        }
+        for (uint32_t i = 0; i < 16; i++) {
+            if (!(vp->inputs & (1u << i)) || (ds.vb[i] == vbufs[i] && ds.vo[i] == voffs[i])) continue;
+            vkCmdBindVertexBuffers(cmd, i, 1, &vbufs[i], &voffs[i]);
+            ds.vb[i] = vbufs[i];
+            ds.vo[i] = voffs[i];
+        }
+    } else {
+        for (uint32_t i = 0; i < 16; i++) {
+            if (!(vp->inputs & (1u << i)) || (ds.vb[i] == vbufs[i] && ds.vo[i] == voffs[i] && ds.vs[i] == vstrides[i])) continue;
+            vkCmdBindVertexBuffers2(cmd, i, 1, &vbufs[i], &voffs[i], nullptr, &vstrides[i]);
+            ds.vb[i] = vbufs[i];
+            ds.vo[i] = voffs[i];
+            ds.vs[i] = vstrides[i];
+        }
     }
     if (ds.ib != ib.buffer || ds.ibo != ib.offset) {
         vkCmdBindIndexBuffer(cmd, ib.buffer, ib.offset, VK_INDEX_TYPE_UINT32);
@@ -3193,7 +3447,7 @@ uint16_t argb_to_565(uint32_t c) {
 }
 
 void nv308a_color(uint32_t index, uint32_t arg) {
-    g_texture_pool.sync();
+    sync_pool();
     if (index >= (R(0xA308) & 0xFFFF)) return;
     uint32_t point = R(0xA304);
     uint32_t x = (point & 0xFFFF) + index, y = point >> 16;
@@ -3208,7 +3462,7 @@ void nv308a_color(uint32_t index, uint32_t arg) {
 }
 
 void nv0039_transfer() {
-    g_texture_pool.sync();
+    sync_pool();
     if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv0039 in 0x%x dma 0x%x out 0x%x dma 0x%x pitch %d/%d len %u lines %u fmt 0x%x", R(0x230C), R(0x2184), R(0x2310), R(0x2188), int32_t(R(0x2314)),
                                                  int32_t(R(0x2318)), R(0x231C), R(0x2320), R(0x2324));
     if (g_trace) LOG_INFO("rsx", "trace nv0039 in 0x%x dma 0x%x out 0x%x dma 0x%x pitch %d/%d len %u lines %u fmt 0x%x", R(0x230C), R(0x2184), R(0x2310), R(0x2188), int32_t(R(0x2314)), int32_t(R(0x2318)), R(0x231C), R(0x2320), R(0x2324));
@@ -3236,7 +3490,7 @@ void nv0039_transfer() {
 }
 
 void nv3089_transfer(uint32_t arg) {
-    g_texture_pool.sync();
+    sync_pool();
     if (std::getenv("GOWA_COPY_LOG")) LOG_INFO("rsxcopy", "nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x clip 0x%x/0x%x dst 0x%x dma 0x%x pitch 0x%x surf 0x%x cfmt 0x%x/0x%x dsdx 0x%x/0x%x arg 0x%x", R(0xC408), R(0xC184),
                                                  R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC308), R(0xC30C), R(0x630C), R(0x6188), R(0x6304), R(0xC198), R(0xC300), R(0x6300), R(0xC318), R(0xC31C), arg);
     if (g_trace) LOG_INFO("rsx", "trace nv3089 src 0x%x dma 0x%x in 0x%x fmt 0x%x out 0x%x/0x%x size 0x%x dst 0x%x dma 0x%x surf 0x%x dsdx 0x%x", R(0xC408), R(0xC184), R(0xC400), R(0xC404), R(0xC310), R(0xC314), R(0xC30C), R(0x630C), R(0x6188), R(0xC198), R(0xC318));
@@ -3698,13 +3952,13 @@ uint32_t zpass_value(uint32_t ea) {
 
 void frame_complete_body();
 
-void sync_decodes() { g_texture_pool.sync(); }
+void sync_decodes() { sync_pool(); }
 
 uint32_t needs_full_wait() { return (g_dumps.empty() ? 0u : 2u) | (g_qpool && g_qused ? 4u : 0u) | (mv::pending() ? 8u : 0u) | (edge_compute::enabled() ? 16u : 0u); }
 
 void frame_complete(bool all) {
     g_complete_all = all;
-    g_texture_pool.sync();
+    sync_pool();
     uint64_t complete_start = ticks();
     frame_complete_body();
     g_stats.complete_ticks += ticks() - complete_start;
@@ -4017,6 +4271,12 @@ bool present(uint32_t buffer_id) {
                      double(now - last) * ms, double(s.draw_ticks - prev.draw_ticks) * ms, double(s.tex_ticks - prev.tex_ticks) * ms, double(s.hash_ticks - prev.hash_ticks) * ms,
                      double(s.present_ticks - prev.present_ticks) * ms, last_fence_wait_ms(), (unsigned long long)(s.draws - prev.draws), (unsigned long long)(s.pipelines - prev.pipelines),
                      (unsigned long long)(s.upload_frame - prev.upload_frame), double(s.upload_bytes - prev.upload_bytes) / 1048576.0, (unsigned long long)(s.copies - prev.copies));
+            LOG_INFO("slowframe", "  textures: create %.2f (%llu new images, %llu pool reuse), hash %.2f, decode %.2f (%llu async), staging %.2f, record %.2f (%llu pass breaks); decode pool sync %.2f ms in %llu calls; bind %.2f, record phase %.2f, complete %.2f",
+                     double(s.tex_create_ticks - prev.tex_create_ticks) * ms, (unsigned long long)(s.image_allocs - prev.image_allocs), (unsigned long long)(s.pool_hits - prev.pool_hits),
+                     double(s.hash_ticks - prev.hash_ticks) * ms, double(s.tex_decode_ticks - prev.tex_decode_ticks) * ms, (unsigned long long)(s.tex_async - prev.tex_async),
+                     double(s.tex_ring_ticks - prev.tex_ring_ticks) * ms, double(s.tex_record_ticks - prev.tex_record_ticks) * ms, (unsigned long long)(s.tex_pass_breaks - prev.tex_pass_breaks),
+                     double(s.pool_sync_ticks - prev.pool_sync_ticks) * ms, (unsigned long long)(s.pool_sync_calls - prev.pool_sync_calls), double(s.phase[7] - prev.phase[7]) * ms,
+                     double(s.phase[6] - prev.phase[6]) * ms, double(s.complete_ticks - prev.complete_ticks) * ms);
         }
         last = now;
         prev = g_stats;
@@ -4063,7 +4323,26 @@ bool present(uint32_t buffer_id) {
         LOG_INFO("rsx", "  write watch faults %.1f per frame, stale repairs %llu, %s", (faults - last_faults) / 60.0, static_cast<unsigned long long>(vm::watch_stale_repairs()), vm::watch_top_pages().c_str());
         last_faults = faults;
         g_stats.hash_count = g_stats.hash_bytes = g_stats.hash_ticks = g_stats.upload_frame = g_stats.upload_bytes = 0;
+        LOG_INFO("rsx", "  programs split: vp %.2f fp %.2f targets %.2f ms; binds: memory %.2f ms (%.0f), copied surface %.2f ms (%.0f), direct surface %.2f ms (%.0f), dummy %.2f ms (%.0f)", g_stats.sub[0] * ms, g_stats.sub[1] * ms, g_stats.sub[2] * ms,
+                 g_stats.sub[3] * ms, g_stats.sub_n[3] / 60.0, g_stats.sub[4] * ms, g_stats.sub_n[4] / 60.0, g_stats.sub[5] * ms, g_stats.sub_n[5] / 60.0, g_stats.sub[6] * ms, g_stats.sub_n[6] / 60.0);
+        std::memset(g_stats.sub, 0, sizeof g_stats.sub);
+        std::memset(g_stats.sub_n, 0, sizeof g_stats.sub_n);
+        LOG_INFO("rsx", "  vertex arrays per frame: native %.1f (%.2f MB), float4 %.1f (%.2f MB)", g_stats.vtx_native / 60.0, g_stats.vtx_native_bytes / 60.0 / 1048576.0, g_stats.vtx_float / 60.0, g_stats.vtx_float_bytes / 60.0 / 1048576.0);
+        g_stats.vtx_native = g_stats.vtx_native_bytes = g_stats.vtx_float = g_stats.vtx_float_bytes = 0;
         LOG_INFO("rsx", "  texture images: %.1f allocated, %.1f reused, %.1f freed per frame, %zu live", g_stats.image_allocs / 60.0, g_stats.pool_hits / 60.0, g_stats.textures_freed / 60.0, g_textures.size());
+        {
+            std::vector<std::pair<uint64_t, uint32_t>> f;
+            for (uint32_t k = 0; k < 256; k++)
+                if (g_stats.fmt_bytes[k]) f.push_back({g_stats.fmt_bytes[k], k});
+            std::sort(f.rbegin(), f.rend());
+            std::string line;
+            for (size_t k = 0; k < f.size() && k < 6; k++) {
+                char b[48];
+                std::snprintf(b, sizeof b, " %02x %.1f MB", f[k].second, f[k].first / 1048576.0);
+                line += b;
+            }
+            if (!line.empty()) LOG_INFO("rsx", "  texture uploads by format since start:%s", line.c_str());
+        }
         {
             uint64_t tb = 0, sb = 0;
             for (auto& [k, t] : g_temps) tb += uint64_t(t->iw) * t->ih * 4;

@@ -230,8 +230,14 @@ def cmd_run(args):
     golden = args.save or os.path.join(RUN_DIR, "savedata_golden")
     if os.path.isdir(golden) and not args.keep_save:
         dst = os.path.join(RUN_DIR, "vfs", "dev_hdd0", "home", "00000001", "savedata")
+        backup = os.path.join(RUN_DIR, "savedata_backup", stamp)
         for d in os.listdir(golden):
-            shutil.rmtree(os.path.join(dst, d), ignore_errors=True)
+            cur = os.path.join(dst, d)
+            if os.path.isdir(cur) and subprocess.run(["diff", "-rq", cur, os.path.join(golden, d)], capture_output=True).returncode != 0:
+                os.makedirs(backup, exist_ok=True)
+                shutil.copytree(cur, os.path.join(backup, d))
+                print("saved the current", d, "to", backup)
+            shutil.rmtree(cur, ignore_errors=True)
             shutil.copytree(os.path.join(golden, d), os.path.join(dst, d))
     for f in ("blackbox.req", "blackbox.done"):
         if os.path.exists(os.path.join(RUN_DIR, f)):

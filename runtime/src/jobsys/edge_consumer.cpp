@@ -1,9 +1,12 @@
 #include "edge_consumer.h"
 #include "runtime/host.h"
 #include "edge_exec.h"
+#include "edge_hle.h"
 
 #include "../spu/hle.h"
 #include "../spu/thread.h"
+#include "../spu/edge/edge_gpu.h"
+#include "../spu/edge/edge_glue.h"
 
 #include "ppu/context.h"
 #include "runtime/critpath.h"
@@ -133,7 +136,7 @@ VSpu g_vspu[kVspus];
 
 struct Stats {
     std::atomic<uint64_t> edge{0}, ab{0}, cr{0}, nops{0}, barriers{0}, blocked{0}, rc_zero{0}, helped{0}, failed{0}, unsupported{0};
-    std::atomic<uint64_t> tsc{0}, cpu{0}, cpu_n{0}, ab_wait{0}, prio_fix{0}, prio_hooked{0}, donated{0}, idle_calls{0}, cooled{0};
+    std::atomic<uint64_t> tsc{0}, cpu{0}, cpu_n{0}, ab_wait{0}, prio_fix{0}, prio_hooked{0}, donated{0}, idle_calls{0}, cooled{0}, sc_pad{0};
     std::atomic<uint64_t> gets{0}, get_bytes{0}, puts{0}, put_bytes{0}, slow{0}, insns{0}, disp{0}, fb{0}, decr{0}, labg{0}, othr{0};
     std::atomic<uint64_t> lv_runs{0}, lv_bad{0}, xv_runs{0}, xv_bad{0}, xv_skip{0}, xv_bytes{0}, xv_ringb{0}, sc_runs{0}, sc_bad{0}, sc_skip{0}, sc_bytes{0}, sc_ringb{0};
 };
@@ -333,17 +336,32 @@ void store_event(uint32_t ea, uint32_t v, uint32_t wid, uint32_t module) {
     critpath::spu_stored(s, 0x40 + v, ea, 2);
 }
 
-void self_check(Sandbox& sb, const Claimed& c) {
+bool self_check(Sandbox& sb, const Claimed& c, Executor& x) {
     if (sb.abort) {
         g_st.sc_skip.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return false;
     }
     uint32_t rings = be32(c.kind.cmd.raw + c.kind.cmd.param_off) + 0x80;
-    uint32_t bad = 0, first = 0, ringb = 0;
+    uint32_t pad_lo = 0, pad_hi = 0;
+    if (x.last_nv) {
+        const uint8_t* ls = x.thread().ls;
+        uint32_t ctx = 0x107a0, stride = 0;
+        uint32_t nv8 = edge::glue::rd16(ls, ctx + 8);
+        if (edge::glue::output_vertex_stride(ls, ctx, ls[ctx + 4], stride) && nv8 > x.last_nv) {
+            uint32_t ea = edge::glue::rd32(ls, 0x3f5b0 + 32);
+            pad_lo = ea + x.last_nv * stride;
+            pad_hi = ea + nv8 * stride;
+        }
+    }
+    uint32_t bad = 0, first = 0, ringb = 0, padded = 0;
     for (auto& [a, b] : sb.writes) {
         if (vm::ptr(a)[0] == b) continue;
         if (a - rings < 0x200 && (a & 0x7f) - 0x18 < 0x18) {
             ringb++;
+            continue;
+        }
+        if (a >= pad_lo && a < pad_hi) {
+            padded++;
             continue;
         }
         if (!bad) first = a;
@@ -352,10 +370,46 @@ void self_check(Sandbox& sb, const Claimed& c) {
     g_st.sc_runs.fetch_add(1, std::memory_order_relaxed);
     g_st.sc_bytes.fetch_add(sb.writes.size(), std::memory_order_relaxed);
     if (ringb) g_st.sc_ringb.fetch_add(1, std::memory_order_relaxed);
+    if (padded) g_st.sc_pad.fetch_add(1, std::memory_order_relaxed);
     if (bad) {
         g_st.sc_bad.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<int> logged{0};
-        if (logged.fetch_add(1) < 20) LOG_ERROR("jsedge", "self-check MISMATCH cmd 0x%08x: %u of %zu bytes differ, first ea 0x%08x (sandbox %02x live %02x)", c.kind.cmd.ea, bad, sb.writes.size(), first, sb.writes[first], vm::ptr(first)[0]);
+        uint32_t hole = be32(c.kind.cmd.raw + c.kind.cmd.param_off + 4);
+        int n = logged.fetch_add(1);
+        if (n < 20)
+            LOG_ERROR("jsedge", "self-check MISMATCH cmd 0x%08x: %u of %zu bytes differ, first ea 0x%08x (sandbox %02x live %02x), hole 0x%08x%s", c.kind.cmd.ea, bad, sb.writes.size(), first, sb.writes[first], vm::ptr(first)[0], hole,
+                      first - hole < 0x400 ? " (in hole)" : "");
+        if (n < 6) {
+            std::string d;
+            int k = 0;
+            uint32_t prev = 0;
+            for (auto& [a, b] : sb.writes) {
+                if (vm::ptr(a)[0] == b) continue;
+                if (a - rings < 0x200 && (a & 0x7f) - 0x18 < 0x18) continue;
+                if (k++ >= 24) break;
+                char buf[48];
+                std::snprintf(buf, sizeof buf, a == prev + 1 ? " %02x/%02x" : " @%08x %02x/%02x", a, b, vm::ptr(a)[0]);
+                if (a == prev + 1) std::snprintf(buf, sizeof buf, " %02x/%02x", b, vm::ptr(a)[0]);
+                d += buf;
+                prev = a;
+            }
+            uint32_t lo = 0xffffffffu, hi = 0;
+            for (auto& [a, b] : sb.writes) {
+                lo = (std::min)(lo, a);
+                hi = (std::max)(hi, a);
+            }
+            LOG_ERROR("jsedge", "self-check detail (sandbox/live, writes 0x%08x..0x%08x):%s", lo, hi, d.c_str());
+        }
+    }
+    return bad != 0;
+}
+
+void dump_ls(const char* what, int n, const uint8_t* ls) {
+    char name[128];
+    std::snprintf(name, sizeof name, "hle_dump_%d_%s.bin", n, what);
+    if (FILE* f = std::fopen(name, "wb")) {
+        std::fwrite(ls, 1, spu::LS_SIZE, f);
+        std::fclose(f);
     }
 }
 
@@ -373,7 +427,22 @@ bool run_claimed(List& L, uint32_t v, Claimed& c) {
         bool check = cfg().verify && cfg().on && seq.fetch_add(1, std::memory_order_relaxed) % cfg().verify == 0;
         Sandbox sb;
         ok = x.run_edge(c.ref, c.kind.cmd, cfg().reference, check ? &sb : nullptr);
-        if (check) self_check(sb, c);
+        if (check && self_check(sb, c, x)) {
+            static std::atomic<int> dumps{0};
+            static const bool want = std::getenv("GOWA_JOBSYS_EDGE_DUMP") != nullptr;
+            int n = want ? dumps.fetch_add(1) : 99;
+            if (n < 4 && x.shadow) {
+                dump_ls("live", n, x.thread().ls);
+                dump_ls("sandbox", n, x.shadow->ls);
+                char name[128];
+                std::snprintf(name, sizeof name, "hle_dump_%d_cmd.bin", n);
+                if (FILE* f = std::fopen(name, "wb")) {
+                    std::fwrite(c.kind.cmd.raw, 1, c.kind.cmd.size, f);
+                    std::fclose(f);
+                }
+                LOG_ERROR("jsedge", "dumped LS pair %d for cmd 0x%08x", n, c.kind.cmd.ea);
+            }
+        }
         if (g_cool_cycles && be32(x.thread().ls + kApiLs + 0xa0) == 0) {
             g_vspu[v].cool_until.store(__rdtsc() + g_cool_cycles, std::memory_order_relaxed);
             g_st.cooled.fetch_add(1, std::memory_order_relaxed);
@@ -658,6 +727,17 @@ void stats_line() {
     static uint64_t l_dec = 0, l_lab = 0, l_oth = 0;
     uint64_t vd = g_st.decr.load(), vl = g_st.labg.load(), vo = g_st.othr.load();
     prof_report(d[0]);
+    if (hle::enabled()) {
+        static uint64_t l_fn[3] = {}, l_rs = 0, l_late = 0;
+        uint64_t fn[3], rs, late;
+        hle::counters(fn, rs, late);
+        LOG_INFO("jsedge", "5s hle: SPU-code fallbacks 9a60 %llu bb38 %llu c490 %llu, job restarts %llu (%llu after DMA), code repairs %llu total", static_cast<unsigned long long>(fn[0] - l_fn[0]), static_cast<unsigned long long>(fn[1] - l_fn[1]),
+                 static_cast<unsigned long long>(fn[2] - l_fn[2]), static_cast<unsigned long long>(rs - l_rs), static_cast<unsigned long long>(late - l_late), static_cast<unsigned long long>(code_repairs()));
+        for (int k = 0; k < 3; k++) l_fn[k] = fn[k];
+        l_rs = rs;
+        l_late = late;
+    }
+    if (edge::gpu::g_mix) LOG_INFO("jsedge", "edge mix (cumulative):\n%s", edge::gpu::mix_report().c_str());
     LOG_INFO("jsedge", "5s per edge job: %.1f decrementer reads, %.2f label GETs, %.1f other channel reads", double(vd - l_dec) / jn, double(vl - l_lab) / jn, double(vo - l_oth) / jn);
     l_dec = vd;
     l_lab = vl;
@@ -689,8 +769,8 @@ void stats_line() {
             LOG_INFO("jsedge", "fresh mask 0x%x: %llu runs, %llu differ, %llu skipped", m, static_cast<unsigned long long>(g_fresh[m].runs.load()), static_cast<unsigned long long>(g_fresh[m].differ.load()),
                      static_cast<unsigned long long>(g_fresh[m].skipped.load()));
     if (cfg().verify && cfg().on)
-        LOG_INFO("jsedge", "self-check: %llu/%llu bad (%llu skipped, %llu bytes, %llu ring-B pointer races)", static_cast<unsigned long long>(g_st.sc_bad.load()), static_cast<unsigned long long>(g_st.sc_runs.load()),
-                 static_cast<unsigned long long>(g_st.sc_skip.load()), static_cast<unsigned long long>(g_st.sc_bytes.load()), static_cast<unsigned long long>(g_st.sc_ringb.load()));
+        LOG_INFO("jsedge", "self-check: %llu/%llu bad (%llu skipped, %llu bytes, %llu ring-B pointer races, %llu padding-only)", static_cast<unsigned long long>(g_st.sc_bad.load()), static_cast<unsigned long long>(g_st.sc_runs.load()),
+                 static_cast<unsigned long long>(g_st.sc_skip.load()), static_cast<unsigned long long>(g_st.sc_bytes.load()), static_cast<unsigned long long>(g_st.sc_ringb.load()), static_cast<unsigned long long>(g_st.sc_pad.load()));
     if (cfg().verify)
         LOG_INFO("jsedge", "verify: loader %llu/%llu bad, exec %llu/%llu bad (%llu skipped, %llu bytes compared, %llu ring-B pointer races)", static_cast<unsigned long long>(g_st.lv_bad.load()),
                  static_cast<unsigned long long>(g_st.lv_runs.load()), static_cast<unsigned long long>(g_st.xv_bad.load()), static_cast<unsigned long long>(g_st.xv_runs.load()),

@@ -128,7 +128,15 @@ struct Output {
 
     void write(const float* stereo, uint32_t n) {
         if (!stream) return;
-        if (SDL_GetAudioStreamQueued(stream) == 0) underruns++;
+        if (SDL_GetAudioStreamQueued(stream) == 0) {
+            underruns++;
+            static const int prime = std::getenv("GOWA_AUDIO_PRIME_MS") ? std::atoi(std::getenv("GOWA_AUDIO_PRIME_MS")) * 48 : 1920;
+            if (prime > 0) {
+                static std::vector<float> silence;
+                silence.assign(size_t(prime) * 2, 0.0f);
+                SDL_PutAudioStreamData(stream, silence.data(), prime * 8);
+            }
+        }
         static const int target = std::getenv("GOWA_AUDIO_LATENCY_MS") ? std::atoi(std::getenv("GOWA_AUDIO_LATENCY_MS")) * 48 : 4800;
         if (SDL_GetAudioStreamQueued(stream) / 8 > target) return;
         SDL_PutAudioStreamData(stream, stereo, static_cast<int>(n * 8));

@@ -19,7 +19,7 @@ uint32_t slot_of(const uint8_t* ls, uint32_t ctx, uint8_t attr) {
 
 uint32_t table_of(const uint8_t* ls, uint32_t ctx, uint8_t attr) { return rd32(ls, ctx + 16 + 4 * slot_of(ls, ctx, attr)); }
 
-enum Enc { F32X3, S16X4, P111110, F16X3 };
+enum Enc { F32X3, S16X4, P111110, F16X3, U8X4 };
 
 struct Field {
     uint8_t attr;
@@ -32,6 +32,7 @@ struct Format {
     uint32_t nq;
     int nfields;
     Field f[8];
+    bool tail = true;
 };
 
 const Format kFormats[] = {
@@ -40,7 +41,17 @@ const Format kFormats[] = {
     {4, 54, 7, 7, {{1, F32X3}, {3, S16X4}, {4, P111110}, {27, F32X3}, {28, F16X3}, {29, F16X3}, {30, F16X3}}},
     {3, 46, 6, 6, {{1, F32X3}, {2, P111110}, {27, F32X3}, {28, F16X3}, {29, F16X3}, {30, F16X3}}},
     {6, 28, 4, 3, {{1, F32X3}, {2, P111110}, {31, F32X3}}},
+    {21, 16, 2, 2, {{1, F32X3}, {2, P111110}}, false},
+    {22, 24, 3, 3, {{1, F32X3}, {3, S16X4}, {4, P111110}}, false},
+    {23, 16, 2, 2, {{1, F32X3}, {20, U8X4}}, false},
+    {24, 28, 4, 4, {{1, F32X3}, {3, S16X4}, {4, P111110}, {20, U8X4}}},
+    {25, 50, 7, 7, {{1, F32X3}, {2, P111110}, {20, U8X4}, {27, F32X3}, {28, F16X3}, {29, F16X3}, {30, F16X3}}},
+    {26, 32, 4, 4, {{1, F32X3}, {2, P111110}, {20, U8X4}, {31, F32X3}}, false},
+    {27, 58, 8, 8, {{1, F32X3}, {3, S16X4}, {4, P111110}, {20, U8X4}, {27, F32X3}, {28, F16X3}, {29, F16X3}, {30, F16X3}}},
+    {28, 40, 5, 5, {{1, F32X3}, {3, S16X4}, {4, P111110}, {20, U8X4}, {31, F32X3}}, false},
 };
+
+inline uint32_t enc_u8(uint32_t x) { return uint32_t(spuf::cfltu(spuf::bits(spuf::fma(spuf::fl(x), spuf::fl(0x437f0000u), spuf::fl(0x3f000000u))), 149)) >> 24; }
 
 inline uint32_t enc_s16(uint32_t x) {
     float v = spuf::fma(spuf::fl(x), 32767.5f, -0.5f);
@@ -86,6 +97,13 @@ void encode_vertex(const uint8_t* ls, const Format& fm, const uint32_t* tabs, ui
             spuf::st16(o + 2, enc_f16(y));
             spuf::st16(o + 4, enc_f16(z));
             o += 6;
+            break;
+        case U8X4:
+            o[0] = uint8_t(enc_u8(x));
+            o[1] = uint8_t(enc_u8(y));
+            o[2] = uint8_t(enc_u8(z));
+            o[3] = uint8_t(enc_u8(w));
+            o += 4;
             break;
         }
     }
@@ -223,6 +241,14 @@ void encode_columns(uint8_t* ls, const Format& fm, const uint32_t* tabs, uint32_
             off += 6;
             break;
         }
+        case U8X4:
+            for (uint32_t v = 0; v < n2; v++) {
+                const uint8_t* q = src + 16 * v;
+                uint8_t* d = o + rec * v;
+                for (int k = 0; k < 4; k++) d[k] = uint8_t(enc_u8(spuf::ld32(q + 4 * k)));
+            }
+            off += 4;
+            break;
         }
     }
 }
@@ -240,7 +266,7 @@ void compress_fmt(uint8_t* ls, uint32_t ctx, uint32_t nv, uint32_t out, const Fo
         uint32_t A = out + pr * (pairs - 1);
         std::memset(ls + A + pr, 0, 16 * fm.nq - pr);
         uint32_t a = A & 15;
-        std::memcpy(ls + A + 16 * fm.nq, ls + A + 16 * (fm.nq - 1), 16 - a);
+        if (fm.tail) std::memcpy(ls + A + 16 * fm.nq, ls + A + 16 * (fm.nq - 1), 16 - a);
         return;
     }
     uint8_t d[128];
@@ -251,7 +277,7 @@ void compress_fmt(uint8_t* ls, uint32_t ctx, uint32_t nv, uint32_t out, const Fo
         uint32_t A = out + pr * k;
         uint32_t len = k + 1 == pairs ? 16 * fm.nq : pr;
         for (uint32_t i = 0; i < len; i++) ls[(A + i) & kMask] = d[i];
-        if (k + 1 == pairs) {
+        if (k + 1 == pairs && fm.tail) {
             uint32_t a = A & 15;
             uint32_t base = 16 * (fm.nq - 1);
             for (uint32_t i = 0; i < 16 - a; i++) ls[(A + 16 * fm.nq + i) & kMask] = d[base + i];

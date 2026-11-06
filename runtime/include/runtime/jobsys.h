@@ -210,6 +210,8 @@ bool get_buffer(const JobDesc& job, uint8_t* ls, uint32_t set, uint32_t buf, uin
 bool simple_buffers(const JobDesc& job);
 
 bool spu_idle_donate(uint32_t spu_slot);
+void donate_last(uint32_t spu_slot, uint32_t& module, uint64_t& age_us, uint64_t& count);
+uint32_t donate_gate();
 void spu_thread_started(uint32_t spu_slot);
 
 }

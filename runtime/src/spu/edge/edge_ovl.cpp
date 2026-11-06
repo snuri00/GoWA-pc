@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <string>
@@ -54,6 +56,66 @@ Stats& stats() {
     return s;
 }
 
+struct DeclineKey {
+    int native;
+    uint64_t key;
+    bool operator<(const DeclineKey& o) const { return native != o.native ? native < o.native : key < o.key; }
+};
+
+struct DeclineInfo {
+    uint64_t count = 0;
+    uint32_t files = 0;
+    uint32_t ptr = 0;
+    std::string overlay;
+};
+
+struct Declines {
+    std::mutex m;
+    std::map<DeclineKey, DeclineInfo> keys;
+    uint32_t files = 0;
+    bool dirty = false;
+};
+
+Declines& declines() {
+    static Declines d;
+    return d;
+}
+
+constexpr const char* kDeclineDir = "edge_declines";
+constexpr uint32_t kFilesPerKey = 8;
+constexpr uint32_t kMaxFiles = 400;
+
+uint64_t fnv(const uint8_t* p, size_t n, uint64_t h = 0xcbf29ce484222325ull) {
+    for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h;
+}
+
+uint32_t pw(const spu::Context& c, int r) { return c.gpr[r].u32[3]; }
+
+void write_summary() {
+    Declines& d = declines();
+    std::vector<std::pair<DeclineKey, DeclineInfo>> rows;
+    {
+        std::lock_guard lk(d.m);
+        if (!d.dirty) return;
+        d.dirty = false;
+        rows.assign(d.keys.begin(), d.keys.end());
+    }
+    std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.second.count > b.second.count; });
+    size_t na = 0;
+    const Adapter* a = adapters(na);
+    std::string tmp = std::string(kDeclineDir) + "/summary.txt.tmp";
+    FILE* f = std::fopen(tmp.c_str(), "w");
+    if (!f) return;
+    std::fprintf(f, "# native key count overlay_ptr overlay files\n");
+    for (auto& r : rows)
+        std::fprintf(f, "%s %016llx %llu %05x %s %u\n", r.first.native >= 0 && size_t(r.first.native) < na ? a[r.first.native].name : "?", static_cast<unsigned long long>(r.first.key), static_cast<unsigned long long>(r.second.count),
+                     r.second.ptr, r.second.overlay.empty() ? "-" : r.second.overlay.c_str(), r.second.files);
+    std::fclose(f);
+    std::error_code ec;
+    std::filesystem::rename(tmp, std::string(kDeclineDir) + "/summary.txt", ec);
+}
+
 void logger() {
     uint64_t last[kCounterCount] = {};
     for (;;) {
@@ -96,6 +158,7 @@ void logger() {
         LOG_INFO("edgecov", "overlay runs %llu (%llu insns), native declines %llu, interpreted in edge jobs %llu blocks %llu insns; overlays:%s; declines:%s; interp pcs:%s", d(kRuns), d(kRunInsns), d(kDeclines), d(kInterpBlocks),
                  d(kInterpInsns), ov.c_str(), dec.c_str(), hot.c_str());
         std::memcpy(last, cur, sizeof last);
+        if (capture_on()) write_summary();
     }
 }
 
@@ -188,6 +251,76 @@ void note_interp(uint32_t pc) {
     Stats& s = stats();
     std::lock_guard lk(s.m);
     s.interp_pcs[pc]++;
+}
+
+bool capture_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("GOWA_EDGE_CAPTURE_DECLINES");
+        return e && *e && e[0] != '0';
+    }();
+    return on;
+}
+
+void capture_decline(int native, const uint8_t* ls, const spu::Context& c) {
+    if (!capture_on()) return;
+    start_logger();
+    uint64_t key = 0;
+    uint32_t ptr = 0;
+    if (native == 1) {
+        ptr = pw(c, 8) & 0x3fffc;
+    } else if (native == 9) {
+        uint32_t ctx = pw(c, 3) & 0x3fff0;
+        if (ctx + 144 <= spu::LS_SIZE) ptr = ((uint32_t(ls[ctx + 140]) << 24) | (uint32_t(ls[ctx + 141]) << 16) | (uint32_t(ls[ctx + 142]) << 8) | ls[ctx + 143]) & 0x3fffc;
+    } else if (native == 8) {
+        uint32_t sp = pw(c, 1);
+        uint32_t m = 0;
+        if ((sp & 15) || sp < 0x2000 || sp > 0x3ffc0) m |= 1;
+        if (pw(c, 8) != 0) m |= 2;
+        if (pw(c, 11) > 0x2000) m |= 4;
+        if ((pw(c, 3) & 0x3fff0) < 0x10000 || (pw(c, 3) & 0x3fff0) + 0x200 > 0x40000) m |= 8;
+        const int rs[] = {4, 5, 6, 7, 9, 10, 12};
+        for (int k = 0; k < 7; k++) {
+            uint32_t a = pw(c, rs[k]);
+            if (a == 0 && (rs[k] == 5 || rs[k] == 6 || rs[k] == 7)) continue;
+            if ((a & 15) || a < 0x10c80 || a >= sp - 0x1000) m |= 16u << k;
+        }
+        key = m;
+    }
+    std::string name;
+    if (ptr && ptr + 256 <= spu::LS_SIZE) {
+        key = fnv(ls + ptr, 256);
+        if (const Entry* e = find(ls, ptr)) name = e->name;
+    }
+    Declines& d = declines();
+    uint32_t file_no = 0;
+    bool save = false;
+    {
+        std::lock_guard lk(d.m);
+        DeclineInfo& info = d.keys[DeclineKey{native, key}];
+        if (!info.count) {
+            info.ptr = ptr;
+            info.overlay = name;
+        }
+        info.count++;
+        d.dirty = true;
+        if (info.files < kFilesPerKey && d.files < kMaxFiles) {
+            file_no = info.files++;
+            d.files++;
+            save = true;
+        }
+    }
+    if (!save) return;
+    std::error_code ec;
+    std::filesystem::create_directories(kDeclineDir, ec);
+    char path[160];
+    std::snprintf(path, sizeof path, "%s/n%d_%016llx_%u.bin", kDeclineDir, native, static_cast<unsigned long long>(key), file_no);
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    uint32_t hdr[6] = {0x4c434445u, 1, uint32_t(native), uint32_t(key), uint32_t(key >> 32), c.pc};
+    std::fwrite(hdr, sizeof hdr, 1, f);
+    std::fwrite(c.gpr, sizeof c.gpr, 1, f);
+    std::fwrite(ls, 1, spu::LS_SIZE, f);
+    std::fclose(f);
 }
 
 }

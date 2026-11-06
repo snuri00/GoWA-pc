@@ -21,6 +21,7 @@ struct VkCtx {
     uint32_t queue_family = 0;
     VkPhysicalDeviceFeatures features{};
     bool cache_control = false;
+    bool vertex_input_dynamic = false;
 };
 
 const VkCtx& vk();

@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstring>
 
+#include <immintrin.h>
+
 namespace gpu {
 
 namespace {
@@ -177,6 +179,92 @@ void convert_unit(const FormatInfo& f, const uint8_t* s, uint8_t* d) {
     }
 }
 
+void swap16_run(const uint8_t* s, uint8_t* d, size_t n) {
+    size_t i = 0;
+#ifdef __AVX2__
+    const __m256i m = _mm256_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    for (; i + 32 <= n; i += 32) _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i), _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i)), m));
+#endif
+    for (; i + 2 <= n; i += 2) {
+        d[i] = s[i + 1];
+        d[i + 1] = s[i];
+    }
+}
+
+void swap32_run(const uint8_t* s, uint8_t* d, size_t n) {
+    size_t i = 0;
+#ifdef __AVX2__
+    const __m256i m = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    for (; i + 32 <= n; i += 32) _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i), _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i)), m));
+#endif
+    for (; i + 4 <= n; i += 4) {
+        d[i] = s[i + 3];
+        d[i + 1] = s[i + 2];
+        d[i + 2] = s[i + 1];
+        d[i + 3] = s[i];
+    }
+}
+
+bool run_capable(const FormatInfo& f) { return (f.conv == COPY || f.conv == SWAP16 || f.conv == SWAP32) && f.out_bytes == f.bytes; }
+
+void convert_run(const FormatInfo& f, const uint8_t* s, uint8_t* d, uint32_t units) {
+    if (run_capable(f)) {
+        size_t n = size_t(units) * f.bytes;
+        if (f.conv == COPY) std::memcpy(d, s, n);
+        else if (f.conv == SWAP16) swap16_run(s, d, n);
+        else swap32_run(s, d, n);
+        return;
+    }
+    for (uint32_t i = 0; i < units; i++) convert_unit(f, s + size_t(i) * f.bytes, d + size_t(i) * f.out_bytes);
+}
+
+template <class Load>
+void swizzled_rows(const uint32_t* xs, const uint32_t* ys, uint32_t bw, uint32_t bh, Load load) {
+    for (uint32_t y = 0; y < bh; y++) {
+        uint32_t yo = ys[y];
+        for (uint32_t x = 0; x < bw; x++) load(x, y, xs[x] | yo);
+    }
+}
+
+void decode_swizzled(const FormatInfo& f, const uint8_t* s, uint8_t* d, uint32_t bw, uint32_t bh, const std::vector<uint32_t>& xs, const std::vector<uint32_t>& ys) {
+    if (run_capable(f) && f.bytes == 4) {
+        uint32_t* o = reinterpret_cast<uint32_t*>(d);
+        if (f.conv == SWAP32) {
+            swizzled_rows(xs.data(), ys.data(), bw, bh, [&](uint32_t x, uint32_t y, uint32_t m) {
+                uint32_t v;
+                std::memcpy(&v, s + size_t(m) * 4, 4);
+                v = __builtin_bswap32(v);
+                std::memcpy(o + size_t(y) * bw + x, &v, 4);
+            });
+        } else if (f.conv == SWAP16) {
+            swizzled_rows(xs.data(), ys.data(), bw, bh, [&](uint32_t x, uint32_t y, uint32_t m) {
+                uint32_t v;
+                std::memcpy(&v, s + size_t(m) * 4, 4);
+                v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+                std::memcpy(o + size_t(y) * bw + x, &v, 4);
+            });
+        } else {
+            swizzled_rows(xs.data(), ys.data(), bw, bh, [&](uint32_t x, uint32_t y, uint32_t m) { std::memcpy(o + size_t(y) * bw + x, s + size_t(m) * 4, 4); });
+        }
+        return;
+    }
+    if (run_capable(f) && f.bytes == 2) {
+        bool swap = f.conv == SWAP16;
+        swizzled_rows(xs.data(), ys.data(), bw, bh, [&](uint32_t x, uint32_t y, uint32_t m) {
+            uint16_t v;
+            std::memcpy(&v, s + size_t(m) * 2, 2);
+            if (swap) v = __builtin_bswap16(v);
+            std::memcpy(d + (size_t(y) * bw + x) * 2, &v, 2);
+        });
+        return;
+    }
+    if (run_capable(f) && f.bytes == 1) {
+        swizzled_rows(xs.data(), ys.data(), bw, bh, [&](uint32_t x, uint32_t y, uint32_t m) { d[size_t(y) * bw + x] = s[m]; });
+        return;
+    }
+    swizzled_rows(xs.data(), ys.data(), bw, bh, [&](uint32_t x, uint32_t y, uint32_t m) { convert_unit(f, s + uint64_t(m) * f.bytes, d + (uint64_t(y) * bw + x) * f.out_bytes); });
+}
+
 void morton_tables(uint32_t w, uint32_t h, std::vector<uint32_t>& xs, std::vector<uint32_t>& ys) {
     uint32_t a = ceil_log2(w), b = ceil_log2(h), m = std::min(a, b);
     xs.assign(w, 0);
@@ -314,8 +402,10 @@ void decode_texture(const uint8_t* src, const TextureRegs& regs, const TextureLa
                     }
                 }
             } else if (linear || f->block == 4) {
-                for (uint32_t y = 0; y < g.bh; y++) {
-                    for (uint32_t x = 0; x < g.bw; x++) convert_unit(*f, s + y * g.src_pitch + x * f->bytes, d + (uint64_t(y) * g.bw + x) * f->out_bytes);
+                if (g.src_pitch == g.bw * f->bytes) {
+                    convert_run(*f, s, d, g.bw * g.bh);
+                } else {
+                    for (uint32_t y = 0; y < g.bh; y++) convert_run(*f, s + size_t(y) * g.src_pitch, d + uint64_t(y) * g.bw * f->out_bytes, g.bw);
                 }
             } else if (f->bytes > 4) {
                 uint32_t sub = f->bytes / 4;
@@ -330,9 +420,7 @@ void decode_texture(const uint8_t* src, const TextureRegs& regs, const TextureLa
                 }
             } else {
                 morton_tables(g.bw, g.bh, xs, ys);
-                for (uint32_t y = 0; y < g.bh; y++) {
-                    for (uint32_t x = 0; x < g.bw; x++) convert_unit(*f, s + uint64_t(xs[x] | ys[y]) * f->bytes, d + (uint64_t(y) * g.bw + x) * f->out_bytes);
-                }
+                decode_swizzled(*f, s, d, g.bw, g.bh, xs, ys);
             }
             so += uint64_t(g.src_size) * slices;
         }

@@ -56,6 +56,9 @@ public:
     uint32_t mfc[6] = {};
     std::function<void(const Dma&, bool after)> on_dma;
     std::function<void(uint32_t ch, uint32_t value)> on_write;
+    std::function<void(uint32_t ch, uint32_t value)> on_read;
+    std::function<void(uint32_t ch, uint32_t value)> on_count;
+    std::function<void(uint32_t lsa)> on_line;
 
     explicit Machine(const Capture& cp);
     void reset();

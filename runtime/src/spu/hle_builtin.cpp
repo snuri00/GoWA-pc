@@ -54,6 +54,7 @@ bool edge_handler(Context& c) {
     edge::Outputs outs;
     if (a.handler(c.ls, c, outs)) return true;
     edge::ovl::count_decline(int(I));
+    edge::ovl::capture_decline(int(I), c.ls, c);
     return false;
 }
 

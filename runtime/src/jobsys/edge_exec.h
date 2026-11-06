@@ -51,6 +51,8 @@ struct Cmd {
 
 bool parse(uint32_t cmd_ea, uint32_t cmd_size, Cmd& out);
 void prof_report(uint64_t jobs);
+bool prof_on();
+void prof_add(const char* name, uint64_t ticks);
 bool edge_shape(const Cmd& c);
 
 struct JobRef {
@@ -94,7 +96,10 @@ public:
     ApiState api;
     HostCounters hc;
     uint32_t fail_pc = 0;
-    uint64_t dispatches = 0, fallbacks = 0;
+    uint32_t last_nv = 0;
+    uint64_t dispatches = 0, fallbacks = 0, hle_fallbacks = 0;
+    uint64_t code_jobs = 0;
+    void check_code(const JobRef& j, const Cmd& c, bool ran_spu);
     std::vector<const spu::hle::Function*> hcache;
     std::vector<uint8_t> hvalid;
     std::unique_ptr<spu::SpuThread> t;
@@ -109,5 +114,6 @@ struct Sandbox {
 };
 
 bool run_sandboxed(spu::SpuThread& shadow, ApiState& api, Sandbox& sb);
+uint64_t code_repairs();
 
 }

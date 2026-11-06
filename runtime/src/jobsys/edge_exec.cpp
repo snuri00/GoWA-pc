@@ -1,4 +1,5 @@
 #include "edge_exec.h"
+#include "edge_hle.h"
 #include "runtime/host.h"
 
 #include "../spu/hle.h"
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -38,7 +40,7 @@ struct ProfEntry {
 ProfEntry g_prof_tab[512];
 thread_local uint64_t t_dma = 0;
 
-void prof_add(const char* name, uint64_t ticks) {
+void prof_add_impl(const char* name, uint64_t ticks) {
     uint32_t h = static_cast<uint32_t>((reinterpret_cast<uintptr_t>(name) >> 3) * 2654435761u) & 511;
     for (uint32_t i = 0; i < 512; i++) {
         ProfEntry& e = g_prof_tab[(h + i) & 511];
@@ -381,7 +383,7 @@ Fast fast_loop(spu::SpuThread& t, spu::Host& h, ApiState& api, std::vector<const
         if (pc < 0x4000) {
             uint64_t a0 = g_prof ? __rdtsc() : 0;
             if (!api_call(c, api)) return Fast::Fallback;
-            if (g_prof) prof_add("jobapi", __rdtsc() - a0);
+            if (g_prof) prof_add_impl("jobapi", __rdtsc() - a0);
             continue;
         }
         dispatches++;
@@ -401,7 +403,7 @@ Fast fast_loop(spu::SpuThread& t, spu::Host& h, ApiState& api, std::vector<const
         if (!f->host_handler) {
             uint64_t s0 = g_prof ? __rdtsc() : 0;
             if (f->handler(c)) {
-                if (g_prof) prof_add(f->name, __rdtsc() - s0);
+                if (g_prof) prof_add_impl(f->name, __rdtsc() - s0);
                 c.pc = c.gpr[0].u32[3] & spu::PC_MASK;
                 continue;
             }
@@ -415,7 +417,7 @@ Fast fast_loop(spu::SpuThread& t, spu::Host& h, ApiState& api, std::vector<const
             c.pc = pc;
             return Fast::Fallback;
         }
-        if (g_prof) prof_add(f->name, __rdtsc() - h0 - (t_dma - d0));
+        if (g_prof) prof_add_impl(f->name, __rdtsc() - h0 - (t_dma - d0));
         if (c.halted) return Fast::Failed;
         c.irq_check = false;
     }
@@ -442,6 +444,10 @@ const uint8_t kApiTemplate[0x100] = {
 };
 
 }
+
+bool prof_on() { return g_prof; }
+
+void prof_add(const char* name, uint64_t ticks) { prof_add_impl(name, ticks); }
 
 bool parse(uint32_t cmd_ea, uint32_t cmd_size, Cmd& c) {
     if (cmd_size < 0x18 || cmd_size > 0x100 || (cmd_ea & 15) || !vm::range_mapped(cmd_ea, cmd_size)) return false;
@@ -643,11 +649,60 @@ Executor::Executor(uint32_t n) : spu_num(n), t(std::make_unique<spu::SpuThread>(
 
 Executor::~Executor() = default;
 
+namespace {
+
+constexpr uint32_t kCodeBase = 0x4000;
+constexpr uint32_t kCodeCheckEnd = 0x10430;
+std::atomic<uint64_t> g_code_repairs{0};
+
+uint64_t code_check_every() {
+    static const uint64_t n = [] {
+        const char* e = std::getenv("GOWA_JOBSYS_EDGE_CODECHECK");
+        return e && *e ? std::strtoull(e, nullptr, 10) : 1024ull;
+    }();
+    return n;
+}
+
+}
+
+uint64_t code_repairs() { return g_code_repairs.load(std::memory_order_relaxed); }
+
+void Executor::check_code(const JobRef& j, const Cmd& c, bool ran_spu) {
+    uint32_t len = std::min<uint32_t>(c.code_len, kCodeCheckEnd - kCodeBase);
+    const uint8_t* g = static_cast<const uint8_t*>(vm::ptr(c.module));
+    uint8_t* l = t->ls + kCodeBase;
+    if (std::memcmp(l, g, len) == 0) return;
+    uint32_t first = 0, last = 0, n = 0;
+    for (uint32_t i = 0; i < len; i++)
+        if (l[i] != g[i]) {
+            if (!n) first = i;
+            last = i;
+            n++;
+        }
+    uint64_t k = g_code_repairs.fetch_add(1, std::memory_order_relaxed);
+    if (k < 20)
+        LOG_ERROR("jsedge", "edge executor %u: resident code differs from the module at LS 0x%05x-0x%05x (%u bytes) after job hdr 0x%x index %u cmd 0x%x%s, reloading it", spu_num, kCodeBase + first, kCodeBase + last, n, j.hdr, j.index, c.ea,
+                  ran_spu ? " (SPU code ran in this job)" : "");
+    if (k < 4) {
+        char name[64];
+        std::snprintf(name, sizeof name, "edge_code_%llu.bin", static_cast<unsigned long long>(k));
+        if (FILE* f = std::fopen(name, "wb")) {
+            std::fwrite(t->ls, 1, spu::LS_SIZE, f);
+            std::fclose(f);
+        }
+    }
+    std::memcpy(l, g, len);
+    t->mark_ls(kCodeBase, len);
+    hcache.assign(spu::LS_SIZE / 4, nullptr);
+    hvalid.assign(spu::LS_SIZE / 4, 0);
+}
+
 bool Executor::run_edge(const JobRef& j, const Cmd& c, bool reference, Sandbox* pre) {
     spu::SpuThread& th = *t;
     toggle ^= 1;
     bool load_code = code_ea != c.module;
     code_ea = c.module;
+    uint64_t exec0 = th.exec_insns;
     uint64_t p0 = g_prof ? __rdtsc() : 0, pd0 = t_dma;
     prepare_ls(th.ls, th.ctx, j, c, spu_num, toggle, load_code, !pm_loaded);
     if (!pm_loaded) {
@@ -688,24 +743,50 @@ bool Executor::run_edge(const JobRef& j, const Cmd& c, bool reference, Sandbox* 
         hcache.assign(spu::LS_SIZE / 4, nullptr);
         hvalid.assign(spu::LS_SIZE / 4, 0);
     }
-    if (g_prof) prof_add(load_code ? "prepare_ls+code" : "prepare_ls", __rdtsc() - p0);
+    if (g_prof) prof_add_impl(load_code ? "prepare_ls+code" : "prepare_ls", __rdtsc() - p0);
     th.stop_flag.store(false);
-    Fast r = reference ? Fast::Fallback : fast_loop(th, fh, api, hcache, hvalid, dispatches);
+    Fast r;
+    if (reference) {
+        r = Fast::Fallback;
+    } else if (hle::enabled() && hle::run(*this, fh, j, c)) {
+        r = Fast::Done;
+    } else {
+        if (hle::enabled()) {
+            hle_fallbacks++;
+            prepare_ls(th.ls, th.ctx, j, c, spu_num, toggle, true, false);
+            th.mark_all_ls();
+            api = ApiState{};
+            for (int k = 0; k < 4; k++) api.mask[k] = 0xff;
+            api.buf = toggle;
+            api.cmd = &c;
+            th.tag_mask = th.tag_stat = th.atomic_stat = 0;
+            th.tag_stat_count = th.atomic_stat_count = false;
+            th.raddr = 0;
+        }
+        r = fast_loop(th, fh, api, hcache, hvalid, dispatches);
+    }
     if (r == Fast::Fallback) {
         fallbacks++;
         uint64_t x0 = g_prof ? __rdtsc() : 0, xd0 = t_dma;
         th.exec_host = reference ? nullptr : &fh;
         th.exec();
         th.exec_host = nullptr;
-        if (g_prof) prof_add("fallback exec", __rdtsc() - x0 - (t_dma - xd0));
+        if (g_prof) prof_add_impl("fallback exec", __rdtsc() - x0 - (t_dma - xd0));
     }
     if (g_prof) {
-        prof_add("dma", t_dma - pd0);
-        prof_add("job total", __rdtsc() - p0);
+        prof_add_impl("dma", t_dma - pd0);
+        prof_add_impl("job total", __rdtsc() - p0);
     }
     fail_pc = th.ctx.pc;
     bool ok = th.ctx.pc == kJobRet && !th.ctx.halted && !api.bad_pc;
     th.ctx.halted = false;
+    if (uint64_t every = code_check_every(); every && !reference) {
+        bool ran_spu = th.exec_insns != exec0;
+        if (ran_spu || ++code_jobs >= every) {
+            code_jobs = 0;
+            check_code(j, c, ran_spu);
+        }
+    }
     return ok;
 }
 

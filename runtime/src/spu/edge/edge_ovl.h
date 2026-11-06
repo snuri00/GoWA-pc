@@ -24,6 +24,8 @@ enum Counter { kRuns, kRunInsns, kDeclines, kInterpBlocks, kInterpInsns, kCounte
 void count(Counter k, uint64_t v);
 void count_entry(int idx);
 void count_decline(int native);
+void capture_decline(int native, const uint8_t* ls, const spu::Context& c);
+bool capture_on();
 void note_interp(uint32_t pc);
 bool stats_on();
 
